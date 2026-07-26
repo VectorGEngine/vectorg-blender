@@ -34,7 +34,7 @@ src/files/models/vehicles/<car_id>/sounds/
   "model": "<car_id>.glb",
   "engine": {
     "idleRPM": 1000,
-    "redlineRPM": 7500,
+    "redlineRPM": 7000,
     "revLimit": 7900,
     "maxRPM": 8000,
     "autoBlip": true

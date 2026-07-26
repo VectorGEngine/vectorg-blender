@@ -894,9 +894,9 @@ class CarExporterSettings(PropertyGroup):
     diff_ratio: FloatProperty(name="Diff Ratio", default=5.0, min=0.01)
     max_rpm: IntProperty(name="Max RPM", default=8000, min=1)
     idle_rpm: IntProperty(name="Idle RPM", default=1000, min=1)
-    redline_rpm: IntProperty(name="Redline RPM", default=7500, min=1)
+    redline_rpm: IntProperty(name="Redline RPM", default=7000, min=1)
     rev_limit: IntProperty(name="Rev Limit", default=7900, min=1)
-    engine_inertia: FloatProperty(name="Engine Inertia", default=0.9, min=0.01)
+    engine_inertia: FloatProperty(name="Engine Inertia", default=0.2, min=0.01)
     engine_friction_torque: FloatProperty(name="Friction Torque", default=70.0, min=0.0)
     clutch_response: FloatProperty(name="Clutch Response", default=12.0, min=0.0)
     shift_cooldown: FloatProperty(name="Gear Change Cooldown", default=0.0, min=0.0, unit="TIME")
@@ -1053,9 +1053,9 @@ def initialize_configuration_settings(settings):
     settings.diff_ratio = 5.0
     settings.max_rpm = 8000
     settings.idle_rpm = 1000
-    settings.redline_rpm = 7500
+    settings.redline_rpm = 7000
     settings.rev_limit = 7900
-    settings.engine_inertia = 0.9
+    settings.engine_inertia = 0.2
     settings.engine_friction_torque = 70.0
     settings.clutch_response = 12.0
     settings.shift_cooldown = 0.0
