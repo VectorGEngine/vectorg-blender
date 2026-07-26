@@ -30,23 +30,35 @@ src/files/models/vehicles/<car_id>/sounds/
 ```json
 {
   "id": "<car_id>",
-  "model": "<car_id>.glb"
+  "packageVersion": "1",
+  "model": "<car_id>.glb",
+  "engine": {
+    "idleRPM": 1000,
+    "redlineRPM": 7500,
+    "revLimit": 7900,
+    "maxRPM": 8000
+  }
 }
 ```
+
+Increment **Package Version** intentionally whenever exported package contents
+change. Importing an existing car manifest preserves its `packageVersion`.
+Engine RPM values are required and must satisfy
+`idleRPM < redlineRPM <= revLimit <= maxRPM`.
 
 ## Scripts Path Installation
 
 In Blender, open `Edit > Preferences > File Paths` and add this Scripts path:
 
 ```text
-/Users/firatkiral/Repo/vectorg/blender
+/Users/firatkiral/Repo/vectorg/vectorg-blender
 ```
 
 Blender loads add-ons from the repository's `addons/` directory. This add-on is
 located at:
 
 ```text
-/Users/firatkiral/Repo/vectorg/blender/addons/vectorg_car_exporter
+/Users/firatkiral/Repo/vectorg/vectorg-blender/addons/vectorg_car_exporter
 ```
 
 Restart Blender, open `Edit > Preferences > Add-ons`, and enable:
@@ -135,10 +147,19 @@ Only assigned files are written to `manifest.json`; the addon does not emit refe
 
 Use `Validate Car` first, then `Export Car Zip`.
 
+**Maximum Texture Size** limits the longest side of every exported material
+texture without modifying the source image. The default car limit is `2048`.
+When **Compress Opaque Color Textures** is enabled, textures used only by
+Principled BSDF base-color or emission inputs are exported as JPEG at the
+selected quality. Textures used for alpha, normals, metallic, roughness, masks,
+or ambiguous node graphs are not converted to JPEG. Textures are embedded in
+the GLB.
+
 The GLB export uses Blender's built-in glTF exporter with:
 
 ```text
 export_format="GLB"
 use_selection=False
 export_apply=True
+export_unused_images=False
 ```

@@ -10,11 +10,24 @@ maps/<layout_id>.svg
 routes/<layout_id>.json
 ```
 
-Install or enable `blender/addons/vectorg_track_exporter` the same way as the
+Install or enable `vectorg-blender/addons/vectorg_track_exporter` the same way as the
 car exporter. The panel is under `View3D > Sidebar > VectorG`.
 
 The optional **HDR** field selects an `.hdr` or `.exr` image texture already
-loaded in the Blender file. Packed image textures are supported.
+loaded in the Blender file. Packed image textures are supported. The HDR is
+written only to `hdr/env.hdr` or `hdr/env.exr`; it is not embedded in the GLB
+and must not be used by an exported track material.
+
+**Maximum Texture Size** limits the longest side of exported material textures
+without modifying source images. The default track limit is `4096`. When
+**Compress Opaque Color Textures** is enabled, textures used only by Principled
+BSDF base-color or emission inputs are exported as JPEG at the selected quality.
+Alpha, normal, metallic, roughness, mask, and ambiguous textures remain
+in their original format and embedded in the GLB.
+
+Set **Package Version** to the asset revision being exported and increment it
+intentionally whenever package contents change. It is written as
+`packageVersion` and is separate from the manifest schema `version`.
 
 ## Workflow
 

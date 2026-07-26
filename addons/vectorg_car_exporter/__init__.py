@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -11,6 +11,7 @@ bl_info = {
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -66,6 +67,15 @@ TORQUE_CURVE_NODE = "Torque Curve"
 CAMERA_PREFIXES = ("chase", "cockpit", "hood", "roof")
 GUIDE_PREFIX = "CAR_EXPORTER_GUIDE_"
 GUIDE_PROP = "car_exporter_helper"
+PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+DEFAULT_MAX_TEXTURE_SIZE = 2048
+DEFAULT_JPEG_QUALITY = 85
+TEMP_IMAGE_FILE_PROPERTY = "vectorg_temp_file"
+TEXTURE_SIZE_ITEMS = (
+    ("1024", "1024", "Cap exported car textures to 1024 px on their longest side"),
+    ("2048", "2048", "Cap exported car textures to 2048 px on their longest side"),
+    ("4096", "4096", "Cap exported car textures to 4096 px on their longest side"),
+)
 AXIS_ITEMS = (
     ("x", "X", ""),
     ("y", "Y", ""),
@@ -391,6 +401,277 @@ def with_helpers_unlinked(callback):
                     collection.objects.link(obj)
 
 
+def node_trees(root_tree):
+    trees = []
+    seen = set()
+    pending = [root_tree] if root_tree else []
+    while pending:
+        tree = pending.pop()
+        if tree in seen:
+            continue
+        seen.add(tree)
+        trees.append(tree)
+        for node in tree.nodes:
+            if node.bl_idname == "ShaderNodeGroup" and node.node_tree:
+                pending.append(node.node_tree)
+    return trees
+
+
+def material_texture_nodes(material):
+    if not material or not material.use_nodes or not material.node_tree:
+        return []
+    return [
+        node
+        for tree in node_trees(material.node_tree)
+        for node in tree.nodes
+        if node.bl_idname == "ShaderNodeTexImage" and node.image
+    ]
+
+
+def export_materials(objects):
+    materials = []
+    seen = set()
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        for slot in obj.material_slots:
+            material = slot.material
+            if material and material.name not in seen:
+                seen.add(material.name)
+                materials.append(material)
+    return materials
+
+
+def upstream_texture_nodes(socket, visited=None):
+    if not socket or not socket.is_linked:
+        return set()
+    if visited is None:
+        visited = set()
+    result = set()
+    for link in socket.links:
+        node = link.from_node
+        if node in visited:
+            continue
+        visited.add(node)
+        if node.bl_idname == "ShaderNodeTexImage" and node.image:
+            result.add(node)
+            continue
+        for input_socket in node.inputs:
+            result.update(upstream_texture_nodes(input_socket, visited))
+    return result
+
+
+def classify_texture_usage(objects):
+    usage_by_image = {}
+    for material in export_materials(objects):
+        texture_nodes = material_texture_nodes(material)
+        classified_nodes = set()
+        for node in texture_nodes:
+            usage_by_image.setdefault(node.image, set())
+        for tree in node_trees(material.node_tree):
+            for node in tree.nodes:
+                if node.bl_idname != "ShaderNodeBsdfPrincipled":
+                    continue
+                for socket in node.inputs:
+                    if not socket.is_linked:
+                        continue
+                    if socket.name in {"Base Color", "Emission", "Emission Color"}:
+                        usage = "color"
+                    elif socket.name == "Alpha":
+                        usage = "alpha"
+                    else:
+                        usage = "data"
+                    for texture_node in upstream_texture_nodes(socket):
+                        usage_by_image.setdefault(texture_node.image, set()).add(usage)
+                        classified_nodes.add(texture_node)
+        for node in texture_nodes:
+            if node not in classified_nodes:
+                usage_by_image[node.image].add("ambiguous")
+    return usage_by_image
+
+
+def alpha_material_warnings(objects):
+    warnings = []
+    for material in export_materials(objects):
+        has_linked_alpha = any(
+            socket.name == "Alpha" and socket.is_linked
+            for tree in node_trees(material.node_tree)
+            for node in tree.nodes
+            if node.bl_idname == "ShaderNodeBsdfPrincipled"
+            for socket in node.inputs
+        )
+        if has_linked_alpha and getattr(material, "blend_method", None) == "OPAQUE":
+            warnings.append(
+                f"Material {material.name} has a linked Alpha input but uses Opaque blend mode"
+            )
+    return warnings
+
+
+def image_source_path(image):
+    return Path(bpy.path.abspath(image.filepath, library=image.library)) if image else None
+
+
+def image_source_exists(image):
+    if image.packed_file or image.source != "FILE":
+        return True
+    source = image_source_path(image)
+    return bool(source and source.is_file())
+
+
+def texture_validation(objects, max_size):
+    errors = []
+    warnings = []
+    for image, usages in classify_texture_usage(objects).items():
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            errors.append(f"Texture {image.name} has no pixel data")
+        elif max(width, height) > max_size:
+            warnings.append(f"Texture {image.name} will be scaled to a maximum of {max_size}px")
+        if not image_source_exists(image):
+            errors.append(f"Texture source does not exist: {image.name}")
+        if "color" in usages and "data" in usages:
+            warnings.append(f"Texture {image.name} is used as both color and data; its format will be preserved")
+        if "ambiguous" in usages:
+            warnings.append(f"Texture {image.name} has an unsupported or ambiguous node path; its format will be preserved")
+    warnings.extend(alpha_material_warnings(objects))
+    return errors, warnings
+
+
+def image_extension(image):
+    return Path(image.filepath_raw or image.filepath).suffix.lower()
+
+
+def image_is_data(image):
+    color_settings = image.colorspace_settings
+    return bool(
+        getattr(color_settings, "is_data", False)
+        or color_settings.name.lower() in {"non-color", "raw"}
+    )
+
+
+def optimized_export_image(
+    image,
+    usages,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    temporary_index,
+    jpeg_quality,
+):
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return None
+    longest_side = max(width, height)
+    should_resize = longest_side > max_size
+    source_extension = image_extension(image)
+    should_use_jpeg = (
+        optimize_color_textures
+        and usages == {"color"}
+        and not image_is_data(image)
+        and source_extension not in {".jpg", ".jpeg", ".jpe", ".webp"}
+    )
+    if not should_resize and not should_use_jpeg:
+        return None
+    if should_resize:
+        scale = max_size / longest_side
+        target_width = max(1, round(width * scale))
+        target_height = max(1, round(height * scale))
+    else:
+        target_width, target_height = width, height
+    copy = image.copy()
+    copy.name = f"{image.name}_vectorg_export_{target_width}x{target_height}"
+    if should_resize:
+        copy.scale(target_width, target_height)
+    if should_use_jpeg:
+        jpeg_path = Path(temporary_directory) / f"texture_{temporary_index}.jpg"
+        copy.filepath_raw = str(jpeg_path)
+        copy.file_format = "JPEG"
+        replacement = None
+        try:
+            copy.save(quality=jpeg_quality)
+            replacement = bpy.data.images.load(str(jpeg_path), check_existing=False)
+            replacement.name = copy.name
+            replacement[TEMP_IMAGE_FILE_PROPERTY] = str(jpeg_path)
+            return replacement
+        except Exception:
+            if replacement and replacement.name in bpy.data.images:
+                bpy.data.images.remove(replacement)
+            jpeg_path.unlink(missing_ok=True)
+            raise
+        finally:
+            bpy.data.images.remove(copy)
+    return copy
+
+
+def apply_export_texture_optimization(
+    objects,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    jpeg_quality,
+):
+    usage_by_image = classify_texture_usage(objects)
+    replacements = {}
+    restored_nodes = []
+    temp_images = []
+    try:
+        for material in export_materials(objects):
+            for node in material_texture_nodes(material):
+                source = node.image
+                if source not in replacements:
+                    replacement = optimized_export_image(
+                        source,
+                        usage_by_image.get(source, {"ambiguous"}),
+                        max_size,
+                        optimize_color_textures,
+                        temporary_directory,
+                        len(replacements),
+                        jpeg_quality,
+                    )
+                    replacements[source] = replacement or source
+                    if replacement:
+                        temp_images.append(replacement)
+                replacement = replacements[source]
+                if replacement is not source:
+                    restored_nodes.append((node, source))
+                    node.image = replacement
+    except Exception:
+        restore_export_textures(restored_nodes, temp_images)
+        raise
+    return restored_nodes, temp_images
+
+
+def restore_export_textures(restored_nodes, temp_images):
+    for node, source in restored_nodes:
+        node.image = source
+    for image in temp_images:
+        temporary_file = image.get(TEMP_IMAGE_FILE_PROPERTY)
+        try:
+            if image.name in bpy.data.images:
+                bpy.data.images.remove(image)
+        finally:
+            if temporary_file:
+                Path(temporary_file).unlink(missing_ok=True)
+
+
+def gltf_image_export_options(jpeg_quality):
+    properties = {
+        prop.identifier
+        for prop in bpy.ops.export_scene.gltf.get_rna_type().properties
+    }
+    options = {}
+    for name, value in (
+        ("export_image_format", "AUTO"),
+        ("export_image_quality", jpeg_quality),
+        ("export_jpeg_quality", jpeg_quality),
+        ("export_unused_images", False),
+        ("export_unused_textures", False),
+    ):
+        if name in properties:
+            options[name] = value
+    return options
+
+
 def validate_scene(settings):
     errors = []
     warnings = []
@@ -398,6 +679,8 @@ def validate_scene(settings):
     if not settings.is_configured:
         errors.append("Create configuration first")
         return errors, warnings
+    if not PACKAGE_VERSION_PATTERN.fullmatch(settings.package_version):
+        errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
 
     car_obj = settings.car_root_object
     required = [
@@ -508,6 +791,22 @@ def validate_scene(settings):
     elif not settings.car_id.replace("_", "").replace("-", "").isalnum():
         errors.append("Car ID may only contain letters, numbers, underscore, and dash")
 
+    if not (
+        settings.idle_rpm
+        < settings.redline_rpm
+        <= settings.rev_limit
+        <= settings.max_rpm
+    ):
+        errors.append("Engine RPM values must satisfy idleRPM < redlineRPM <= revLimit <= maxRPM")
+
+    if car_obj:
+        texture_errors, texture_warnings = texture_validation(
+            [obj for obj in bpy.context.scene.objects if obj not in guide_objects()],
+            int(settings.max_texture_size),
+        )
+        errors.extend(texture_errors)
+        warnings.extend(texture_warnings)
+
     return errors, warnings
 
 
@@ -544,7 +843,30 @@ class CarWheelSettings(PropertyGroup):
 class CarExporterSettings(PropertyGroup):
     is_configured: BoolProperty(name="Configured", default=False)
     car_id: StringProperty(name="Car ID", default="my_car")
+    package_version: StringProperty(
+        name="Package Version",
+        description="Explicit asset revision; increment when package contents change",
+        default="1",
+    )
     display_name: StringProperty(name="Display Name", default="My Car")
+    max_texture_size: EnumProperty(
+        name="Maximum Texture Size",
+        description="Maximum exported material-texture dimension",
+        items=TEXTURE_SIZE_ITEMS,
+        default=str(DEFAULT_MAX_TEXTURE_SIZE),
+    )
+    optimize_color_textures: BoolProperty(
+        name="Compress Opaque Color Textures",
+        description="Export unambiguous opaque color textures as JPEG while preserving alpha and data textures",
+        default=True,
+    )
+    jpeg_quality: IntProperty(
+        name="JPEG Quality",
+        description="Quality used for optimized opaque color textures",
+        default=DEFAULT_JPEG_QUALITY,
+        min=1,
+        max=100,
+    )
     car_class: StringProperty(name="Class", default="GT")
     vehicle_tag_tarmac: BoolProperty(name="Tarmac", default=True)
     vehicle_tag_offroad: BoolProperty(name="Offroad", default=True)
@@ -572,10 +894,13 @@ class CarExporterSettings(PropertyGroup):
     diff_ratio: FloatProperty(name="Diff Ratio", default=5.0, min=0.01)
     max_rpm: IntProperty(name="Max RPM", default=8000, min=1)
     idle_rpm: IntProperty(name="Idle RPM", default=1000, min=1)
+    redline_rpm: IntProperty(name="Redline RPM", default=7500, min=1)
     rev_limit: IntProperty(name="Rev Limit", default=7900, min=1)
     engine_inertia: FloatProperty(name="Engine Inertia", default=0.9, min=0.01)
     engine_friction_torque: FloatProperty(name="Friction Torque", default=70.0, min=0.0)
     clutch_response: FloatProperty(name="Clutch Response", default=12.0, min=0.0)
+    shift_cooldown: FloatProperty(name="Gear Change Cooldown", default=0.0, min=0.0, unit="TIME")
+    auto_blip_duration: FloatProperty(name="Auto Blip Duration", default=0.2, min=0.0, max=1.0, unit="TIME")
     turbo_enabled: BoolProperty(name="Turbo Enabled", default=True)
     turbo_boost: FloatProperty(name="Turbo Boost", default=1.35, min=1.0)
     turbo_valve: BoolProperty(name="Turbo Valve", default=False)
@@ -640,7 +965,11 @@ class CarExporterSettings(PropertyGroup):
 def clear_configuration_settings(settings):
     settings.is_configured = False
     settings.car_id = ""
+    settings.package_version = "1"
     settings.display_name = ""
+    settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
+    settings.optimize_color_textures = True
+    settings.jpeg_quality = DEFAULT_JPEG_QUALITY
     settings.car_class = ""
     settings.vehicle_tag_tarmac = False
     settings.vehicle_tag_offroad = False
@@ -663,10 +992,13 @@ def clear_configuration_settings(settings):
     settings.diff_ratio = 0.01
     settings.max_rpm = 1
     settings.idle_rpm = 1
+    settings.redline_rpm = 1
     settings.rev_limit = 1
     settings.engine_inertia = 0.01
     settings.engine_friction_torque = 0.0
     settings.clutch_response = 0.0
+    settings.shift_cooldown = 0.0
+    settings.auto_blip_duration = 0.0
     settings.turbo_enabled = False
     settings.turbo_boost = 1.0
     settings.turbo_valve = False
@@ -695,7 +1027,11 @@ def initialize_configuration_settings(settings):
     clear_configuration_settings(settings)
     settings.is_configured = True
     settings.car_id = "my_car"
+    settings.package_version = "1"
     settings.display_name = "My Car"
+    settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
+    settings.optimize_color_textures = True
+    settings.jpeg_quality = DEFAULT_JPEG_QUALITY
     settings.car_class = "GT"
     settings.vehicle_tag_tarmac = True
     settings.vehicle_tag_offroad = True
@@ -711,10 +1047,13 @@ def initialize_configuration_settings(settings):
     settings.diff_ratio = 5.0
     settings.max_rpm = 8000
     settings.idle_rpm = 1000
+    settings.redline_rpm = 7500
     settings.rev_limit = 7900
     settings.engine_inertia = 0.9
     settings.engine_friction_torque = 70.0
     settings.clutch_response = 12.0
+    settings.shift_cooldown = 0.0
+    settings.auto_blip_duration = 0.2
     settings.turbo_enabled = True
     settings.turbo_boost = 1.35
     settings.turbo_valve = False
@@ -942,6 +1281,7 @@ def build_manifest(settings):
 
     return {
         "id": settings.car_id,
+        "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
         "displayName": settings.display_name,
         "class": settings.car_class,
@@ -960,10 +1300,13 @@ def build_manifest(settings):
             "diffRatio": settings.diff_ratio,
             "maxRPM": settings.max_rpm,
             "idleRPM": settings.idle_rpm,
+            "redlineRPM": settings.redline_rpm,
             "revLimit": settings.rev_limit,
             "inertia": settings.engine_inertia,
             "frictionTorque": settings.engine_friction_torque,
             "clutchResponse": settings.clutch_response,
+            "shiftCooldown": settings.shift_cooldown,
+            "autoBlipDuration": settings.auto_blip_duration,
             "gearRatios": {
                 **{"0": 0, "-1": settings.reverse_ratio},
                 **{
@@ -1278,6 +1621,30 @@ class CAR_EXPORTER_OT_remove_configuration(Operator):
         return {"FINISHED"}
 
 
+def export_car_glb(context, filepath, max_texture_size, optimize_color_textures, jpeg_quality):
+    export_objects = list(context.scene.objects)
+    restored_nodes, temp_images = apply_export_texture_optimization(
+        export_objects,
+        max_texture_size,
+        optimize_color_textures,
+        Path(filepath).parent,
+        jpeg_quality,
+    )
+    try:
+        result = bpy.ops.export_scene.gltf(
+            filepath=str(filepath),
+            export_format="GLB",
+            use_selection=False,
+            export_apply=True,
+            export_cameras=True,
+            **gltf_image_export_options(jpeg_quality),
+        )
+        if "FINISHED" not in result:
+            raise RuntimeError("Blender glTF export did not finish")
+    finally:
+        restore_export_textures(restored_nodes, temp_images)
+
+
 class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
     bl_idname = "car_exporter.export_car_zip"
     bl_label = "Export Car Zip"
@@ -1310,12 +1677,12 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
                 sounds_path.mkdir()
 
             model_filename = f"{settings.car_id}.glb"
-            with_helpers_unlinked(lambda: bpy.ops.export_scene.gltf(
-                filepath=str(temp_path / model_filename),
-                export_format="GLB",
-                use_selection=False,
-                export_apply=True,
-                export_cameras=True,
+            with_helpers_unlinked(lambda: export_car_glb(
+                context,
+                temp_path / model_filename,
+                int(settings.max_texture_size),
+                settings.optimize_color_textures,
+                settings.jpeg_quality,
             ))
 
             manifest = build_manifest(settings)
@@ -1359,11 +1726,16 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
 
     def execute(self, context):
         settings = scene_settings(context)
-        settings.is_configured = True
         data = json.loads(Path(abspath(self.filepath)).read_text(encoding="utf-8"))
         engine = data.get("engine", {})
+        if "redlineRPM" not in engine:
+            self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
+            return {"CANCELLED"}
+
+        settings.is_configured = True
         body = data.get("body", {})
         settings.car_id = data.get("id", data.get("name", settings.car_id))
+        settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
         settings.car_class = data.get("class", settings.car_class)
         track_types = data.get("trackTypes")
@@ -1376,10 +1748,13 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.diff_ratio = engine.get("diffRatio", settings.diff_ratio)
         settings.max_rpm = engine.get("maxRPM", settings.max_rpm)
         settings.idle_rpm = engine.get("idleRPM", settings.idle_rpm)
+        settings.redline_rpm = engine["redlineRPM"]
         settings.rev_limit = engine.get("revLimit", settings.rev_limit)
         settings.engine_inertia = engine.get("inertia", settings.engine_inertia)
         settings.engine_friction_torque = engine.get("frictionTorque", settings.engine_friction_torque)
         settings.clutch_response = engine.get("clutchResponse", settings.clutch_response)
+        settings.shift_cooldown = engine.get("shiftCooldown", settings.shift_cooldown)
+        settings.auto_blip_duration = engine.get("autoBlipDuration", settings.auto_blip_duration)
         set_object_pointer(settings, "car_root_object", body.get("obj", ""))
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
@@ -1583,7 +1958,13 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Package")
         draw_split_prop(box, settings, "car_id")
+        draw_split_prop(box, settings, "package_version")
         draw_split_prop(box, settings, "display_name")
+        draw_split_prop(box, settings, "max_texture_size")
+        draw_split_prop(box, settings, "optimize_color_textures")
+        color_quality = box.row()
+        color_quality.enabled = settings.optimize_color_textures
+        draw_split_prop(color_quality, settings, "jpeg_quality")
         draw_split_prop(box, settings, "car_class")
         draw_vehicle_tags(box, settings)
 
@@ -1603,8 +1984,9 @@ class CAR_EXPORTER_PT_car_export(Panel):
             "hp",
             "diff_ratio",
             "idle_rpm",
-            "max_rpm",
+            "redline_rpm",
             "rev_limit",
+            "max_rpm",
             "engine_inertia",
             "engine_friction_torque",
             "clutch_response",
@@ -1620,6 +2002,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         box = layout.box()
         box.label(text="Gears")
+        draw_split_prop(box, settings, "shift_cooldown")
+        draw_split_prop(box, settings, "auto_blip_duration")
         draw_split_prop(box, settings, "reverse_ratio")
         draw_split_prop(box, settings, "forward_gear_count")
         for index in range(1, settings.forward_gear_count + 1):

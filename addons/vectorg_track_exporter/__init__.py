@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import struct
 import tempfile
 import zipfile
 from pathlib import Path
@@ -51,6 +52,7 @@ ROLE_SPAWN_POINT = "spawn_point"
 ROLE_SURFACE = "surface"
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 DEFAULT_EVENT_SCALE = (5.0, 1.0, 2.0)
 DEFAULT_DYNAMIC_MASS = 10.0
 DYNAMIC_COLLIDER_DENSITY = 10.0
@@ -58,6 +60,14 @@ ROUTE_MAX_SPACING = 5.0
 ROUTE_MAX_ANGLE_DEGREES = 5.0
 ROUTE_MAX_CURVE_ERROR = 0.05
 MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
+DEFAULT_MAX_TEXTURE_SIZE = 4096
+DEFAULT_JPEG_QUALITY = 85
+TEMP_IMAGE_FILE_PROPERTY = "vectorg_temp_file"
+TEXTURE_SIZE_ITEMS = (
+    ("2048", "2048", "Cap exported track textures to 2048 px on their longest side"),
+    ("4096", "4096", "Cap exported track textures to 4096 px on their longest side"),
+    ("8192", "8192", "Cap exported track textures to 8192 px on their longest side"),
+)
 SURFACE_IDS = (
     "tarmac",
     "concrete",
@@ -501,6 +511,325 @@ def ensure_surface_group(context, collision_root, surface_id):
     return group
 
 
+def node_trees(root_tree):
+    trees = []
+    seen = set()
+    pending = [root_tree] if root_tree else []
+    while pending:
+        tree = pending.pop()
+        if tree in seen:
+            continue
+        seen.add(tree)
+        trees.append(tree)
+        for node in tree.nodes:
+            if node.bl_idname == "ShaderNodeGroup" and node.node_tree:
+                pending.append(node.node_tree)
+    return trees
+
+
+def material_texture_nodes(material):
+    if not material or not material.use_nodes or not material.node_tree:
+        return []
+    return [
+        node
+        for tree in node_trees(material.node_tree)
+        for node in tree.nodes
+        if node.bl_idname == "ShaderNodeTexImage" and node.image
+    ]
+
+
+def export_materials(objects):
+    materials = []
+    seen = set()
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        for slot in obj.material_slots:
+            material = slot.material
+            if material and material.name not in seen:
+                seen.add(material.name)
+                materials.append(material)
+    return materials
+
+
+def track_export_objects(track_root, excluded_objects=()):
+    excluded_objects = set(excluded_objects)
+    return [
+        obj
+        for obj in [track_root, *descendants(track_root)]
+        if obj not in excluded_objects
+    ]
+
+
+def upstream_texture_nodes(socket, visited=None):
+    if not socket or not socket.is_linked:
+        return set()
+    if visited is None:
+        visited = set()
+    result = set()
+    for link in socket.links:
+        node = link.from_node
+        if node in visited:
+            continue
+        visited.add(node)
+        if node.bl_idname == "ShaderNodeTexImage" and node.image:
+            result.add(node)
+            continue
+        for input_socket in node.inputs:
+            result.update(upstream_texture_nodes(input_socket, visited))
+    return result
+
+
+def classify_texture_usage(objects):
+    usage_by_image = {}
+    for material in export_materials(objects):
+        texture_nodes = material_texture_nodes(material)
+        classified_nodes = set()
+        for node in texture_nodes:
+            usage_by_image.setdefault(node.image, set())
+        for tree in node_trees(material.node_tree):
+            for node in tree.nodes:
+                if node.bl_idname != "ShaderNodeBsdfPrincipled":
+                    continue
+                for socket in node.inputs:
+                    if not socket.is_linked:
+                        continue
+                    if socket.name in {"Base Color", "Emission", "Emission Color"}:
+                        usage = "color"
+                    elif socket.name == "Alpha":
+                        usage = "alpha"
+                    else:
+                        usage = "data"
+                    for texture_node in upstream_texture_nodes(socket):
+                        usage_by_image.setdefault(texture_node.image, set()).add(usage)
+                        classified_nodes.add(texture_node)
+        for node in texture_nodes:
+            if node not in classified_nodes:
+                usage_by_image[node.image].add("ambiguous")
+    return usage_by_image
+
+
+def alpha_material_warnings(objects):
+    warnings = []
+    for material in export_materials(objects):
+        has_linked_alpha = any(
+            socket.name == "Alpha" and socket.is_linked
+            for tree in node_trees(material.node_tree)
+            for node in tree.nodes
+            if node.bl_idname == "ShaderNodeBsdfPrincipled"
+            for socket in node.inputs
+        )
+        if has_linked_alpha and getattr(material, "blend_method", None) == "OPAQUE":
+            warnings.append(
+                f"Material {material.name} has a linked Alpha input but uses Opaque blend mode"
+            )
+    return warnings
+
+
+def image_source_exists(image):
+    if image.packed_file or image.source != "FILE":
+        return True
+    source = image_source_path(image)
+    return bool(source and source.is_file())
+
+
+def texture_validation(objects, max_size, hdr_image=None):
+    errors = []
+    warnings = []
+    usage_by_image = classify_texture_usage(objects)
+    for image, usages in usage_by_image.items():
+        if image == hdr_image:
+            errors.append("HDR environment image must not be used by an exported track material")
+            continue
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            errors.append(f"Texture {image.name} has no pixel data")
+        elif max(width, height) > max_size:
+            warnings.append(f"Texture {image.name} will be scaled to a maximum of {max_size}px")
+        if not image_source_exists(image):
+            errors.append(f"Texture source does not exist: {image.name}")
+        if "color" in usages and "data" in usages:
+            warnings.append(f"Texture {image.name} is used as both color and data; its format will be preserved")
+        if "ambiguous" in usages:
+            warnings.append(f"Texture {image.name} has an unsupported or ambiguous node path; its format will be preserved")
+    warnings.extend(alpha_material_warnings(objects))
+    return errors, warnings
+
+
+def image_extension(image):
+    return Path(image.filepath_raw or image.filepath).suffix.lower()
+
+
+def image_is_data(image):
+    color_settings = image.colorspace_settings
+    return bool(
+        getattr(color_settings, "is_data", False)
+        or color_settings.name.lower() in {"non-color", "raw"}
+    )
+
+
+def optimized_export_image(
+    image,
+    usages,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    temporary_index,
+    jpeg_quality,
+):
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return None
+    longest_side = max(width, height)
+    should_resize = longest_side > max_size
+    source_extension = image_extension(image)
+    should_use_jpeg = (
+        optimize_color_textures
+        and usages == {"color"}
+        and not image_is_data(image)
+        and source_extension not in {".jpg", ".jpeg", ".jpe", ".webp"}
+    )
+    if not should_resize and not should_use_jpeg:
+        return None
+    if should_resize:
+        scale = max_size / longest_side
+        target_width = max(1, round(width * scale))
+        target_height = max(1, round(height * scale))
+    else:
+        target_width, target_height = width, height
+    copy = image.copy()
+    copy.name = f"{image.name}_vectorg_export_{target_width}x{target_height}"
+    if should_resize:
+        copy.scale(target_width, target_height)
+    if should_use_jpeg:
+        jpeg_path = Path(temporary_directory) / f"texture_{temporary_index}.jpg"
+        copy.filepath_raw = str(jpeg_path)
+        copy.file_format = "JPEG"
+        replacement = None
+        try:
+            copy.save(quality=jpeg_quality)
+            replacement = bpy.data.images.load(str(jpeg_path), check_existing=False)
+            replacement.name = copy.name
+            replacement[TEMP_IMAGE_FILE_PROPERTY] = str(jpeg_path)
+            return replacement
+        except Exception:
+            if replacement and replacement.name in bpy.data.images:
+                bpy.data.images.remove(replacement)
+            jpeg_path.unlink(missing_ok=True)
+            raise
+        finally:
+            bpy.data.images.remove(copy)
+    return copy
+
+
+def apply_export_texture_optimization(
+    objects,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    jpeg_quality,
+):
+    if max_size <= 0:
+        return [], []
+    usage_by_image = classify_texture_usage(objects)
+    replacements = {}
+    restored_nodes = []
+    temp_images = []
+    try:
+        for material in export_materials(objects):
+            for node in material_texture_nodes(material):
+                source = node.image
+                if source not in replacements:
+                    replacement = optimized_export_image(
+                        source,
+                        usage_by_image.get(source, {"ambiguous"}),
+                        max_size,
+                        optimize_color_textures,
+                        temporary_directory,
+                        len(replacements),
+                        jpeg_quality,
+                    )
+                    replacements[source] = replacement or source
+                    if replacement:
+                        temp_images.append(replacement)
+                replacement = replacements[source]
+                if replacement is not source:
+                    restored_nodes.append((node, source))
+                    node.image = replacement
+    except Exception:
+        restore_export_textures(restored_nodes, temp_images)
+        raise
+    return restored_nodes, temp_images
+
+
+def restore_export_textures(restored_nodes, temp_images):
+    for node, source in restored_nodes:
+        node.image = source
+    for image in temp_images:
+        temporary_file = image.get(TEMP_IMAGE_FILE_PROPERTY)
+        try:
+            if image.name in bpy.data.images:
+                bpy.data.images.remove(image)
+        finally:
+            if temporary_file:
+                Path(temporary_file).unlink(missing_ok=True)
+
+
+def gltf_image_export_options(jpeg_quality):
+    properties = {
+        prop.identifier
+        for prop in bpy.ops.export_scene.gltf.get_rna_type().properties
+    }
+    options = {}
+    for name, value in (
+        ("export_image_format", "AUTO"),
+        ("export_image_quality", jpeg_quality),
+        ("export_jpeg_quality", jpeg_quality),
+        ("export_unused_images", False),
+        ("export_unused_textures", False),
+    ):
+        if name in properties:
+            options[name] = value
+    return options
+
+
+def glb_json(filepath):
+    with Path(filepath).open("rb") as source:
+        header = source.read(12)
+        if len(header) != 12:
+            raise RuntimeError("Exported GLB has an invalid header")
+        magic, version, total_length = struct.unpack("<4sII", header)
+        if magic != b"glTF" or version != 2:
+            raise RuntimeError("Exported model is not a glTF 2.0 binary")
+        if total_length != Path(filepath).stat().st_size:
+            raise RuntimeError("Exported GLB length is invalid")
+        while source.tell() < total_length:
+            chunk_header = source.read(8)
+            if len(chunk_header) != 8:
+                break
+            chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+            chunk = source.read(chunk_length)
+            if chunk_type == 0x4E4F534A:
+                return json.loads(chunk.rstrip(b" \x00").decode("utf-8"))
+    raise RuntimeError("Exported GLB has no JSON chunk")
+
+
+def validate_hdr_not_embedded(filepath, hdr_image):
+    if not hdr_image:
+        return
+    identifiers = {
+        hdr_image.name.lower(),
+        Path(hdr_image.filepath or "").name.lower(),
+        Path(hdr_image.filepath or "").stem.lower(),
+    }
+    identifiers.discard("")
+    for image in glb_json(filepath).get("images", []):
+        name = str(image.get("name", "")).lower()
+        uri = str(image.get("uri", "")).lower()
+        if name in identifiers or Path(uri).name in identifiers or Path(uri).stem in identifiers:
+            raise RuntimeError("HDR environment image was embedded in the GLB")
+
+
 def resolved_surface(collision_root, obj):
     current = obj
     while current and current != collision_root:
@@ -685,7 +1014,7 @@ def build_manifest(settings):
             "spawnPoints": sorted(
                 obj.name for obj in descendants_with_role(nodes["spawnPoints"], ROLE_SPAWN_POINT)
             ),
-            "hotLap": {
+            "timeAttack": {
                 "events": layout_event_config(layout),
             },
         }
@@ -697,6 +1026,7 @@ def build_manifest(settings):
     config = {
         "version": 1,
         "id": settings.track_id,
+        "packageVersion": settings.package_version,
         "displayName": settings.display_name,
         "model": f"{settings.track_id}.glb",
         "root": object_name(settings.track_root_object),
@@ -967,6 +1297,8 @@ def validate_scene(settings):
 
     if not valid_id(settings.track_id):
         errors.append("Track ID may only contain letters, numbers, underscore, and dash")
+    if not PACKAGE_VERSION_PATTERN.fullmatch(settings.package_version):
+        errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
     if not settings.display_name.strip():
         errors.append("Display name is required")
     if not track_root:
@@ -1129,6 +1461,26 @@ def validate_scene(settings):
         elif not settings.hdr_image.packed_file and not image_source_path(settings.hdr_image).is_file():
             errors.append("HDR texture source file does not exist")
 
+    if track_root:
+        map_roots = [
+            direct_child_with_role(layout.root_object, ROLE_MAP)
+            for layout in settings.layouts
+            if layout.root_object
+        ]
+        excluded_map_objects = {
+            obj
+            for root in map_roots
+            if root
+            for obj in [root, *descendants(root)]
+        }
+        texture_errors, texture_warnings = texture_validation(
+            track_export_objects(track_root, excluded_map_objects),
+            int(settings.max_texture_size),
+            settings.hdr_image,
+        )
+        errors.extend(texture_errors)
+        warnings.extend(texture_warnings)
+
     return errors, warnings
 
 
@@ -1151,7 +1503,11 @@ def show_validation_popup(context, errors, warnings):
 def reset_settings(settings):
     settings.is_configured = False
     settings.track_id = ""
+    settings.package_version = "1"
     settings.display_name = ""
+    settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
+    settings.optimize_color_textures = True
+    settings.jpeg_quality = DEFAULT_JPEG_QUALITY
     settings.track_root_object = None
     settings.shared_root_object = None
     settings.layouts.clear()
@@ -1211,7 +1567,30 @@ class DynamicColliderLink(PropertyGroup):
 class TrackExporterSettings(PropertyGroup):
     is_configured: BoolProperty(name="Configured", default=False)
     track_id: StringProperty(name="Track ID", description="Export identifier for the whole track package", default="my_track")
+    package_version: StringProperty(
+        name="Package Version",
+        description="Explicit asset revision; increment when package contents change",
+        default="1",
+    )
     display_name: StringProperty(name="Display Name", description="Player-facing track name", default="My Track")
+    max_texture_size: EnumProperty(
+        name="Maximum Texture Size",
+        description="Maximum exported material-texture dimension",
+        items=TEXTURE_SIZE_ITEMS,
+        default=str(DEFAULT_MAX_TEXTURE_SIZE),
+    )
+    optimize_color_textures: BoolProperty(
+        name="Compress Opaque Color Textures",
+        description="Export unambiguous opaque color textures as JPEG while preserving alpha and data textures",
+        default=True,
+    )
+    jpeg_quality: IntProperty(
+        name="JPEG Quality",
+        description="Quality used for optimized opaque color textures",
+        default=DEFAULT_JPEG_QUALITY,
+        min=1,
+        max=100,
+    )
     track_root_object: PointerProperty(name="Track Root", description="Root of all track content", type=bpy.types.Object)
     shared_root_object: PointerProperty(name="Shared Root", description="Content shared by every layout", type=bpy.types.Object)
     hdr_image: PointerProperty(name="HDR", description="Loaded HDR or EXR image exported as the track environment", type=bpy.types.Image, poll=hdr_image_poll)
@@ -1239,7 +1618,11 @@ class TRACK_EXPORTER_OT_create_configuration(Operator):
         reset_settings(settings)
         settings.is_configured = True
         settings.track_id = "my_track"
+        settings.package_version = "1"
         settings.display_name = "My Track"
+        settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
+        settings.optimize_color_textures = True
+        settings.jpeg_quality = DEFAULT_JPEG_QUALITY
 
         track_root = create_empty(context, "TRACK_ROOT", role=ROLE_TRACK)
         shared = create_empty(context, "SHARED", track_root, ROLE_SHARED)
@@ -1557,18 +1940,30 @@ class TRACK_EXPORTER_OT_validate_track(Operator):
         return {"CANCELLED"} if errors else {"FINISHED"}
 
 
-def export_track_glb(context, track_root, filepath, excluded_objects=()):
+def export_track_glb(
+    context,
+    track_root,
+    filepath,
+    max_texture_size,
+    optimize_color_textures,
+    jpeg_quality,
+    hdr_image=None,
+    excluded_objects=(),
+):
     selected_before = list(context.selected_objects)
     active_before = context.view_layer.objects.active
-    excluded_objects = set(excluded_objects)
-    export_objects = [
-        obj for obj in [track_root, *descendants(track_root)]
-        if obj not in excluded_objects
-    ]
+    export_objects = track_export_objects(track_root, excluded_objects)
     visibility_before = [
         (obj, obj.hide_get(), obj.hide_render)
         for obj in export_objects
     ]
+    restored_nodes, temp_images = apply_export_texture_optimization(
+        export_objects,
+        max_texture_size,
+        optimize_color_textures,
+        Path(filepath).parent,
+        jpeg_quality,
+    )
     try:
         for obj, _hidden, _hide_render in visibility_before:
             obj.hide_set(False)
@@ -1584,10 +1979,12 @@ def export_track_glb(context, track_root, filepath, excluded_objects=()):
             export_apply=True,
             export_extras=True,
             export_cameras=False,
+            **gltf_image_export_options(jpeg_quality),
         )
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")
     finally:
+        restore_export_textures(restored_nodes, temp_images)
         bpy.ops.object.select_all(action="DESELECT")
         for obj, hidden, hide_render in visibility_before:
             obj.hide_set(hidden)
@@ -1597,6 +1994,7 @@ def export_track_glb(context, track_root, filepath, excluded_objects=()):
                 obj.select_set(True)
         if active_before and active_before.name in bpy.data.objects:
             context.view_layer.objects.active = active_before
+    validate_hdr_not_embedded(filepath, hdr_image)
 
 
 class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
@@ -1640,6 +2038,10 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
                 context,
                 settings.track_root_object,
                 temp_path / model_filename,
+                int(settings.max_texture_size),
+                settings.optimize_color_textures,
+                settings.jpeg_quality,
+                settings.hdr_image,
                 excluded_objects=excluded_map_objects,
             )
             manifest = build_manifest(settings)
@@ -1710,7 +2112,13 @@ class TRACK_EXPORTER_PT_track_export(Panel):
         box = layout.box()
         box.label(text="Package")
         draw_split_prop(box, settings, "track_id")
+        draw_split_prop(box, settings, "package_version")
         draw_split_prop(box, settings, "display_name")
+        draw_split_prop(box, settings, "max_texture_size")
+        draw_split_prop(box, settings, "optimize_color_textures")
+        color_quality = box.row()
+        color_quality.enabled = settings.optimize_color_textures
+        draw_split_prop(color_quality, settings, "jpeg_quality")
         draw_split_prop(box, settings, "track_root_object")
         draw_split_prop(box, settings, "shared_root_object")
         draw_split_prop(box, settings, "hdr_image")
