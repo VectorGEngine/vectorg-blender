@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -68,7 +68,7 @@ CAMERA_PREFIXES = ("chase", "cockpit", "hood", "roof")
 GUIDE_PREFIX = "CAR_EXPORTER_GUIDE_"
 GUIDE_PROP = "car_exporter_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
-DEFAULT_MAX_TEXTURE_SIZE = 2048
+DEFAULT_MAX_TEXTURE_SIZE = 4096
 DEFAULT_JPEG_QUALITY = 85
 TEMP_IMAGE_FILE_PROPERTY = "vectorg_temp_file"
 TEXTURE_SIZE_ITEMS = (
@@ -900,6 +900,11 @@ class CarExporterSettings(PropertyGroup):
     engine_friction_torque: FloatProperty(name="Friction Torque", default=70.0, min=0.0)
     clutch_response: FloatProperty(name="Clutch Response", default=12.0, min=0.0)
     shift_cooldown: FloatProperty(name="Gear Change Cooldown", default=0.0, min=0.0, unit="TIME")
+    auto_blip: BoolProperty(
+        name="Auto Blip",
+        description="Allow the game auto-blip setting to operate for this vehicle",
+        default=True,
+    )
     auto_blip_duration: FloatProperty(name="Auto Blip Duration", default=0.2, min=0.0, max=1.0, unit="TIME")
     turbo_enabled: BoolProperty(name="Turbo Enabled", default=True)
     turbo_boost: FloatProperty(name="Turbo Boost", default=1.35, min=1.0)
@@ -998,6 +1003,7 @@ def clear_configuration_settings(settings):
     settings.engine_friction_torque = 0.0
     settings.clutch_response = 0.0
     settings.shift_cooldown = 0.0
+    settings.auto_blip = False
     settings.auto_blip_duration = 0.0
     settings.turbo_enabled = False
     settings.turbo_boost = 1.0
@@ -1053,6 +1059,7 @@ def initialize_configuration_settings(settings):
     settings.engine_friction_torque = 70.0
     settings.clutch_response = 12.0
     settings.shift_cooldown = 0.0
+    settings.auto_blip = True
     settings.auto_blip_duration = 0.2
     settings.turbo_enabled = True
     settings.turbo_boost = 1.35
@@ -1306,6 +1313,7 @@ def build_manifest(settings):
             "frictionTorque": settings.engine_friction_torque,
             "clutchResponse": settings.clutch_response,
             "shiftCooldown": settings.shift_cooldown,
+            "autoBlip": settings.auto_blip,
             "autoBlipDuration": settings.auto_blip_duration,
             "gearRatios": {
                 **{"0": 0, "-1": settings.reverse_ratio},
@@ -1754,6 +1762,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.engine_friction_torque = engine.get("frictionTorque", settings.engine_friction_torque)
         settings.clutch_response = engine.get("clutchResponse", settings.clutch_response)
         settings.shift_cooldown = engine.get("shiftCooldown", settings.shift_cooldown)
+        settings.auto_blip = engine.get("autoBlip") is True
         settings.auto_blip_duration = engine.get("autoBlipDuration", settings.auto_blip_duration)
         set_object_pointer(settings, "car_root_object", body.get("obj", ""))
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
@@ -2003,7 +2012,10 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Gears")
         draw_split_prop(box, settings, "shift_cooldown")
-        draw_split_prop(box, settings, "auto_blip_duration")
+        draw_split_prop(box, settings, "auto_blip")
+        auto_blip_duration_row = box.row()
+        auto_blip_duration_row.enabled = settings.auto_blip
+        draw_split_prop(auto_blip_duration_row, settings, "auto_blip_duration")
         draw_split_prop(box, settings, "reverse_ratio")
         draw_split_prop(box, settings, "forward_gear_count")
         for index in range(1, settings.forward_gear_count + 1):

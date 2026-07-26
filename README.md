@@ -36,7 +36,8 @@ src/files/models/vehicles/<car_id>/sounds/
     "idleRPM": 1000,
     "redlineRPM": 7500,
     "revLimit": 7900,
-    "maxRPM": 8000
+    "maxRPM": 8000,
+    "autoBlip": true
   }
 }
 ```
@@ -45,6 +46,8 @@ Increment **Package Version** intentionally whenever exported package contents
 change. Importing an existing car manifest preserves its `packageVersion`.
 Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
+The game applies auto blip only when both its gameplay setting and the vehicle's
+`engine.autoBlip` capability are enabled.
 
 ## Scripts Path Installation
 
