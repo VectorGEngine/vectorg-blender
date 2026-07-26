@@ -29,6 +29,7 @@ src/files/models/vehicles/<car_id>/sounds/
 
 ```json
 {
+  "version": 2,
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
@@ -38,7 +39,27 @@ src/files/models/vehicles/<car_id>/sounds/
     "revLimit": 7900,
     "maxRPM": 8000,
     "autoBlip": true
-  }
+  },
+  "presets": [
+    {
+      "id": "default",
+      "name": "Default",
+      "wheels": {
+        "front": {
+          "l": {
+            "tireType": "medium",
+            "pressure": 2.0,
+            "camber": -4.0,
+            "toe": -0.15,
+            "suspensionOffset": 0.0,
+            "suspensionStiffness": 80.0,
+            "dampingRelaxation": 2.6,
+            "dampingCompression": 2.0
+          }
+        }
+      }
+    }
+  ]
 }
 ```
 
@@ -48,6 +69,20 @@ Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
 The game applies auto blip only when both its gameplay setting and the vehicle's
 `engine.autoBlip` capability are enabled.
+
+Wheel object selections, axes, radius, steering behavior, braking, and friction
+parameters are shared by every preset. Presets contain tire type, pressure,
+camber, toe, suspension offset, suspension stiffness, relaxation damping, and
+compression damping. The current game uses the first preset. Tire type is
+`soft`, `medium`, or `hard`, with `medium` as the default. Suspension offset is
+a signed change in metres to the calculated suspension rest length. Positive
+values move the wheel farther down from the mount; negative values move it
+toward the mount. The mount position and maximum suspension travel remain
+unchanged. Applying the same offset to every wheel raises or lowers the chassis.
+
+Preset adjustments are edited once for the front axle and once for the rear
+axle. Exported manifests still contain separate `l` and `r` wheel entries, with
+the corresponding axle values copied into both entries.
 
 ## Scripts Path Installation
 

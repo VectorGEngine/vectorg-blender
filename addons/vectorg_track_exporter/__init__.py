@@ -1697,6 +1697,24 @@ class TRACK_EXPORTER_OT_remove_layout(Operator):
         return {"FINISHED"}
 
 
+class TRACK_EXPORTER_OT_move_layout(Operator):
+    bl_idname = "track_exporter.move_layout"
+    bl_label = "Move Layout"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(items=(("UP", "Up", ""), ("DOWN", "Down", "")))
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_layout_index
+        target = index - 1 if self.direction == "UP" else index + 1
+        if not (0 <= index < len(settings.layouts) and 0 <= target < len(settings.layouts)):
+            return {"CANCELLED"}
+        settings.layouts.move(index, target)
+        settings.active_layout_index = target
+        return {"FINISHED"}
+
+
 class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
     bl_idname = "track_exporter.refresh_layout_names"
     bl_label = "Refresh Layout Names"
@@ -2145,6 +2163,10 @@ class TRACK_EXPORTER_PT_track_export(Panel):
         row.label(text="Layouts")
         row.operator("track_exporter.add_layout", text="", icon="ADD")
         row.operator("track_exporter.remove_layout", text="", icon="REMOVE")
+        move_up = row.operator("track_exporter.move_layout", text="", icon="TRIA_UP")
+        move_up.direction = "UP"
+        move_down = row.operator("track_exporter.move_layout", text="", icon="TRIA_DOWN")
+        move_down.direction = "DOWN"
         box.template_list(
             "TRACK_EXPORTER_UL_layouts", "", settings, "layouts", settings, "active_layout_index", rows=3
         )
@@ -2215,6 +2237,7 @@ classes = (
     TRACK_EXPORTER_OT_remove_configuration,
     TRACK_EXPORTER_OT_add_layout,
     TRACK_EXPORTER_OT_remove_layout,
+    TRACK_EXPORTER_OT_move_layout,
     TRACK_EXPORTER_OT_refresh_layout_names,
     TRACK_EXPORTER_OT_add_static_box_collider,
     TRACK_EXPORTER_OT_add_dynamic_box_collider,

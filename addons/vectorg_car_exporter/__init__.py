@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 2, 1),
+    "version": (0, 3, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -46,6 +46,12 @@ WHEEL_LABELS = {
     ("rear", "l"): "Rear Left Wheel",
     ("rear", "r"): "Rear Right Wheel",
 }
+
+TIRE_TYPE_ITEMS = (
+    ("soft", "Soft", "Highest configured tire grip"),
+    ("medium", "Medium", "Balanced configured tire grip"),
+    ("hard", "Hard", "Lowest configured tire grip"),
+)
 
 SOUND_SLOTS = {
     "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
@@ -732,8 +738,10 @@ def validate_scene(settings):
         validate_object_in_car_tree(errors, car_obj, f"Collider {index}", collider.object_ref)
 
     ensure_default_wheels(settings)
+    ensure_default_presets(settings)
 
     wheel_positions = {}
+    wheel_rest_lengths = {}
     for index, wheel in enumerate(settings.wheels, start=1):
         mount_obj = wheel.suspension_ref
         joint_obj = wheel.hub_ref
@@ -753,12 +761,16 @@ def validate_scene(settings):
             errors.append(f"Wheel {index} spin must be inside joint hierarchy")
         if wheel_obj:
             wheel_positions[(wheel.group, wheel.key)] = wheel_obj.matrix_world.translation.copy()
-            up_alignment = object_axis(wheel_obj, BLENDER_AXIS_LOCAL[wheel.up_local_axis]).dot(Vector((0, 0, 1)))
+            up_axis_world = object_axis(wheel_obj, BLENDER_AXIS_LOCAL[wheel.up_local_axis]).normalized()
+            up_alignment = up_axis_world.dot(Vector((0, 0, 1)))
             if up_alignment < ORIENTATION_DOT_THRESHOLD:
                 warnings.append(f"{object_config_name(wheel_obj)} configured up axis should point world +Z")
             axle_alignment = abs(object_axis(wheel_obj, BLENDER_AXIS_LOCAL[wheel.spin_local_axis]).dot(Vector((1, 0, 0))))
             if axle_alignment < ORIENTATION_DOT_THRESHOLD:
                 warnings.append(f"{object_config_name(wheel_obj)} configured spin axis should align with world X left/right")
+            if mount_obj and joint_obj:
+                mount_to_joint = joint_obj.matrix_world.translation - mount_obj.matrix_world.translation
+                wheel_rest_lengths[(wheel.group, wheel.key)] = abs(mount_to_joint.dot(up_axis_world))
 
     for group in ("front", "rear"):
         left_pos = wheel_positions.get((group, "l"))
@@ -771,6 +783,37 @@ def validate_scene(settings):
         rear_pos = wheel_positions.get(("rear", key))
         if front_pos is not None and rear_pos is not None and front_pos.y >= rear_pos.y:
             warnings.append(f"Front {key.upper()} wheel should be forward of rear {key.upper()} wheel on world -Y")
+
+    preset_ids = set()
+    for index, preset in enumerate(settings.presets, start=1):
+        label = preset.display_name.strip() or preset.preset_id or f"Preset {index}"
+        if not preset.preset_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", preset.preset_id):
+            errors.append(f"{label} preset has an invalid ID")
+        elif preset.preset_id in preset_ids:
+            errors.append(f"Duplicate preset ID: {preset.preset_id}")
+        preset_ids.add(preset.preset_id)
+        if not preset.display_name.strip():
+            errors.append(f"{label} preset name is required")
+        for group in ("front", "rear"):
+            wheel = getattr(preset, group)
+            if wheel.tire_type not in {"soft", "medium", "hard"}:
+                errors.append(f"{label} {group} tire type is invalid")
+            if not all(math.isfinite(value) for value in (
+                wheel.pressure,
+                wheel.camber,
+                wheel.toe,
+                wheel.suspension_offset,
+                wheel.suspension_stiffness,
+                wheel.damping_relaxation,
+                wheel.damping_compression,
+            )):
+                errors.append(f"{label} {group} adjustments must be finite")
+            for key in ("l", "r"):
+                rest_length = wheel_rest_lengths.get((group, key))
+                if rest_length is not None and rest_length + wheel.suspension_offset <= 0:
+                    errors.append(
+                        f"{label} {group} suspension offset collapses the {key.upper()} wheel rest length"
+                    )
 
     steering_obj = settings.steering_wheel_object
     if steering_obj:
@@ -840,6 +883,34 @@ class CarWheelSettings(PropertyGroup):
     contact_damping: FloatProperty(name="Contact Damping", default=0.15)
 
 
+class CarWheelPresetSettings(PropertyGroup):
+    group: StringProperty(name="Group", default="front")
+    key: StringProperty(name="Key", default="l")
+    tire_type: EnumProperty(name="Tire Type", items=TIRE_TYPE_ITEMS, default="medium")
+    pressure: FloatProperty(name="Pressure", default=2.0, min=1.3, max=2.7)
+    camber: FloatProperty(name="Camber", default=-4.0)
+    toe: FloatProperty(name="Toe", default=-0.15)
+    suspension_offset: FloatProperty(
+        name="Suspension Offset",
+        description="Signed change to suspension rest length; positive pushes the wheel farther from the mount",
+        default=0.0,
+        min=-0.25,
+        max=0.25,
+        unit="LENGTH",
+    )
+    suspension_stiffness: FloatProperty(name="Suspension Stiffness", default=80.0, min=0.0)
+    damping_relaxation: FloatProperty(name="Damping Relaxation", default=2.6, min=0.0)
+    damping_compression: FloatProperty(name="Damping Compression", default=2.0, min=0.0)
+
+
+class CarPresetSettings(PropertyGroup):
+    preset_id: StringProperty(name="ID", default="default")
+    display_name: StringProperty(name="Name", default="Default")
+    front: PointerProperty(type=CarWheelPresetSettings)
+    rear: PointerProperty(type=CarWheelPresetSettings)
+    wheels: CollectionProperty(type=CarWheelPresetSettings)
+
+
 class CarExporterSettings(PropertyGroup):
     is_configured: BoolProperty(name="Configured", default=False)
     car_id: StringProperty(name="Car ID", default="my_car")
@@ -884,6 +955,9 @@ class CarExporterSettings(PropertyGroup):
     use_custom_sounds: BoolProperty(name="Use Custom Sounds", default=False)
     colliders: CollectionProperty(type=CarColliderSettings)
     wheels: CollectionProperty(type=CarWheelSettings)
+    presets: CollectionProperty(type=CarPresetSettings)
+    active_preset_index: IntProperty(name="Active Preset", default=0)
+    preset_schema_version: IntProperty(default=0, options={"HIDDEN"})
     guide_length: FloatProperty(name="Guide Length", default=4.5, min=0.1, unit="LENGTH")
     guide_width: FloatProperty(name="Guide Width", default=2.0, min=0.1, unit="LENGTH")
     guide_wheelbase: FloatProperty(name="Wheelbase", default=2.7, min=0.1, unit="LENGTH")
@@ -984,6 +1058,9 @@ def clear_configuration_settings(settings):
     settings.steering_wheel_spin_axis = "y"
     settings.colliders.clear()
     settings.wheels.clear()
+    settings.presets.clear()
+    settings.active_preset_index = 0
+    settings.preset_schema_version = 0
     settings.down_force = 0.0
     settings.air_drag = 0.0
     settings.anti_roll = 0.0
@@ -1110,6 +1187,7 @@ def initialize_configuration_settings(settings):
     settings.roof_shake = 1.1
     reset_torque_curve_node()
     ensure_default_wheels(settings)
+    ensure_default_presets(settings)
     create_size_guide(settings)
 
 
@@ -1118,9 +1196,6 @@ def wheel_config(wheel):
         "steering": bool(wheel.steering),
         "mount": {
             "obj": object_config_name(wheel.suspension_ref),
-            "stiffness": wheel.suspension_stiffness,
-            "dampingRelaxation": wheel.damping_relaxation,
-            "dampingCompression": wheel.damping_compression,
         },
         "joint": {
             "obj": object_config_name(wheel.hub_ref),
@@ -1131,9 +1206,6 @@ def wheel_config(wheel):
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[wheel.spin_local_axis],
             "radius": wheel.radius,
             "maxBrakeForce": wheel.max_brake_force,
-            "pressure": wheel.pressure,
-            "camber": wheel.camber,
-            "toe": wheel.toe,
             "sideFrictionStiffness": wheel.side_friction_stiffness,
             "sideFactor": wheel.side_factor,
             "forwardFactor": wheel.forward_factor,
@@ -1149,6 +1221,37 @@ def build_wheels_config(settings):
     for wheel in settings.wheels:
         wheels.setdefault(wheel.group, {})[wheel.key] = wheel_config(wheel)
     return wheels
+
+
+def wheel_preset_config(wheel):
+    return {
+        "tireType": wheel.tire_type,
+        "pressure": wheel.pressure,
+        "camber": wheel.camber,
+        "toe": wheel.toe,
+        "suspensionOffset": wheel.suspension_offset,
+        "suspensionStiffness": wheel.suspension_stiffness,
+        "dampingRelaxation": wheel.damping_relaxation,
+        "dampingCompression": wheel.damping_compression,
+    }
+
+
+def build_presets_config(settings):
+    ensure_default_presets(settings)
+    return [
+        {
+            "id": preset.preset_id,
+            "name": preset.display_name,
+            "wheels": {
+                group: {
+                    key: wheel_preset_config(getattr(preset, group))
+                    for key in ("l", "r")
+                }
+                for group in ("front", "rear")
+            },
+        }
+        for preset in settings.presets
+    ]
 
 
 def sample_torque_curve(settings):
@@ -1235,6 +1338,7 @@ def initialize_car_exporter_defaults():
         for scene in bpy.data.scenes:
             if hasattr(scene, "car_exporter"):
                 ensure_default_wheels(scene.car_exporter)
+                ensure_default_presets(scene.car_exporter)
     except AttributeError:
         return 0.2
     return None
@@ -1287,6 +1391,7 @@ def build_manifest(settings):
             }
 
     return {
+        "version": 2,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
@@ -1350,6 +1455,7 @@ def build_manifest(settings):
             "maxSteeringAngle": settings.max_steering_angle,
         },
         "wheels": build_wheels_config(settings),
+        "presets": build_presets_config(settings),
         "steeringWheel": {
             "obj": object_config_name(settings.steering_wheel_object),
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[settings.steering_wheel_spin_axis],
@@ -1451,6 +1557,81 @@ class CAR_EXPORTER_OT_remove_collider(Operator):
             collider.collider_type = "trimesh"
             collider.mass = 0.0
             settings.colliders.remove(self.index)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_UL_presets(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, index):
+        row = layout.row(align=True)
+        row.label(
+            text=item.display_name or item.preset_id,
+            icon="CHECKMARK" if index == 0 else "OUTLINER_COLLECTION",
+        )
+        row.label(text=item.preset_id)
+
+
+class CAR_EXPORTER_OT_add_preset(Operator):
+    bl_idname = "car_exporter.add_preset"
+    bl_label = "Add Wheel Preset"
+    bl_description = "Add a wheel preset by copying the active preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        source = active_preset(settings)
+        first_preset = len(settings.presets) == 0
+        preset_id = "default" if first_preset else next_preset_id(settings)
+        preset = settings.presets.add()
+        preset.preset_id = preset_id
+        preset.display_name = "Default" if first_preset else f"Preset {len(settings.presets)}"
+        if source:
+            copy_preset_wheels(source, preset)
+        else:
+            ensure_preset_wheels(preset, settings.wheels)
+            for group in ("front", "rear"):
+                source_wheel = next(
+                    wheel for wheel in preset.wheels
+                    if wheel.group == group and wheel.key == "l"
+                )
+                copy_wheel_preset_values(source_wheel, getattr(preset, group))
+            settings.preset_schema_version = 3
+        settings.active_preset_index = len(settings.presets) - 1
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_preset(Operator):
+    bl_idname = "car_exporter.remove_preset"
+    bl_label = "Remove Wheel Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if len(settings.presets) <= 1:
+            self.report({"ERROR"}, "At least one wheel preset is required")
+            return {"CANCELLED"}
+        index = settings.active_preset_index
+        if not (0 <= index < len(settings.presets)):
+            return {"CANCELLED"}
+        settings.presets.remove(index)
+        settings.active_preset_index = min(index, len(settings.presets) - 1)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_move_preset(Operator):
+    bl_idname = "car_exporter.move_preset"
+    bl_label = "Move Wheel Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(items=(("UP", "Up", ""), ("DOWN", "Down", "")))
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_preset_index
+        target = index - 1 if self.direction == "UP" else index + 1
+        if not (0 <= index < len(settings.presets) and 0 <= target < len(settings.presets)):
+            return {"CANCELLED"}
+        settings.presets.move(index, target)
+        settings.active_preset_index = target
         return {"FINISHED"}
 
 
@@ -1581,6 +1762,133 @@ def ensure_default_wheels(settings):
                 "contactDamping": 0.15,
             },
         })
+
+
+def default_wheel_preset_values(group):
+    front_wheel = group == "front"
+    return {
+        "tire_type": "medium",
+        "pressure": 2.0,
+        "camber": -4.0 if front_wheel else -3.0,
+        "toe": -0.15 if front_wheel else 0.2,
+        "suspension_offset": 0.0,
+        "suspension_stiffness": 80.0,
+        "damping_relaxation": 2.6,
+        "damping_compression": 2.0,
+    }
+
+
+def ensure_preset_wheels(preset, source_wheels=None):
+    expected = [(group, key) for group, key, _steering in WHEEL_KEYS]
+    current = [(wheel.group, wheel.key) for wheel in preset.wheels]
+    if current == expected:
+        return
+
+    existing = {
+        (wheel.group, wheel.key): {
+            "tire_type": wheel.tire_type,
+            "pressure": wheel.pressure,
+            "camber": wheel.camber,
+            "toe": wheel.toe,
+            "suspension_offset": wheel.suspension_offset,
+            "suspension_stiffness": wheel.suspension_stiffness,
+            "damping_relaxation": wheel.damping_relaxation,
+            "damping_compression": wheel.damping_compression,
+        }
+        for wheel in preset.wheels
+    }
+    legacy = {
+        (wheel.group, wheel.key): {
+            "tire_type": "medium",
+            "pressure": wheel.pressure,
+            "camber": wheel.camber,
+            "toe": wheel.toe,
+            "suspension_offset": 0.0,
+            "suspension_stiffness": wheel.suspension_stiffness,
+            "damping_relaxation": wheel.damping_relaxation,
+            "damping_compression": wheel.damping_compression,
+        }
+        for wheel in (source_wheels or [])
+    }
+    preset.wheels.clear()
+    for group, key, _steering in WHEEL_KEYS:
+        values = existing.get((group, key)) or legacy.get((group, key)) or default_wheel_preset_values(group)
+        wheel = preset.wheels.add()
+        wheel.group = group
+        wheel.key = key
+        wheel.tire_type = values["tire_type"]
+        wheel.pressure = values["pressure"]
+        wheel.camber = values["camber"]
+        wheel.toe = values["toe"]
+        wheel.suspension_offset = values["suspension_offset"]
+        wheel.suspension_stiffness = values["suspension_stiffness"]
+        wheel.damping_relaxation = values["damping_relaxation"]
+        wheel.damping_compression = values["damping_compression"]
+
+
+def copy_wheel_preset_values(source, target):
+    target.tire_type = source.tire_type
+    target.pressure = source.pressure
+    target.camber = source.camber
+    target.toe = source.toe
+    target.suspension_offset = source.suspension_offset
+    target.suspension_stiffness = source.suspension_stiffness
+    target.damping_relaxation = source.damping_relaxation
+    target.damping_compression = source.damping_compression
+
+
+def ensure_default_presets(settings):
+    if len(settings.presets) == 0:
+        preset = settings.presets.add()
+        preset.preset_id = "default"
+        preset.display_name = "Default"
+        ensure_preset_wheels(preset, settings.wheels)
+        settings.active_preset_index = 0
+    for preset in settings.presets:
+        ensure_preset_wheels(preset)
+    if settings.preset_schema_version < 2:
+        shared_wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
+        for preset in settings.presets:
+            for wheel in preset.wheels:
+                shared = shared_wheels.get((wheel.group, wheel.key))
+                if not shared:
+                    continue
+                wheel.suspension_stiffness = shared.suspension_stiffness
+                wheel.damping_relaxation = shared.damping_relaxation
+                wheel.damping_compression = shared.damping_compression
+    if settings.preset_schema_version < 3:
+        for preset in settings.presets:
+            for group in ("front", "rear"):
+                source = next(
+                    (wheel for wheel in preset.wheels if wheel.group == group and wheel.key == "l"),
+                    None,
+                )
+                if source:
+                    copy_wheel_preset_values(source, getattr(preset, group))
+        settings.preset_schema_version = 3
+    settings.active_preset_index = min(
+        max(settings.active_preset_index, 0),
+        len(settings.presets) - 1,
+    )
+
+
+def active_preset(settings):
+    if 0 <= settings.active_preset_index < len(settings.presets):
+        return settings.presets[settings.active_preset_index]
+    return None
+
+
+def next_preset_id(settings):
+    existing = {preset.preset_id for preset in settings.presets}
+    index = 1
+    while f"preset_{index}" in existing:
+        index += 1
+    return f"preset_{index}"
+
+
+def copy_preset_wheels(source, target):
+    copy_wheel_preset_values(source.front, target.front)
+    copy_wheel_preset_values(source.rear, target.rear)
 
 
 def schedule_defaults_initialization():
@@ -1790,6 +2098,29 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     for key, wheel_data in group_wheels.items():
                         add_wheel_from_config(settings, group, key, wheel_data)
         ensure_default_wheels(settings)
+        settings.presets.clear()
+        settings.preset_schema_version = 3
+        for preset_data in data.get("presets") or []:
+            if not isinstance(preset_data, dict):
+                continue
+            preset = settings.presets.add()
+            preset.preset_id = str(preset_data.get("id", next_preset_id(settings)))
+            preset.display_name = str(preset_data.get("name", preset.preset_id))
+            preset_wheels = preset_data.get("wheels") or {}
+            for group in ("front", "rear"):
+                group_wheels = preset_wheels.get(group) or {}
+                wheel_data = group_wheels.get("l") or group_wheels.get("r") or {}
+                wheel = getattr(preset, group)
+                wheel.tire_type = wheel_data.get("tireType", "medium")
+                wheel.pressure = wheel_data.get("pressure", 2.0)
+                wheel.camber = wheel_data.get("camber", -4.0 if group == "front" else -3.0)
+                wheel.toe = wheel_data.get("toe", -0.15 if group == "front" else 0.2)
+                wheel.suspension_offset = wheel_data.get("suspensionOffset", 0.0)
+                wheel.suspension_stiffness = wheel_data.get("suspensionStiffness", 80.0)
+                wheel.damping_relaxation = wheel_data.get("dampingRelaxation", 2.6)
+                wheel.damping_compression = wheel_data.get("dampingCompression", 2.0)
+        ensure_default_presets(settings)
+        settings.active_preset_index = 0
 
         ratios = engine.get("gearRatios", {})
         settings.reverse_ratio = ratios.get("-1", settings.reverse_ratio)
@@ -1912,20 +2243,53 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "up_local_axis")
         draw_split_prop(layout, wheel, "spin_local_axis")
         draw_split_prop(layout, wheel, "radius")
-        draw_split_prop(layout, wheel, "pressure")
-        draw_split_prop(layout, wheel, "camber")
-        draw_split_prop(layout, wheel, "toe")
         row = layout.row(align=True)
         row.label(text="Sim")
-        draw_split_prop(layout, wheel, "suspension_stiffness")
-        draw_split_prop(layout, wheel, "damping_relaxation")
-        draw_split_prop(layout, wheel, "damping_compression")
         draw_split_prop(layout, wheel, "max_brake_force")
         draw_split_prop(layout, wheel, "side_friction_stiffness")
         draw_split_prop(layout, wheel, "side_factor")
         draw_split_prop(layout, wheel, "forward_factor")
         draw_split_prop(layout, wheel, "brake_factor")
         draw_split_prop(layout, wheel, "contact_damping")
+
+
+def draw_presets(layout, settings):
+    header = layout.row(align=True)
+    header.label(text="Wheel Presets")
+    header.operator("car_exporter.add_preset", text="", icon="ADD")
+    header.operator("car_exporter.remove_preset", text="", icon="REMOVE")
+    move_up = header.operator("car_exporter.move_preset", text="", icon="TRIA_UP")
+    move_up.direction = "UP"
+    move_down = header.operator("car_exporter.move_preset", text="", icon="TRIA_DOWN")
+    move_down.direction = "DOWN"
+    layout.template_list(
+        "CAR_EXPORTER_UL_presets",
+        "",
+        settings,
+        "presets",
+        settings,
+        "active_preset_index",
+        rows=3,
+    )
+    preset = active_preset(settings)
+    if not preset:
+        layout.label(text="Add a wheel preset to configure adjustments", icon="INFO")
+        return
+    draw_split_prop(layout, preset, "preset_id")
+    draw_split_prop(layout, preset, "display_name")
+
+    for group in ("front", "rear"):
+        axle_box = layout.box()
+        axle_box.label(text=f"{group.title()} Wheels")
+        wheel = getattr(preset, group)
+        draw_split_prop(axle_box, wheel, "tire_type")
+        draw_split_prop(axle_box, wheel, "pressure")
+        draw_split_prop(axle_box, wheel, "camber")
+        draw_split_prop(axle_box, wheel, "toe")
+        draw_split_prop(axle_box, wheel, "suspension_offset")
+        draw_split_prop(axle_box, wheel, "suspension_stiffness")
+        draw_split_prop(axle_box, wheel, "damping_relaxation")
+        draw_split_prop(axle_box, wheel, "damping_compression")
 
 
 def draw_cameras(layout, settings):
@@ -2032,8 +2396,11 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_colliders(box, settings)
 
         box = layout.box()
-        box.label(text="Wheels")
+        box.label(text="Wheel Setup")
         draw_wheels(box, settings)
+
+        box = layout.box()
+        draw_presets(box, settings)
 
         box = layout.box()
         box.label(text="Cameras")
@@ -2059,10 +2426,16 @@ class CAR_EXPORTER_PT_car_export(Panel):
 classes = (
     CarColliderSettings,
     CarWheelSettings,
+    CarWheelPresetSettings,
+    CarPresetSettings,
     CarExporterSettings,
+    CAR_EXPORTER_UL_presets,
     CAR_EXPORTER_OT_validate_car,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
+    CAR_EXPORTER_OT_add_preset,
+    CAR_EXPORTER_OT_remove_preset,
+    CAR_EXPORTER_OT_move_preset,
     CAR_EXPORTER_OT_tooltip_label,
     CAR_EXPORTER_OT_reset_torque_curve,
     CAR_EXPORTER_OT_create_configuration,

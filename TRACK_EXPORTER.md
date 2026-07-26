@@ -43,6 +43,10 @@ intentionally whenever package contents change. It is written as
    the forward crossing direction.
 10. Select **Validate Track**, then **Export Track Zip**.
 
+Use the up and down controls beside the layout list to set their player-facing
+order. The exporter writes the manifest `layouts` array in this order, and the
+game uses that order in its track-selection interfaces.
+
 Picking a layout map curve moves it under the generated `<layout_id>_MAP` node
 while preserving its world transform. The exporter calculates layout length from
 that curve, projects it onto world XY for `maps/<layout_id>.svg`, and adaptively
