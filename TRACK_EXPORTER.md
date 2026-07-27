@@ -52,11 +52,56 @@ while preserving its world transform. The exporter calculates layout length from
 that curve, projects it onto world XY for `maps/<layout_id>.svg`, and adaptively
 samples its full 3D shape for `routes/<layout_id>.json`. Route samples have a
 maximum spacing of 5 metres and become denser around corners and elevation
-changes. SVG maps automatically rotate their principal axis horizontally unless
-the layout is nearly square. Draw the curve in driving direction. Circular layouts require one cyclic
-spline; point-to-point layouts require one open spline. MAP hierarchies are
-excluded from the GLB. Layouts without a map curve remain valid and use the
-game's placeholder map and spawn-point reset fallback.
+changes. Route format version 2 stores cumulative distance in metres, world
+position, forward direction, and up direction at every sample. The frame uses
+parallel transport for stable orientation and applies the map curve control
+points' tilt as road banking. Set the curve tilt to match the road on banked
+sections.
+
+The route file also stores the projected distance of the start, finish, and
+checkpoint events. Circular routes are rebased so the start/finish event is
+distance zero. Point-to-point start and finish events must project within 10
+metres of their respective curve endpoints. Every race event must be within 30
+metres of the route, and checkpoint distance must increase in checkpoint order.
+
+SVG maps automatically rotate their principal axis horizontally unless the
+layout is nearly square. Draw the curve in driving direction. Circular layouts
+require one cyclic spline; point-to-point layouts require one open spline. MAP
+hierarchies are excluded from the GLB. Layouts without a map curve remain valid
+and use the game's placeholder map and spawn-point reset fallback.
+
+The generated route data has this shape:
+
+```json
+{
+  "version": 2,
+  "closed": true,
+  "length": 1234.5,
+  "maxSpacing": 5.0,
+  "frame": "parallel_transport",
+  "samples": [
+    {
+      "s": 0.0,
+      "position": [0.0, 0.0, 0.0],
+      "forward": [0.0, 0.0, 1.0],
+      "up": [0.0, 1.0, 0.0]
+    }
+  ],
+  "events": [
+    {
+      "object": "gp_start_finish",
+      "type": "start_finish",
+      "s": 0.0
+    },
+    {
+      "object": "gp_checkpoint_01",
+      "type": "checkpoint",
+      "s": 400.0,
+      "order": 1
+    }
+  ]
+}
+```
 
 Changing a layout's **ID** renames its generated hierarchy nodes, addon-created
 spawn points, route events, and layout box colliders. Use the refresh icon next

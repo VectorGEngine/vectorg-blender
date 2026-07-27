@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -59,6 +59,9 @@ DYNAMIC_COLLIDER_DENSITY = 10.0
 ROUTE_MAX_SPACING = 5.0
 ROUTE_MAX_ANGLE_DEGREES = 5.0
 ROUTE_MAX_CURVE_ERROR = 0.05
+ROUTE_EVENT_MAX_DISTANCE = 30.0
+ROUTE_ENDPOINT_MAX_DISTANCE = 10.0
+ROUTE_EPSILON = 1e-6
 MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
 DEFAULT_MAX_TEXTURE_SIZE = 4096
 DEFAULT_JPEG_QUALITY = 85
@@ -909,22 +912,26 @@ def bezier_needs_subdivision(points):
     )
 
 
-def sample_bezier_segment(points, depth=0):
+def sample_bezier_segment(points, start_parameter=0.0, end_parameter=1.0, depth=0):
     if depth >= 18 or not bezier_needs_subdivision(points):
-        return [points[0], points[3]]
+        return [(points[0], start_parameter), (points[3], end_parameter)]
     left, right = split_bezier(points)
-    left_points = sample_bezier_segment(left, depth + 1)
-    right_points = sample_bezier_segment(right, depth + 1)
+    midpoint = (start_parameter + end_parameter) * 0.5
+    left_points = sample_bezier_segment(left, start_parameter, midpoint, depth + 1)
+    right_points = sample_bezier_segment(right, midpoint, end_parameter, depth + 1)
     return left_points[:-1] + right_points
 
 
 def subdivide_line(start, end):
     distance = (end - start).length
     segments = max(1, int(math.ceil(distance / ROUTE_MAX_SPACING)))
-    return [start.lerp(end, index / segments) for index in range(segments + 1)]
+    return [
+        (start.lerp(end, index / segments), index / segments)
+        for index in range(segments + 1)
+    ]
 
 
-def adaptive_route_points(curve_object):
+def adaptive_route_samples(curve_object):
     if not curve_object or len(curve_object.data.splines) != 1:
         return [], False
     spline = curve_object.data.splines[0]
@@ -943,46 +950,329 @@ def adaptive_route_points(curve_object):
                 points[next_index].co,
             ))
             sampled = sample_bezier_segment(segment)
-            route.extend(sampled if not route else sampled[1:])
+            samples = [
+                {
+                    "position": position,
+                    "tilt": points[index].tilt
+                    + (points[next_index].tilt - points[index].tilt) * parameter,
+                }
+                for position, parameter in sampled
+            ]
+            route.extend(samples if not route else samples[1:])
     elif spline.type == "POLY":
-        points = [matrix @ Vector(point.co[:3]) for point in spline.points]
+        control_points = list(spline.points)
+        points = [matrix @ Vector(point.co[:3]) for point in control_points]
         segment_count = len(points) if spline.use_cyclic_u else len(points) - 1
         for index in range(max(0, segment_count)):
-            sampled = subdivide_line(points[index], points[(index + 1) % len(points)])
-            route.extend(sampled if not route else sampled[1:])
+            next_index = (index + 1) % len(points)
+            sampled = subdivide_line(points[index], points[next_index])
+            samples = [
+                {
+                    "position": position,
+                    "tilt": control_points[index].tilt
+                    + (control_points[next_index].tilt - control_points[index].tilt) * parameter,
+                }
+                for position, parameter in sampled
+            ]
+            route.extend(samples if not route else samples[1:])
 
     closed = bool(spline.use_cyclic_u)
-    if closed and len(route) > 1 and (route[-1] - route[0]).length < 1e-5:
+    if closed and len(route) > 1 and (
+        route[-1]["position"] - route[0]["position"]
+    ).length < 1e-5:
         route.pop()
     return route, closed
 
 
-def route_length(points, closed):
-    if len(points) < 2:
+def adaptive_route_points(curve_object):
+    samples, closed = adaptive_route_samples(curve_object)
+    return [sample["position"] for sample in samples], closed
+
+
+def route_length(samples, closed):
+    if len(samples) < 2:
         return 0.0
-    length = sum((points[index] - points[index - 1]).length for index in range(1, len(points)))
+    positions = [
+        sample["position"] if isinstance(sample, dict) else sample
+        for sample in samples
+    ]
+    length = sum(
+        (positions[index] - positions[index - 1]).length
+        for index in range(1, len(positions))
+    )
     if closed:
-        length += (points[0] - points[-1]).length
+        length += (positions[0] - positions[-1]).length
     return length
 
 
 def update_layout_length(layout):
-    points, closed = adaptive_route_points(layout.map_curve)
-    if len(points) >= 2:
-        layout.length = route_length(points, closed) / 1000.0
-    return points, closed
+    samples, closed = adaptive_route_samples(layout.map_curve)
+    if len(samples) >= 2:
+        layout.length = route_length(samples, closed) / 1000.0
+    return [sample["position"] for sample in samples], closed
+
+
+def route_event_objects(layout):
+    events_root = layout_nodes(layout)["events"]
+    events = [
+        obj for obj in descendants(events_root)
+        if obj.get(EVENT_PROPERTY) in {"start_finish", "start", "finish", "checkpoint"}
+    ] if events_root else []
+    return sorted(events, key=lambda obj: (
+        {"start_finish": 0, "start": 0, "checkpoint": 1, "finish": 2}.get(
+            obj.get(EVENT_PROPERTY),
+            3,
+        ),
+        int(obj.get(ORDER_PROPERTY, 0)),
+        obj.name,
+    ))
+
+
+def closest_route_position(samples, closed, position):
+    segment_count = len(samples) if closed else len(samples) - 1
+    best = None
+    for index in range(max(0, segment_count)):
+        start = samples[index]["position"]
+        end = samples[(index + 1) % len(samples)]["position"]
+        delta = end - start
+        length_squared = delta.length_squared
+        if length_squared <= ROUTE_EPSILON:
+            continue
+        amount = max(0.0, min(1.0, (position - start).dot(delta) / length_squared))
+        point = start + delta * amount
+        distance_squared = (point - position).length_squared
+        if best is None or distance_squared < best["distanceSquared"]:
+            best = {
+                "segment": index,
+                "amount": amount,
+                "point": point,
+                "distanceSquared": distance_squared,
+            }
+    return best
+
+
+def rebase_closed_route(samples, position):
+    projection = closest_route_position(samples, True, position)
+    if not projection:
+        raise ValueError("cannot project the start/finish event onto the route")
+    index = projection["segment"]
+    next_index = (index + 1) % len(samples)
+    amount = projection["amount"]
+    if amount <= ROUTE_EPSILON:
+        start_index = index
+        return samples[start_index:] + samples[:start_index]
+    if amount >= 1.0 - ROUTE_EPSILON:
+        start_index = next_index
+        return samples[start_index:] + samples[:start_index]
+    start = samples[index]
+    end = samples[next_index]
+    seam = {
+        "position": projection["point"],
+        "tilt": start["tilt"] + (end["tilt"] - start["tilt"]) * amount,
+    }
+    return [seam] + samples[next_index:] + samples[:next_index]
+
+
+def route_distances(samples, closed):
+    cumulative = [0.0]
+    for index in range(1, len(samples)):
+        distance = (samples[index]["position"] - samples[index - 1]["position"]).length
+        if distance <= ROUTE_EPSILON:
+            raise ValueError("contains duplicate consecutive samples")
+        cumulative.append(cumulative[-1] + distance)
+    total = cumulative[-1]
+    if closed:
+        closing_distance = (samples[0]["position"] - samples[-1]["position"]).length
+        if closing_distance <= ROUTE_EPSILON:
+            raise ValueError("contains a duplicate closing sample")
+        total += closing_distance
+    if total <= ROUTE_EPSILON:
+        raise ValueError("has zero length")
+    return cumulative, total
+
+
+def route_tangents(samples, closed):
+    tangents = []
+    for index in range(len(samples)):
+        if closed:
+            previous = samples[(index - 1) % len(samples)]["position"]
+            following = samples[(index + 1) % len(samples)]["position"]
+        elif index == 0:
+            previous = samples[0]["position"]
+            following = samples[1]["position"]
+        elif index == len(samples) - 1:
+            previous = samples[-2]["position"]
+            following = samples[-1]["position"]
+        else:
+            previous = samples[index - 1]["position"]
+            following = samples[index + 1]["position"]
+        tangent = following - previous
+        if tangent.length_squared <= ROUTE_EPSILON:
+            raise ValueError(f"has an undefined tangent at sample {index}")
+        tangents.append(tangent.normalized())
+    return tangents
+
+
+def projected_up(reference, tangent):
+    up = reference - tangent * reference.dot(tangent)
+    if up.length_squared <= ROUTE_EPSILON:
+        fallback = min(
+            (Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0))),
+            key=lambda axis: abs(axis.dot(tangent)),
+        )
+        up = fallback - tangent * fallback.dot(tangent)
+    if up.length_squared <= ROUTE_EPSILON:
+        raise ValueError("cannot construct a stable route frame")
+    return up.normalized()
+
+
+def transport_up(up, previous_tangent, tangent):
+    axis = previous_tangent.cross(tangent)
+    dot = max(-1.0, min(1.0, previous_tangent.dot(tangent)))
+    if axis.length_squared <= ROUTE_EPSILON:
+        if dot < 0.0:
+            raise ValueError("contains a 180-degree tangent reversal")
+        return projected_up(up, tangent)
+    transported = Matrix.Rotation(
+        math.acos(dot),
+        3,
+        axis.normalized(),
+    ) @ up
+    return projected_up(transported, tangent)
+
+
+def signed_angle_around_axis(start, end, axis):
+    return math.atan2(axis.dot(start.cross(end)), max(-1.0, min(1.0, start.dot(end))))
+
+
+def route_frames(samples, closed, cumulative, total, reference_up):
+    tangents = route_tangents(samples, closed)
+    base_ups = [projected_up(reference_up, tangents[0])]
+    for index in range(1, len(samples)):
+        base_ups.append(transport_up(base_ups[-1], tangents[index - 1], tangents[index]))
+
+    seam_correction = 0.0
+    if closed:
+        transported = transport_up(base_ups[-1], tangents[-1], tangents[0])
+        seam_correction = signed_angle_around_axis(transported, base_ups[0], tangents[0])
+
+    frames = []
+    for index, sample in enumerate(samples):
+        tangent = tangents[index]
+        distributed_roll = seam_correction * cumulative[index] / total if closed else 0.0
+        up = Matrix.Rotation(distributed_roll + sample["tilt"], 3, tangent) @ base_ups[index]
+        up = projected_up(up, tangent)
+        frames.append({"forward": tangent, "up": up})
+    return frames
+
+
+def game_vector(value):
+    return [round(value.x, 6), round(value.z, 6), round(-value.y, 6)]
+
+
+def route_event_data(layout, samples, closed, cumulative, total):
+    result = []
+    for obj in route_event_objects(layout):
+        projection = closest_route_position(samples, closed, obj.matrix_world.translation)
+        if not projection:
+            raise ValueError(f"cannot project event {obj.name} onto the route")
+        distance = math.sqrt(projection["distanceSquared"])
+        if distance > ROUTE_EVENT_MAX_DISTANCE:
+            raise ValueError(
+                f"event {obj.name} is {distance:.2f} m from the route; "
+                f"maximum is {ROUTE_EVENT_MAX_DISTANCE:.0f} m"
+            )
+        segment = projection["segment"]
+        next_index = (segment + 1) % len(samples)
+        segment_length = (
+            samples[next_index]["position"] - samples[segment]["position"]
+        ).length
+        route_distance = cumulative[segment] + segment_length * projection["amount"]
+        if closed and obj.get(EVENT_PROPERTY) == "start_finish":
+            route_distance = 0.0
+        if closed and total - route_distance <= ROUTE_EPSILON:
+            route_distance = 0.0
+        entry = {
+            "object": obj.name,
+            "type": obj[EVENT_PROPERTY],
+            "s": round(route_distance, 6),
+        }
+        if obj.get(EVENT_PROPERTY) == "checkpoint":
+            entry["order"] = int(obj.get(ORDER_PROPERTY, 0))
+        result.append(entry)
+    return result
+
+
+def validate_route_events(layout, events, total):
+    by_type = {}
+    for event in events:
+        by_type.setdefault(event["type"], []).append(event)
+
+    if layout.route_type == "point_to_point":
+        starts = by_type.get("start", [])
+        finishes = by_type.get("finish", [])
+        if starts and starts[0]["s"] > ROUTE_ENDPOINT_MAX_DISTANCE:
+            raise ValueError(
+                f"start event projects to {starts[0]['s']:.2f} m; "
+                f"it must be within {ROUTE_ENDPOINT_MAX_DISTANCE:.0f} m of the route start"
+            )
+        if finishes and total - finishes[0]["s"] > ROUTE_ENDPOINT_MAX_DISTANCE:
+            raise ValueError(
+                f"finish event projects to {finishes[0]['s']:.2f} m; "
+                f"it must be within {ROUTE_ENDPOINT_MAX_DISTANCE:.0f} m of the route end"
+            )
+
+    checkpoints = sorted(by_type.get("checkpoint", []), key=lambda event: event["order"])
+    for previous, current in zip(checkpoints, checkpoints[1:]):
+        if current["s"] <= previous["s"] + ROUTE_EPSILON:
+            raise ValueError(
+                f"checkpoint {current['order']} does not follow checkpoint "
+                f"{previous['order']} along the route"
+            )
 
 
 def layout_route_data(layout):
-    points, closed = update_layout_length(layout)
+    samples, closed = adaptive_route_samples(layout.map_curve)
+    if len(samples) < 2:
+        raise ValueError("must contain at least two route samples")
+
+    if closed:
+        start_finish = next(
+            (
+                obj for obj in route_event_objects(layout)
+                if obj.get(EVENT_PROPERTY) == "start_finish"
+            ),
+            None,
+        )
+        if not start_finish:
+            raise ValueError("needs a start/finish event to define route distance zero")
+        samples = rebase_closed_route(samples, start_finish.matrix_world.translation)
+
+    cumulative, total = route_distances(samples, closed)
+    reference_up = layout.map_curve.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
+    if reference_up.length_squared <= ROUTE_EPSILON:
+        raise ValueError("map curve has an invalid world up axis")
+    frames = route_frames(samples, closed, cumulative, total, reference_up.normalized())
+    events = route_event_data(layout, samples, closed, cumulative, total)
+    validate_route_events(layout, events, total)
+    layout.length = total / 1000.0
+
     return {
-        "version": 1,
+        "version": 2,
         "closed": closed,
+        "length": round(total, 6),
         "maxSpacing": ROUTE_MAX_SPACING,
-        "points": [
-            [round(point.x, 6), round(point.z, 6), round(-point.y, 6)]
-            for point in points
+        "frame": "parallel_transport",
+        "samples": [
+            {
+                "s": round(cumulative[index], 6),
+                "position": game_vector(sample["position"]),
+                "forward": game_vector(frames[index]["forward"]),
+                "up": game_vector(frames[index]["up"]),
+            }
+            for index, sample in enumerate(samples)
         ],
+        "events": events,
     }
 
 
@@ -1449,6 +1739,11 @@ def validate_scene(settings):
             errors.append(f"{label} checkpoint orders must be contiguous from 1")
         for event in event_objects:
             validate_box_empty(errors, event, "Event")
+        if layout.map_curve:
+            try:
+                layout_route_data(layout)
+            except ValueError as error:
+                errors.append(f"{label} route {error}")
 
     if settings.shared_root_object:
         shared_collision_root = object_with_role(settings.shared_root_object, ROLE_COLLISIONS)
