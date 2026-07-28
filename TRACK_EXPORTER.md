@@ -29,13 +29,29 @@ Set **Package Version** to the asset revision being exported and increment it
 intentionally whenever package contents change. It is written as
 `packageVersion` and is separate from the manifest schema `version`.
 
+## Mesh instances
+
+The exporter enables glTF GPU instancing when the installed Blender glTF
+exporter supports it. For repeated props such as trees, create linked duplicates
+with `Alt+D`, give them identical materials, and parent them directly to the
+scope's `FOLIAGE_CARDS` Empty. Instances must be meshes without children. Apply
+modifiers before creating the linked duplicates when every instance uses the
+same evaluated geometry.
+
+Every shared and layout `VISUALS` root contains two behavior roots:
+
+- `PBR` uses the regular lit track-material path.
+- `FOLIAGE_CARDS` uses unlit, double-sided alpha cutouts without cast or receive
+  shadows.
+
 ## Workflow
 
 1. Select **Create Track Structure**.
 2. Set the track ID and name.
 3. Add one or more layouts.
 4. Draw or assign an optional Bezier or Poly map curve for each layout.
-5. Move visual objects under the generated visual roots.
+5. Move regular visual objects under `PBR` and foliage cards under
+   `FOLIAGE_CARDS`.
 6. Parent driving collision meshes under the appropriate generated surface.
 7. Parent walls, barriers, fences, and props under `OBSTACLES`.
 8. Add spawn points, one start/finish volume, and ordered checkpoints.

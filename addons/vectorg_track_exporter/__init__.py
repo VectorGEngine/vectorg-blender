@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -43,6 +43,8 @@ ROLE_TRACK = "track"
 ROLE_SHARED = "shared"
 ROLE_LAYOUTS = "layouts"
 ROLE_VISUALS = "visuals"
+ROLE_PBR = "pbr"
+ROLE_FOLIAGE_CARDS = "foliage_cards"
 ROLE_COLLISIONS = "collisions"
 ROLE_OBSTACLES = "obstacles"
 ROLE_SPAWN_POINTS = "spawn_points"
@@ -202,6 +204,13 @@ def create_collision_hierarchy(context, parent, name_prefix):
     return collisions
 
 
+def create_visual_hierarchy(context, parent, name_prefix):
+    visuals = create_empty(context, f"{name_prefix}_VISUALS", parent, ROLE_VISUALS)
+    create_empty(context, f"{name_prefix}_PBR", visuals, ROLE_PBR)
+    create_empty(context, f"{name_prefix}_FOLIAGE_CARDS", visuals, ROLE_FOLIAGE_CARDS)
+    return visuals
+
+
 def layout_root_name(layout_id):
     return layout_id if layout_id.startswith("layout_") else f"layout_{layout_id}"
 
@@ -293,6 +302,14 @@ def sync_layout_node_names(layout):
         if generated_name:
             name_map[child] = generated_name
 
+    visuals = direct_child_with_role(root, ROLE_VISUALS)
+    if visuals:
+        for child in visuals.children:
+            if child.get(ROLE_PROPERTY) == ROLE_PBR:
+                name_map[child] = f"{layout_id}_PBR"
+            elif child.get(ROLE_PROPERTY) == ROLE_FOLIAGE_CARDS:
+                name_map[child] = f"{layout_id}_FOLIAGE_CARDS"
+
     collisions = direct_child_with_role(root, ROLE_COLLISIONS)
     if collisions:
         for child in collisions.children:
@@ -380,7 +397,7 @@ def update_layout_visibility(layout, _context):
 def create_layout_hierarchy(context, track_root, layout_id):
     root = create_empty(context, layout_root_name(layout_id), track_root, "layout")
     root["vectorg_layout_id"] = layout_id
-    visuals = create_empty(context, f"{layout_id}_VISUALS", root, ROLE_VISUALS)
+    visuals = create_visual_hierarchy(context, root, layout_id)
     collisions = create_collision_hierarchy(context, root, layout_id)
     spawn_points = create_empty(context, f"{layout_id}_SPAWN_POINTS", root, ROLE_SPAWN_POINTS)
     events = create_empty(context, f"{layout_id}_EVENTS", root, ROLE_EVENTS)
@@ -392,6 +409,8 @@ def layout_generated_node_names(layout_id):
     names = {
         layout_root_name(layout_id),
         f"{layout_id}_VISUALS",
+        f"{layout_id}_PBR",
+        f"{layout_id}_FOLIAGE_CARDS",
         f"{layout_id}_COLLISIONS",
         f"{layout_id}_SPAWN_POINTS",
         f"{layout_id}_EVENTS",
@@ -794,6 +813,16 @@ def gltf_image_export_options(jpeg_quality):
         if name in properties:
             options[name] = value
     return options
+
+
+def gltf_mesh_instance_export_options():
+    properties = {
+        prop.identifier
+        for prop in bpy.ops.export_scene.gltf.get_rna_type().properties
+    }
+    if "export_gpu_instances" not in properties:
+        return {}
+    return {"export_gpu_instances": True}
 
 
 def glb_json(filepath):
@@ -1471,6 +1500,29 @@ def write_layout_map_svg(layout, filepath):
     filepath.write_text(svg, encoding="utf-8")
 
 
+def validate_visual_root(errors, label, visuals):
+    if not visuals:
+        return
+
+    pbr_roots = [
+        child for child in visuals.children
+        if child.get(ROLE_PROPERTY) == ROLE_PBR
+    ]
+    foliage_roots = [
+        child for child in visuals.children
+        if child.get(ROLE_PROPERTY) == ROLE_FOLIAGE_CARDS
+    ]
+    if len(pbr_roots) != 1:
+        errors.append(f"{label} visuals need exactly one PBR root")
+    if len(foliage_roots) != 1:
+        errors.append(f"{label} visuals need exactly one FOLIAGE_CARDS root")
+
+    behavior_roots = set(pbr_roots + foliage_roots)
+    for child in visuals.children:
+        if child not in behavior_roots:
+            errors.append(f"{child.name} must be inside the {label} PBR or FOLIAGE_CARDS root")
+
+
 def validate_collision_root(errors, warnings, label, collision_root):
     if not collision_root:
         errors.append(f"Missing {label} collision root")
@@ -1705,6 +1757,7 @@ def validate_scene(settings):
                 errors.append(f"{label} is missing its {node_label} node")
             elif len(matches) > 1:
                 errors.append(f"{label} has multiple {node_label} nodes")
+        validate_visual_root(errors, label, nodes["visuals"])
         validate_collision_root(errors, warnings, label, nodes["collisions"])
 
         spawn_points = descendants_with_role(nodes["spawnPoints"], ROLE_SPAWN_POINT)
@@ -1746,6 +1799,8 @@ def validate_scene(settings):
                 errors.append(f"{label} route {error}")
 
     if settings.shared_root_object:
+        shared_visuals = object_with_role(settings.shared_root_object, ROLE_VISUALS)
+        validate_visual_root(errors, "Shared", shared_visuals)
         shared_collision_root = object_with_role(settings.shared_root_object, ROLE_COLLISIONS)
         validate_collision_root(errors, warnings, "Shared", shared_collision_root)
 
@@ -1921,7 +1976,7 @@ class TRACK_EXPORTER_OT_create_configuration(Operator):
 
         track_root = create_empty(context, "TRACK_ROOT", role=ROLE_TRACK)
         shared = create_empty(context, "SHARED", track_root, ROLE_SHARED)
-        create_empty(context, "SHARED_VISUALS", shared, ROLE_VISUALS)
+        create_visual_hierarchy(context, shared, "SHARED")
         create_collision_hierarchy(context, shared, "SHARED")
         create_empty(context, "LAYOUTS", track_root, ROLE_LAYOUTS)
 
@@ -2293,6 +2348,7 @@ def export_track_glb(
             export_extras=True,
             export_cameras=False,
             **gltf_image_export_options(jpeg_quality),
+            **gltf_mesh_instance_export_options(),
         )
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")

@@ -40,6 +40,7 @@ def make_cube(name, parent, material, x):
     cube.name = name
     cube.parent = parent
     cube.data.materials.append(material)
+    return cube
 
 
 track = load_module(
@@ -61,6 +62,12 @@ bpy.ops.object.delete(use_global=False)
 
 root = bpy.data.objects.new("TRACK_ROOT", None)
 bpy.context.scene.collection.objects.link(root)
+visuals = track.create_visual_hierarchy(bpy.context, root, "TEST")
+pbr = track.direct_child_with_role(visuals, track.ROLE_PBR)
+foliage_cards = track.direct_child_with_role(visuals, track.ROLE_FOLIAGE_CARDS)
+visual_errors = []
+track.validate_visual_root(visual_errors, "Test", visuals)
+assert visual_errors == []
 
 color_image = bpy.data.images.new("opaque_color", width=8, height=4, alpha=True)
 alpha_image = bpy.data.images.new("alpha_color", width=8, height=4, alpha=True)
@@ -73,9 +80,14 @@ color_material, color_node = make_material("opaque_material", color_image, "colo
 alpha_material, alpha_node = make_material("alpha_material", alpha_image, "alpha")
 normal_material, normal_node = make_material("normal_material", normal_image, "data")
 
-make_cube("opaque_cube", root, color_material, -3)
-make_cube("alpha_cube", root, alpha_material, 0)
-make_cube("normal_cube", root, normal_material, 3)
+opaque_cube = make_cube("opaque_cube", pbr, color_material, -3)
+make_cube("alpha_cube", pbr, alpha_material, 0)
+make_cube("normal_cube", pbr, normal_material, 3)
+for index in range(3):
+    tree = bpy.data.objects.new(f"TREE_{index + 1}", opaque_cube.data)
+    tree.location = (index * 2, 3, 0)
+    tree.parent = foliage_cards
+    bpy.context.scene.collection.objects.link(tree)
 
 export_objects = [root, *track.descendants(root)]
 usage = track.classify_texture_usage(export_objects)
@@ -113,6 +125,18 @@ with tempfile.TemporaryDirectory(prefix="vectorg_exporter_smoke_") as directory:
     track_mime_types = sorted(image["mimeType"] for image in track_json["images"])
     assert track_mime_types == ["image/jpeg", "image/png", "image/png"]
     assert all(image.get("name") != hdr_image.name for image in track_json["images"])
+    exported_roles = {
+        node.get("extras", {}).get(track.ROLE_PROPERTY)
+        for node in track_json["nodes"]
+    }
+    assert track.ROLE_PBR in exported_roles
+    assert track.ROLE_FOLIAGE_CARDS in exported_roles
+    if track.gltf_mesh_instance_export_options():
+        assert "EXT_mesh_gpu_instancing" in track_json.get("extensionsUsed", [])
+        assert any(
+            "EXT_mesh_gpu_instancing" in node.get("extensions", {})
+            for node in track_json["nodes"]
+        )
     assert not list(directory.glob("texture_*.jpg"))
 
     car_path = directory / "car.glb"
