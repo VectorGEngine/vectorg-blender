@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 3, 1),
+    "version": (0, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -122,6 +122,10 @@ def object_config_name(obj):
 
 def set_object_pointer(data, prop_name, object_name):
     setattr(data, prop_name, find_object(object_name))
+
+
+def set_material_pointer(data, prop_name, material_name):
+    setattr(data, prop_name, bpy.data.materials.get(material_name) if material_name else None)
 
 
 def object_axis(obj, local_axis):
@@ -821,6 +825,62 @@ def validate_scene(settings):
         if steering_spin_alignment < STEERING_WHEEL_DOT_THRESHOLD:
             warnings.append("Steering wheel configured spin axis should align with world Y forward/back")
 
+    dashboard_screen = settings.dashboard_screen_object
+    if dashboard_screen:
+        validate_object_in_car_tree(errors, car_obj, "Dashboard screen", dashboard_screen)
+        if dashboard_screen.type != "MESH":
+            errors.append("Dashboard screen must be a mesh object")
+        else:
+            uv_layer = dashboard_screen.data.uv_layers.active
+            if not uv_layer or not uv_layer.data:
+                errors.append("Dashboard screen must have an active UV map")
+            else:
+                u_values = [loop.uv.x for loop in uv_layer.data]
+                v_values = [loop.uv.y for loop in uv_layer.data]
+                if min(u_values) > 0.01 or max(u_values) < 0.99 or min(v_values) > 0.01 or max(v_values) < 0.99:
+                    errors.append("Dashboard screen UV map must cover the full 0-1 texture area")
+
+            screen_materials = {
+                slot.material
+                for slot in dashboard_screen.material_slots
+                if slot.material
+            }
+            if len(screen_materials) != 1:
+                errors.append("Dashboard screen must use exactly one material")
+            else:
+                screen_material = next(iter(screen_materials))
+                material_users = [
+                    obj.name
+                    for obj in bpy.context.scene.objects
+                    if obj != dashboard_screen
+                    and obj.type == "MESH"
+                    and any(slot.material == screen_material for slot in obj.material_slots)
+                    and obj not in guide_objects()
+                ]
+                if material_users:
+                    errors.append(
+                        f"Dashboard screen material must not be shared with other meshes: {', '.join(material_users)}"
+                    )
+
+            screen_size = object_world_bounds_size(dashboard_screen)
+            if not screen_size or screen_size.x <= 1e-6 or screen_size.y <= 1e-6:
+                errors.append("Dashboard screen local X and Y dimensions must be greater than zero")
+
+    exported_material_names = {
+        material.name
+        for material in export_materials(
+            [obj for obj in bpy.context.scene.objects if obj not in guide_objects()]
+        )
+    }
+    for label, prop_name in (
+        ("Headlights", "headlights_material"),
+        ("Brake lights", "brake_lights_material"),
+        ("Reverse lights", "reverse_lights_material"),
+    ):
+        material = getattr(settings, prop_name)
+        if material and material.name not in exported_material_names:
+            errors.append(f"{label} material is not used by an exported mesh: {material.name}")
+
     if settings.use_custom_sounds:
         for slot in SOUND_SLOTS:
             path = getattr(settings, f"sound_{slot}")
@@ -945,6 +1005,10 @@ class CarExporterSettings(PropertyGroup):
     center_of_mass_object: PointerProperty(name="Center of Mass", type=bpy.types.Object)
     steering_wheel_object: PointerProperty(name="Steering Wheel", type=bpy.types.Object)
     steering_wheel_spin_axis: EnumProperty(name="Steering Wheel Spin Axis", items=AXIS_ITEMS, default="y")
+    headlights_material: PointerProperty(name="Headlights", type=bpy.types.Material)
+    brake_lights_material: PointerProperty(name="Brake Lights", type=bpy.types.Material)
+    reverse_lights_material: PointerProperty(name="Reverse Lights", type=bpy.types.Material)
+    dashboard_screen_object: PointerProperty(name="Screen", type=bpy.types.Object)
     down_force: FloatProperty(name="Downforce", default=3000.0)
     air_drag: FloatProperty(name="Air Drag", default=0.5, min=0.0, max=1.0)
     anti_roll: FloatProperty(name="Anti-roll", default=0.4)
@@ -1056,6 +1120,10 @@ def clear_configuration_settings(settings):
     settings.center_of_mass_object = None
     settings.steering_wheel_object = None
     settings.steering_wheel_spin_axis = "y"
+    settings.headlights_material = None
+    settings.brake_lights_material = None
+    settings.reverse_lights_material = None
+    settings.dashboard_screen_object = None
     settings.colliders.clear()
     settings.wheels.clear()
     settings.presets.clear()
@@ -1390,7 +1458,25 @@ def build_manifest(settings):
                 "volume": meta["volume"],
             }
 
-    return {
+    lights = {
+        key: {"material": material.name}
+        for key, material in (
+            ("headlights", settings.headlights_material),
+            ("brakeLights", settings.brake_lights_material),
+            ("reverseLights", settings.reverse_lights_material),
+        )
+        if material
+    }
+
+    dashboard = None
+    if settings.dashboard_screen_object:
+        dashboard = {
+            "screen": {
+                "obj": object_config_name(settings.dashboard_screen_object),
+            },
+        }
+
+    manifest = {
         "version": 2,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
@@ -1460,6 +1546,7 @@ def build_manifest(settings):
             "obj": object_config_name(settings.steering_wheel_object),
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[settings.steering_wheel_spin_axis],
         },
+        "lights": lights,
         "cameras": {
             "chase_cam": {
                 "obj": object_config_name(settings.chase_camera_object),
@@ -1484,6 +1571,9 @@ def build_manifest(settings):
         },
         "sounds": sounds,
     }
+    if dashboard:
+        manifest["dashboard"] = dashboard
+    return manifest
 
 
 def show_validation_popup(context, errors, warnings):
@@ -2152,6 +2242,23 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             set_object_pointer(settings, "steering_wheel_object", steering_wheel)
             settings.steering_wheel_spin_axis = "y"
 
+        lights = data.get("lights", {})
+        for key, prop_name in (
+            ("headlights", "headlights_material"),
+            ("brakeLights", "brake_lights_material"),
+            ("reverseLights", "reverse_lights_material"),
+        ):
+            light = lights.get(key, {}) if isinstance(lights, dict) else {}
+            material_name = light.get("material", "") if isinstance(light, dict) else ""
+            set_material_pointer(settings, prop_name, material_name)
+
+        dashboard = data.get("dashboard", {})
+        screen = dashboard.get("screen", {}) if isinstance(dashboard, dict) else {}
+        if isinstance(screen, dict):
+            set_object_pointer(settings, "dashboard_screen_object", screen.get("obj", ""))
+        else:
+            settings.dashboard_screen_object = None
+
         cameras = data.get("cameras", {})
         for name, attr in (
             ("chase_cam", "chase"),
@@ -2349,6 +2456,16 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.label(text="Steering Wheel")
         draw_split_prop(box, settings, "steering_wheel_object")
         draw_split_prop(box, settings, "steering_wheel_spin_axis")
+
+        box = layout.box()
+        box.label(text="Lights")
+        draw_split_prop(box, settings, "headlights_material")
+        draw_split_prop(box, settings, "brake_lights_material")
+        draw_split_prop(box, settings, "reverse_lights_material")
+
+        box = layout.box()
+        box.label(text="Dashboard")
+        draw_split_prop(box, settings, "dashboard_screen_object")
 
         box = layout.box()
         box.label(text="Engine")

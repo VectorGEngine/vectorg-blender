@@ -125,6 +125,7 @@ body
 body_collider
 centerOfMass
 steering_wheel
+dashboard_screen
 
 suspension_fl
 suspension_fr
@@ -141,6 +142,9 @@ cockpit_cam
 hood_cam
 roof_cam
 ```
+
+`dashboard_screen` is optional. Assign it in the Dashboard section when the car
+has an in-cockpit racing display.
 
 Wheel objects should be direct children of their suspension objects.
 
@@ -180,6 +184,56 @@ Turbo Flutter
 Assigned files are copied into `sounds/`. Audio is required by default because the runtime applies fixed engine sample keys every frame. Disable `Require Audio Slots` only when intentionally exporting a visual/physics-only test package.
 
 Only assigned files are written to `manifest.json`; the addon does not emit references to files that are not packaged.
+
+## Lights
+
+Assign the Headlights, Brake Lights, and Reverse Lights materials in the
+exporter. Each material must be used by an exported mesh and have its emission
+color or texture configured in Blender. The game keeps emission intensity at
+`0` while inactive and sets it to `10` while active. Headlights toggle with `E`
+on keyboard or `R1` on a gamepad.
+
+The selected material names are exported as:
+
+```json
+{
+  "lights": {
+    "headlights": { "material": "headlight_emission" },
+    "brakeLights": { "material": "brake_emission" },
+    "reverseLights": { "material": "reverse_emission" }
+  }
+}
+```
+
+## Dashboard Screen
+
+Create and position a dedicated plane in the dashboard, parent it inside the
+car root, and assign it as **Dashboard > Screen**. The plane must use local X
+for width, local Y for height, and local Z for its normal. It must have one
+dedicated material and an active UV map covering the complete 0-1 texture area.
+Do not share its material with another mesh. Any positive aspect ratio is
+accepted.
+
+Only the selected object is exported:
+
+```json
+{
+  "dashboard": {
+    "screen": {
+      "obj": "dashboard_screen"
+    }
+  }
+}
+```
+
+The runtime measures the plane's physical X:Y ratio, including hierarchy
+scale. Canvas height is always 1024 pixels and width is calculated from that
+ratio. For example, a 2:1 plane creates a 2048 x 1024 canvas.
+
+The display shows five mirrored shift-light pairs across ten LEDs at the top.
+They light from the outside edges toward the center as RPM rises: green, green,
+amber, amber, then red. At the rev limiter all ten LEDs flash together. Gear is
+centered, lap timing is at the bottom left, and speed is at the bottom right.
 
 ## Export
 
