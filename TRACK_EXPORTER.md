@@ -147,7 +147,15 @@ exporter keeps a Blender object pointer to the visual mesh and writes
 box volume using a density of `10 kg/m³`, with a minimum mass of `1 kg`.
 
 Collision meshes without a `vectorg_shape` property are treated as trimesh
-colliders.
+colliders. Validation and export automatically apply non-negative, non-unit
+local scale on collision meshes to their mesh data. Negative collision mesh
+scale remains a validation error.
+
+Dynamic collider target objects may retain Blender's dotted duplicate suffixes,
+such as `.001`. The exporter temporarily replaces dots with underscores in the
+GLB node name and matching `vectorg_target` metadata, then restores the Blender
+object name after export. Validation reports a conflict if the converted name
+is already used by another object.
 
 Event sensors and box colliders use their exported node transforms. Their world
 scale is interpreted as box half-extents, so scale `(5, 1, 2)` produces a box

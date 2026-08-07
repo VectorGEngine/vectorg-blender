@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 4, 0),
+    "version": (0, 4, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -514,6 +514,76 @@ def sync_dynamic_collider_metadata(settings):
             del collider["vectorg_target"]
 
 
+def dynamic_target_export_name(name):
+    return name.replace(".", "_")
+
+
+def validate_dynamic_target_export_names(errors, settings):
+    checked_targets = set()
+    for link in settings.dynamic_colliders:
+        target = link.target_object
+        if not target or target in checked_targets:
+            continue
+        checked_targets.add(target)
+        export_name = dynamic_target_export_name(target.name)
+        existing = bpy.data.objects.get(export_name)
+        if existing and existing != target:
+            errors.append(
+                f"Dynamic collider target {target.name} exports as {export_name}, "
+                f"which conflicts with {existing.name}"
+            )
+
+
+def apply_dynamic_target_export_names(settings):
+    target_names = []
+    collider_targets = []
+    checked_targets = set()
+    try:
+        for link in settings.dynamic_colliders:
+            target = link.target_object
+            if not target or target in checked_targets:
+                continue
+            checked_targets.add(target)
+            export_name = dynamic_target_export_name(target.name)
+            if export_name == target.name:
+                continue
+            existing = bpy.data.objects.get(export_name)
+            if existing and existing != target:
+                raise RuntimeError(
+                    f"Dynamic collider target {target.name} cannot export as {export_name}; "
+                    f"the name is used by {existing.name}"
+                )
+            target_names.append((target, target.name))
+            target.name = export_name
+            if target.name != export_name:
+                raise RuntimeError(
+                    f"Blender could not temporarily rename dynamic collider target to {export_name}"
+                )
+
+        for link in settings.dynamic_colliders:
+            collider = link.collider_object
+            target = link.target_object
+            if not collider or not target:
+                continue
+            had_target = "vectorg_target" in collider
+            collider_targets.append((collider, had_target, collider.get("vectorg_target")))
+            collider["vectorg_target"] = target.name
+    except Exception:
+        restore_dynamic_target_export_names(target_names, collider_targets)
+        raise
+    return target_names, collider_targets
+
+
+def restore_dynamic_target_export_names(target_names, collider_targets):
+    for collider, had_target, target_name in reversed(collider_targets):
+        if had_target:
+            collider["vectorg_target"] = target_name
+        else:
+            collider.pop("vectorg_target", None)
+    for target, name in reversed(target_names):
+        target.name = name
+
+
 def find_surface_group(collision_root, surface_id):
     if not collision_root:
         return None
@@ -690,6 +760,45 @@ def image_is_data(image):
     )
 
 
+def ensure_image_data_loaded(image):
+    if image.has_data:
+        return
+    try:
+        image.pixels[0]
+    except Exception as error:
+        raise RuntimeError(f"Texture {image.name} has no readable pixel data") from error
+    if not image.has_data:
+        raise RuntimeError(f"Texture {image.name} has no readable pixel data")
+
+
+def duplicate_image_with_data(image):
+    ensure_image_data_loaded(image)
+    copy = image.copy()
+    try:
+        ensure_image_data_loaded(copy)
+        return copy
+    except RuntimeError:
+        bpy.data.images.remove(copy)
+
+    width, height = image.size
+    copy = bpy.data.images.new(
+        name=f"{image.name}_vectorg_export_source",
+        width=width,
+        height=height,
+        alpha=image.channels == 4,
+        float_buffer=image.is_float,
+    )
+    try:
+        copy.colorspace_settings.name = image.colorspace_settings.name
+        copy.alpha_mode = image.alpha_mode
+        copy.pixels.foreach_set(image.pixels)
+        copy.update()
+        return copy
+    except Exception as error:
+        bpy.data.images.remove(copy)
+        raise RuntimeError(f"Texture {image.name} pixel data could not be copied") from error
+
+
 def optimized_export_image(
     image,
     usages,
@@ -719,7 +828,7 @@ def optimized_export_image(
         target_height = max(1, round(height * scale))
     else:
         target_width, target_height = width, height
-    copy = image.copy()
+    copy = duplicate_image_with_data(image)
     copy.name = f"{image.name}_vectorg_export_{target_width}x{target_height}"
     if should_resize:
         copy.scale(target_width, target_height)
@@ -1523,6 +1632,83 @@ def validate_visual_root(errors, label, visuals):
             errors.append(f"{child.name} must be inside the {label} PBR or FOLIAGE_CARDS root")
 
 
+def collision_meshes_with_unapplied_scale(settings):
+    scope_roots = [settings.shared_root_object]
+    scope_roots.extend(layout.root_object for layout in settings.layouts)
+    collision_roots = [
+        object_with_role(scope_root, ROLE_COLLISIONS)
+        for scope_root in scope_roots
+        if scope_root
+    ]
+    objects = []
+    seen = set()
+    for collision_root in collision_roots:
+        for obj in descendants(collision_root):
+            if obj in seen:
+                continue
+            seen.add(obj)
+            if (
+                obj.type == "MESH"
+                and obj.get(SHAPE_PROPERTY, "trimesh") == "trimesh"
+                and not any(component < 0 for component in obj.scale)
+                and any(abs(component - 1.0) > 0.0001 for component in obj.scale)
+            ):
+                objects.append(obj)
+    return objects
+
+
+def apply_collision_mesh_scales(context, settings):
+    objects = collision_meshes_with_unapplied_scale(settings)
+    if not objects:
+        return 0
+
+    unavailable = [obj.name for obj in objects if obj.name not in context.view_layer.objects]
+    if unavailable:
+        raise RuntimeError(
+            "Cannot apply collision mesh scale because objects are excluded from the active view layer: "
+            + ", ".join(unavailable)
+        )
+
+    previous_active = context.view_layer.objects.active
+    previous_mode = previous_active.mode if previous_active else "OBJECT"
+    try:
+        if previous_active and previous_mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        with context.temp_override(
+            object=objects[0],
+            active_object=objects[0],
+            selected_objects=objects,
+            selected_editable_objects=objects,
+        ):
+            result = bpy.ops.object.transform_apply(
+                location=False,
+                rotation=False,
+                scale=True,
+                isolate_users=True,
+            )
+        if "FINISHED" not in result:
+            raise RuntimeError("Blender could not apply collision mesh scale")
+    finally:
+        context.view_layer.objects.active = previous_active
+        if previous_active and previous_mode != "OBJECT":
+            with context.temp_override(
+                object=previous_active,
+                active_object=previous_active,
+            ):
+                bpy.ops.object.mode_set(mode=previous_mode)
+
+    unscaled = [
+        obj.name
+        for obj in objects
+        if any(abs(component - 1.0) > 0.0001 for component in obj.scale)
+    ]
+    if unscaled:
+        raise RuntimeError(
+            "Blender did not apply scale to collision meshes: " + ", ".join(unscaled)
+        )
+    return len(objects)
+
+
 def validate_collision_root(errors, warnings, label, collision_root):
     if not collision_root:
         errors.append(f"Missing {label} collision root")
@@ -1636,6 +1822,7 @@ def validate_scene(settings):
     warnings = []
     track_root = settings.track_root_object
     sync_dynamic_collider_metadata(settings)
+    validate_dynamic_target_export_names(errors, settings)
 
     if not valid_id(settings.track_id):
         errors.append("Track ID may only contain letters, numbers, underscore, and dash")
@@ -2303,13 +2490,22 @@ class TRACK_EXPORTER_OT_validate_track(Operator):
     bl_description = "Check the track hierarchy and export requirements"
 
     def execute(self, context):
-        errors, warnings = validate_scene(scene_settings(context))
+        settings = scene_settings(context)
+        try:
+            applied_count = apply_collision_mesh_scales(context, settings)
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        errors, warnings = validate_scene(settings)
+        if applied_count:
+            self.report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
         show_validation_popup(context, errors, warnings)
         return {"CANCELLED"} if errors else {"FINISHED"}
 
 
 def export_track_glb(
     context,
+    settings,
     track_root,
     filepath,
     max_texture_size,
@@ -2332,7 +2528,10 @@ def export_track_glb(
         Path(filepath).parent,
         jpeg_quality,
     )
+    target_names = []
+    collider_targets = []
     try:
+        target_names, collider_targets = apply_dynamic_target_export_names(settings)
         for obj, _hidden, _hide_render in visibility_before:
             obj.hide_set(False)
             obj.hide_render = False
@@ -2353,6 +2552,7 @@ def export_track_glb(
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")
     finally:
+        restore_dynamic_target_export_names(target_names, collider_targets)
         restore_export_textures(restored_nodes, temp_images)
         bpy.ops.object.select_all(action="DESELECT")
         for obj, hidden, hide_render in visibility_before:
@@ -2378,7 +2578,14 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
 
     def execute(self, context):
         settings = scene_settings(context)
+        try:
+            applied_count = apply_collision_mesh_scales(context, settings)
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
         errors, warnings = validate_scene(settings)
+        if applied_count:
+            self.report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
         for message in warnings:
             self.report({"WARNING"}, message)
         if errors:
@@ -2405,6 +2612,7 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
             }
             export_track_glb(
                 context,
+                settings,
                 settings.track_root_object,
                 temp_path / model_filename,
                 int(settings.max_texture_size),

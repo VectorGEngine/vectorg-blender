@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 5, 0),
+    "version": (0, 5, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -197,6 +197,73 @@ def is_object_in_tree(root_obj, obj):
             return True
         current = current.parent
     return False
+
+
+def hierarchy_objects(root_obj):
+    objects = []
+    pending = [root_obj] if root_obj else []
+    while pending:
+        obj = pending.pop()
+        objects.append(obj)
+        pending.extend(reversed(obj.children))
+    return objects
+
+
+def objects_with_unapplied_scale(root_obj):
+    return [
+        obj
+        for obj in hierarchy_objects(root_obj)
+        if any(abs(component - 1.0) > 1e-6 for component in obj.scale)
+    ]
+
+
+def apply_car_hierarchy_scales(context, root_obj):
+    objects = hierarchy_objects(root_obj)
+    if not objects_with_unapplied_scale(root_obj):
+        return
+
+    unavailable = [obj.name for obj in objects if obj.name not in context.view_layer.objects]
+    if unavailable:
+        raise RuntimeError(
+            "Cannot apply scale because car hierarchy objects are excluded from the active view layer: "
+            + ", ".join(unavailable)
+        )
+
+    previous_active = context.view_layer.objects.active
+    previous_mode = previous_active.mode if previous_active else "OBJECT"
+    try:
+        if previous_active and previous_mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        with context.temp_override(
+            object=root_obj,
+            active_object=root_obj,
+            selected_objects=objects,
+            selected_editable_objects=objects,
+        ):
+            result = bpy.ops.object.transform_apply(
+                location=False,
+                rotation=False,
+                scale=True,
+                isolate_users=True,
+            )
+        if "FINISHED" not in result:
+            raise RuntimeError("Blender could not apply scale to the car hierarchy")
+    finally:
+        context.view_layer.objects.active = previous_active
+        if previous_active and previous_mode != "OBJECT":
+            with context.temp_override(
+                object=previous_active,
+                active_object=previous_active,
+            ):
+                bpy.ops.object.mode_set(mode=previous_mode)
+
+    unscaled = [
+        obj.name
+        for obj in objects
+        if any(abs(component - 1.0) > 1e-6 for component in obj.scale)
+    ]
+    if unscaled:
+        raise RuntimeError("Scale was not applied to car hierarchy objects: " + ", ".join(unscaled))
 
 
 def validate_object_in_car_tree(errors, car_obj, label, obj):
@@ -559,6 +626,45 @@ def image_is_data(image):
     )
 
 
+def ensure_image_data_loaded(image):
+    if image.has_data:
+        return
+    try:
+        image.pixels[0]
+    except Exception as error:
+        raise RuntimeError(f"Texture {image.name} has no readable pixel data") from error
+    if not image.has_data:
+        raise RuntimeError(f"Texture {image.name} has no readable pixel data")
+
+
+def duplicate_image_with_data(image):
+    ensure_image_data_loaded(image)
+    copy = image.copy()
+    try:
+        ensure_image_data_loaded(copy)
+        return copy
+    except RuntimeError:
+        bpy.data.images.remove(copy)
+
+    width, height = image.size
+    copy = bpy.data.images.new(
+        name=f"{image.name}_vectorg_export_source",
+        width=width,
+        height=height,
+        alpha=image.channels == 4,
+        float_buffer=image.is_float,
+    )
+    try:
+        copy.colorspace_settings.name = image.colorspace_settings.name
+        copy.alpha_mode = image.alpha_mode
+        copy.pixels.foreach_set(image.pixels)
+        copy.update()
+        return copy
+    except Exception as error:
+        bpy.data.images.remove(copy)
+        raise RuntimeError(f"Texture {image.name} pixel data could not be copied") from error
+
+
 def optimized_export_image(
     image,
     usages,
@@ -588,7 +694,7 @@ def optimized_export_image(
         target_height = max(1, round(height * scale))
     else:
         target_width, target_height = width, height
-    copy = image.copy()
+    copy = duplicate_image_with_data(image)
     copy.name = f"{image.name}_vectorg_export_{target_width}x{target_height}"
     if should_resize:
         copy.scale(target_width, target_height)
@@ -756,6 +862,8 @@ def validate_scene(settings):
             errors.append(f"Wheel {index} joint object is required")
         if not wheel_obj:
             errors.append(f"Wheel {index} spin object is required")
+        if not math.isfinite(wheel.grip_factor) or wheel.grip_factor <= 0:
+            errors.append(f"Wheel {index} grip factor must be a positive number")
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} mount", mount_obj)
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} joint", joint_obj)
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} spin", wheel_obj)
@@ -941,6 +1049,12 @@ class CarWheelSettings(PropertyGroup):
     forward_factor: FloatProperty(name="Forward Factor", default=1.6)
     brake_factor: FloatProperty(name="Brake Factor", default=1.5)
     contact_damping: FloatProperty(name="Contact Damping", default=0.15)
+    grip_factor: FloatProperty(
+        name="Grip Factor",
+        description="Multiplier for this wheel's pressure-derived grip",
+        default=1.0,
+        min=0.01,
+    )
 
 
 class CarWheelPresetSettings(PropertyGroup):
@@ -1029,7 +1143,7 @@ class CarExporterSettings(PropertyGroup):
 
     drive: EnumProperty(name="Drive", items=(("awd", "AWD", ""), ("fwd", "FWD", ""), ("rwd", "RWD", "")), default="awd")
     hp: FloatProperty(name="HP", default=590.0, min=1.0)
-    diff_ratio: FloatProperty(name="Diff Ratio", default=5.0, min=0.01)
+    final_drive_ratio: FloatProperty(name="Final Drive Ratio", default=5.0, min=0.01)
     max_rpm: IntProperty(name="Max RPM", default=8000, min=1)
     idle_rpm: IntProperty(name="Idle RPM", default=1000, min=1)
     redline_rpm: IntProperty(name="Redline RPM", default=7000, min=1)
@@ -1048,6 +1162,12 @@ class CarExporterSettings(PropertyGroup):
     turbo_boost: FloatProperty(name="Turbo Boost", default=1.35, min=1.0)
     turbo_valve: BoolProperty(name="Turbo Valve", default=False)
     max_torque: FloatProperty(name="Max Torque", default=590.0, min=1.0)
+    torque_factor: FloatProperty(
+        name="Torque Factor",
+        description="Multiplier applied to drive and engine-braking torque before tire-force limits",
+        default=1.0,
+        min=0.01,
+    )
 
     reverse_ratio: FloatProperty(name="Reverse", default=-3.57)
     forward_gear_count: IntProperty(name="Forward Gears", default=6, min=1, max=15)
@@ -1139,7 +1259,7 @@ def clear_configuration_settings(settings):
     settings.use_custom_sounds = False
     settings.drive = "awd"
     settings.hp = 1.0
-    settings.diff_ratio = 0.01
+    settings.final_drive_ratio = 0.01
     settings.max_rpm = 1
     settings.idle_rpm = 1
     settings.redline_rpm = 1
@@ -1154,6 +1274,7 @@ def clear_configuration_settings(settings):
     settings.turbo_boost = 1.0
     settings.turbo_valve = False
     settings.max_torque = 1.0
+    settings.torque_factor = 0.01
     settings.reverse_ratio = 0.0
     settings.forward_gear_count = 1
     for index in range(1, 16):
@@ -1195,7 +1316,7 @@ def initialize_configuration_settings(settings):
     settings.max_steering_angle = 50.0
     settings.drive = "awd"
     settings.hp = 590.0
-    settings.diff_ratio = 5.0
+    settings.final_drive_ratio = 5.0
     settings.max_rpm = 8000
     settings.idle_rpm = 1000
     settings.redline_rpm = 7000
@@ -1210,6 +1331,7 @@ def initialize_configuration_settings(settings):
     settings.turbo_boost = 1.35
     settings.turbo_valve = False
     settings.max_torque = 590.0
+    settings.torque_factor = 1.0
     settings.reverse_ratio = -3.57
     settings.forward_gear_count = 6
     for index, value in {
@@ -1279,6 +1401,7 @@ def wheel_config(wheel):
             "forwardFactor": wheel.forward_factor,
             "brakeFactor": wheel.brake_factor,
             "contactDamping": wheel.contact_damping,
+            "gripFactor": wheel.grip_factor,
         },
     }
 
@@ -1495,7 +1618,7 @@ def build_manifest(settings):
         "engine": {
             "hp": settings.hp,
             "drive": settings.drive,
-            "diffRatio": settings.diff_ratio,
+            "finalDriveRatio": settings.final_drive_ratio,
             "maxRPM": settings.max_rpm,
             "idleRPM": settings.idle_rpm,
             "redlineRPM": settings.redline_rpm,
@@ -1506,6 +1629,7 @@ def build_manifest(settings):
             "shiftCooldown": settings.shift_cooldown,
             "autoBlip": settings.auto_blip,
             "autoBlipDuration": settings.auto_blip_duration,
+            "torqueFactor": settings.torque_factor,
             "gearRatios": {
                 **{"0": 0, "-1": settings.reverse_ratio},
                 **{
@@ -1767,6 +1891,7 @@ def add_wheel_from_config(settings, group, key, data=None):
     wheel.forward_factor = spin_data.get("forwardFactor", wheel.forward_factor)
     wheel.brake_factor = spin_data.get("brakeFactor", wheel.brake_factor)
     wheel.contact_damping = spin_data.get("contactDamping", wheel.contact_damping)
+    wheel.grip_factor = spin_data["gripFactor"]
     return wheel
 
 
@@ -1797,6 +1922,7 @@ def ensure_default_wheels(settings):
             "forward_factor": wheel.forward_factor,
             "brake_factor": wheel.brake_factor,
             "contact_damping": wheel.contact_damping,
+            "grip_factor": wheel.grip_factor,
         }
         for wheel in settings.wheels
     }
@@ -1826,6 +1952,7 @@ def ensure_default_wheels(settings):
             wheel.forward_factor = imported["forward_factor"]
             wheel.brake_factor = imported["brake_factor"]
             wheel.contact_damping = imported["contact_damping"]
+            wheel.grip_factor = imported["grip_factor"]
             continue
 
         front_wheel = group == "front"
@@ -1850,6 +1977,7 @@ def ensure_default_wheels(settings):
                 "forwardFactor": 1.6,
                 "brakeFactor": 1.5,
                 "contactDamping": 0.15,
+                "gripFactor": 1.0,
             },
         })
 
@@ -2059,8 +2187,34 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
 
     filepath: StringProperty(name="Export Zip", subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
+    apply_scales_before_export: BoolProperty(
+        name="Apply scales",
+        description="Apply scale to the car root and all descendants before export",
+        default=True,
+    )
+    file_selector_opened: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
+    def open_file_selector(self, context):
+        settings = scene_settings(context)
+        if not self.filepath:
+            self.filepath = bpy.path.abspath(f"//{settings.car_id or 'car'}.zip")
+        self.file_selector_opened = True
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def draw(self, _context):
+        if self.file_selector_opened:
+            return
+        layout = self.layout
+        layout.label(text="One or more car hierarchy objects have unapplied scale.")
+        layout.label(text="This may cause unexpected behaviour in game.")
+        layout.separator()
+        layout.prop(self, "apply_scales_before_export")
 
     def execute(self, context):
+        if not self.file_selector_opened:
+            return self.open_file_selector(context)
+
         settings = scene_settings(context)
         errors, warnings = validate_scene(settings)
         for msg in warnings:
@@ -2075,6 +2229,12 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
             export_zip = export_zip.with_suffix(".zip")
         export_zip.parent.mkdir(parents=True, exist_ok=True)
         ensure_camera_targets(settings)
+        if self.apply_scales_before_export:
+            try:
+                apply_car_hierarchy_scales(context, settings.car_root_object)
+            except RuntimeError as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
 
         with tempfile.TemporaryDirectory(prefix="car_exporter_") as temp_dir:
             temp_path = Path(temp_dir)
@@ -2115,12 +2275,17 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
         self.report({"INFO"}, f"Exported {export_zip}")
         return {"FINISHED"}
 
-    def invoke(self, context, event):
+    def invoke(self, context, _event):
         settings = scene_settings(context)
-        if not self.filepath:
-            self.filepath = f"//{settings.car_id or 'car'}.zip"
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
+        if objects_with_unapplied_scale(settings.car_root_object):
+            self.file_selector_opened = False
+            return context.window_manager.invoke_props_dialog(
+                self,
+                width=420,
+                title="Unapplied Scale",
+                confirm_text="Export",
+            )
+        return self.open_file_selector(context)
 
 
 class CAR_EXPORTER_OT_import_manifest(Operator):
@@ -2137,6 +2302,16 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
             return {"CANCELLED"}
+        wheels_data = data.get("wheels") or {}
+        for group, key, _steering in WHEEL_KEYS:
+            spin_data = ((wheels_data.get(group) or {}).get(key) or {}).get("spin") or {}
+            grip_factor = spin_data.get("gripFactor")
+            if not isinstance(grip_factor, (int, float)) or not math.isfinite(grip_factor) or grip_factor <= 0:
+                self.report(
+                    {"ERROR"},
+                    f"Manifest wheels.{group}.{key}.spin.gripFactor must be a positive number",
+                )
+                return {"CANCELLED"}
 
         settings.is_configured = True
         body = data.get("body", {})
@@ -2151,7 +2326,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             settings.vehicle_tag_offroad = "offroad" in tags
         settings.drive = engine.get("drive", settings.drive)
         settings.hp = engine.get("hp", settings.hp)
-        settings.diff_ratio = engine.get("diffRatio", settings.diff_ratio)
+        settings.final_drive_ratio = engine.get("finalDriveRatio", settings.final_drive_ratio)
         settings.max_rpm = engine.get("maxRPM", settings.max_rpm)
         settings.idle_rpm = engine.get("idleRPM", settings.idle_rpm)
         settings.redline_rpm = engine["redlineRPM"]
@@ -2162,6 +2337,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.shift_cooldown = engine.get("shiftCooldown", settings.shift_cooldown)
         settings.auto_blip = engine.get("autoBlip") is True
         settings.auto_blip_duration = engine.get("autoBlipDuration", settings.auto_blip_duration)
+        settings.torque_factor = engine.get("torqueFactor", settings.torque_factor)
         set_object_pointer(settings, "car_root_object", body.get("obj", ""))
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
@@ -2307,8 +2483,9 @@ def draw_vehicle_tags(layout, settings):
 
 def draw_torque_curve(layout, settings):
     draw_split_prop(layout, settings, "max_torque")
+    draw_split_prop(layout, settings, "torque_factor")
     layout.operator("car_exporter.reset_torque_curve", text="Reset Curve")
-    node = get_torque_curve_node(create=True)
+    node = get_torque_curve_node(create=False)
     if node:
         layout.template_curve_mapping(node, "mapping", type="NONE")
     else:
@@ -2358,6 +2535,7 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "forward_factor")
         draw_split_prop(layout, wheel, "brake_factor")
         draw_split_prop(layout, wheel, "contact_damping")
+        draw_split_prop(layout, wheel, "grip_factor")
 
 
 def draw_presets(layout, settings):
@@ -2472,7 +2650,6 @@ class CAR_EXPORTER_PT_car_export(Panel):
         for prop in (
             "drive",
             "hp",
-            "diff_ratio",
             "idle_rpm",
             "redline_rpm",
             "rev_limit",
@@ -2501,6 +2678,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_split_prop(box, settings, "forward_gear_count")
         for index in range(1, settings.forward_gear_count + 1):
             draw_split_prop(box, settings, f"gear_{index}")
+        draw_split_prop(box, settings, "final_drive_ratio")
 
         box = layout.box()
         box.label(text="Body Physics")

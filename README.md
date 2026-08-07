@@ -34,6 +34,13 @@ src/files/models/vehicles/<car_id>/sounds/
   "packageVersion": "1",
   "model": "<car_id>.glb",
   "engine": {
+    "torqueFactor": 1.0,
+    "finalDriveRatio": 5.0,
+    "gearRatios": {
+      "-1": -3.57,
+      "0": 0,
+      "1": 4.08
+    },
     "idleRPM": 1000,
     "redlineRPM": 7000,
     "revLimit": 7900,
@@ -67,6 +74,10 @@ Increment **Package Version** intentionally whenever exported package contents
 change. Importing an existing car manifest preserves its `packageVersion`.
 Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
+The Gears section exports the final drive as `engine.finalDriveRatio` and the
+individual ratios as `engine.gearRatios`.
+The Torque Curve section exports `engine.torqueFactor`, which scales drive and
+engine-braking torque before tire-force limits are applied.
 The game applies auto blip only when both its gameplay setting and the vehicle's
 `engine.autoBlip` capability are enabled.
 
@@ -79,6 +90,8 @@ a signed change in metres to the calculated suspension rest length. Positive
 values move the wheel farther down from the mount; negative values move it
 toward the mount. The mount position and maximum suspension travel remain
 unchanged. Applying the same offset to every wheel raises or lowers the chassis.
+Each shared wheel's `spin.gripFactor` multiplies its pressure-derived grip;
+`2.0` doubles grip and `0.5` halves it.
 
 Preset adjustments are edited once for the front axle and once for the rear
 axle. Exported manifests still contain separate `l` and `r` wheel entries, with
@@ -238,6 +251,12 @@ centered, lap timing is at the bottom left, and speed is at the bottom right.
 ## Export
 
 Use `Validate Car` first, then `Export Car Zip`.
+
+When the configured car root or any object below it has non-unit scale, export
+asks whether to apply hierarchy scales. Leaving **Apply scales** checked
+updates those Blender objects to `(1, 1, 1)` while preserving their
+transformed geometry. Unchecking it exports without modifying their scales,
+and **Cancel** stops the export.
 
 **Maximum Texture Size** limits the longest side of every exported material
 texture without modifying the source image. The default car limit is `2048`.
