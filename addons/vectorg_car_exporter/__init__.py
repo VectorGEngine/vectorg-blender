@@ -57,14 +57,14 @@ SOUND_SLOTS = {
     "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
     "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "loop": True, "volume": 0.1},
     "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "loop": True, "volume": 0.5},
-    "on_mid": {"label": "On Mid", "default": "BAC_Mono_onmid.wav", "rpm": 1000, "loop": True, "volume": 0.45},
     "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "loop": True, "volume": 0.4},
     "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "loop": True, "volume": 0.3},
-    "off_mid": {"label": "Off Mid", "default": "BAC_Mono_offmid.wav", "rpm": 1000, "loop": True, "volume": 0.35},
     "off_low": {"label": "Off Low", "default": "BAC_Mono_offlow.wav", "rpm": 1000, "loop": True, "volume": 0.3},
     "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "loop": True, "volume": 0.4},
     "turbo_flutter": {"label": "Turbo Flutter", "default": "turbo_flutter.wav", "rpm": 8000, "loop": False, "volume": 0.6},
 }
+OPTIONAL_SOUND_SLOTS = {"tranny_on", "tranny_off", "limiter", "turbo_flutter"}
+SOUND_RPM_SLOTS = {"on_high", "on_low", "off_high", "off_low"}
 
 ORIENTATION_DOT_THRESHOLD = math.cos(math.radians(1.0))
 STEERING_WHEEL_DOT_THRESHOLD = math.cos(math.radians(45.0))
@@ -993,7 +993,8 @@ def validate_scene(settings):
         for slot in SOUND_SLOTS:
             path = getattr(settings, f"sound_{slot}")
             if not path:
-                errors.append(f"Sound slot is not assigned: {slot}")
+                if slot not in OPTIONAL_SOUND_SLOTS:
+                    errors.append(f"Sound slot is not assigned: {slot}")
             elif not os.path.isfile(abspath(path)):
                 errors.append(f"Sound file for {slot} does not exist: {path}")
 
@@ -1216,13 +1217,23 @@ class CarExporterSettings(PropertyGroup):
     sound_tranny_on: StringProperty(name="Transmission On", subtype="FILE_PATH", default="")
     sound_tranny_off: StringProperty(name="Transmission Off", subtype="FILE_PATH", default="")
     sound_on_high: StringProperty(name="On High", subtype="FILE_PATH", default="")
-    sound_on_mid: StringProperty(name="On Mid", subtype="FILE_PATH", default="")
     sound_on_low: StringProperty(name="On Low", subtype="FILE_PATH", default="")
     sound_off_high: StringProperty(name="Off High", subtype="FILE_PATH", default="")
-    sound_off_mid: StringProperty(name="Off Mid", subtype="FILE_PATH", default="")
     sound_off_low: StringProperty(name="Off Low", subtype="FILE_PATH", default="")
     sound_limiter: StringProperty(name="Limiter", subtype="FILE_PATH", default="")
     sound_turbo_flutter: StringProperty(name="Turbo Flutter", subtype="FILE_PATH", default="")
+    sound_tranny_on_volume: FloatProperty(name="Volume", default=0.6, min=0.0, soft_max=1.0)
+    sound_tranny_off_volume: FloatProperty(name="Volume", default=0.1, min=0.0, soft_max=1.0)
+    sound_on_high_rpm: IntProperty(name="RPM", default=1000, min=0)
+    sound_on_high_volume: FloatProperty(name="Volume", default=0.5, min=0.0, soft_max=1.0)
+    sound_on_low_rpm: IntProperty(name="RPM", default=1000, min=0)
+    sound_on_low_volume: FloatProperty(name="Volume", default=0.4, min=0.0, soft_max=1.0)
+    sound_off_high_rpm: IntProperty(name="RPM", default=1000, min=0)
+    sound_off_high_volume: FloatProperty(name="Volume", default=0.3, min=0.0, soft_max=1.0)
+    sound_off_low_rpm: IntProperty(name="RPM", default=1000, min=0)
+    sound_off_low_volume: FloatProperty(name="Volume", default=0.3, min=0.0, soft_max=1.0)
+    sound_limiter_volume: FloatProperty(name="Volume", default=0.4, min=0.0, soft_max=1.0)
+    sound_turbo_flutter_volume: FloatProperty(name="Volume", default=0.6, min=0.0, soft_max=1.0)
 
 
 def clear_configuration_settings(settings):
@@ -1286,8 +1297,11 @@ def clear_configuration_settings(settings):
         setattr(settings, f"{prefix}_fov", 0.0)
         setattr(settings, f"{prefix}_target_distance", 0.01)
         setattr(settings, f"{prefix}_shake", 0.0)
-    for slot in SOUND_SLOTS:
+    for slot, meta in SOUND_SLOTS.items():
         setattr(settings, f"sound_{slot}", "")
+        setattr(settings, f"sound_{slot}_volume", meta["volume"])
+        if slot in SOUND_RPM_SLOTS:
+            setattr(settings, f"sound_{slot}_rpm", meta["rpm"])
     settings.guide_length = 4.5
     settings.guide_width = 2.0
     settings.guide_wheelbase = 2.7
@@ -1479,6 +1493,11 @@ def get_torque_curve_node(create=True):
             return None
         tree = bpy.data.node_groups.new(name=TORQUE_CURVE_NODE_GROUP, type="ShaderNodeTree")
 
+    if create:
+        # The curve node group is an internal data store and is not linked to a
+        # material. Keep it when saving the blend file despite having no users.
+        tree.use_fake_user = True
+
     node = tree.nodes.get(TORQUE_CURVE_NODE)
     if node is None:
         if not create:
@@ -1572,13 +1591,15 @@ def build_manifest(settings):
         for slot, meta in SOUND_SLOTS.items():
             source_path = getattr(settings, f"sound_{slot}")
             if not source_path:
+                if slot in OPTIONAL_SOUND_SLOTS:
+                    sounds[slot] = None
                 continue
             source_name = Path(abspath(source_path)).name
             sounds[slot] = {
                 "source": source_name,
-                "rpm": meta["rpm"],
+                "rpm": getattr(settings, f"sound_{slot}_rpm") if slot in SOUND_RPM_SLOTS else meta["rpm"],
                 "loop": meta["loop"],
-                "volume": meta["volume"],
+                "volume": getattr(settings, f"sound_{slot}_volume"),
             }
 
     lights = {
@@ -2705,8 +2726,15 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.label(text="Audio")
         draw_split_prop(box, settings, "use_custom_sounds")
         if settings.use_custom_sounds:
-            for slot, meta in SOUND_SLOTS.items():
-                draw_split_prop(box, settings, f"sound_{slot}", label=meta["label"])
+            for index, (slot, meta) in enumerate(SOUND_SLOTS.items()):
+                if index:
+                    box.separator(type="LINE")
+                sound_section = box.column()
+                sound_section.label(text=meta["label"])
+                draw_split_prop(sound_section, settings, f"sound_{slot}", label="File")
+                if slot in SOUND_RPM_SLOTS:
+                    draw_split_prop(sound_section, settings, f"sound_{slot}_rpm")
+                draw_split_prop(sound_section, settings, f"sound_{slot}_volume")
 
         box = layout.box()
         box.operator("car_exporter.remove_configuration", icon="TRASH")
