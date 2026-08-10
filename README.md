@@ -29,7 +29,7 @@ src/files/models/vehicles/<car_id>/sounds/
 
 ```json
 {
-  "version": 2,
+  "version": 5,
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
@@ -47,21 +47,40 @@ src/files/models/vehicles/<car_id>/sounds/
     "maxRPM": 8000,
     "autoBlip": true
   },
+  "steeringWheel": {
+    "obj": "steering_wheel",
+    "spinLocalAxis": [0, 1, 0]
+  },
   "presets": [
     {
       "id": "default",
       "name": "Default",
+      "maxSteeringAngle": 50.0,
+      "maxDegreesOfRotation": 540.0,
+      "antiRoll": 0.4,
+      "abs": 1.0,
+      "esc": 0.0,
+      "tractionControl": 1.0,
+      "brakeBias": 0.6,
       "wheels": {
         "front": {
           "l": {
             "tireType": "medium",
             "pressure": 2.0,
             "camber": -4.0,
+            "caster": 6.0,
             "toe": -0.15,
             "suspensionOffset": 0.0,
             "suspensionStiffness": 80.0,
             "dampingRelaxation": 2.6,
-            "dampingCompression": 2.0
+            "dampingCompression": 2.0,
+            "maxBrakeForce": 1000.0,
+            "sideFrictionStiffness": 1.0,
+            "sideFactor": 1.0,
+            "forwardFactor": 1.6,
+            "brakeFactor": 1.0,
+            "contactDamping": 0.15,
+            "gripFactor": 1.0
           }
         }
       }
@@ -81,17 +100,23 @@ engine-braking torque before tire-force limits are applied.
 The game applies auto blip only when both its gameplay setting and the vehicle's
 `engine.autoBlip` capability are enabled.
 
-Wheel object selections, axes, radius, steering behavior, braking, and friction
-parameters are shared by every preset. Presets contain tire type, pressure,
-camber, toe, suspension offset, suspension stiffness, relaxation damping, and
-compression damping. The current game uses the first preset. Tire type is
+Wheel object selections, axes, radius, and steering behavior are shared by
+every preset. Car presets contain steering limits, steering-wheel rotation,
+anti-roll, driver assists, brake bias, and per-axle tire, suspension, braking,
+friction, damping, and grip configuration. The current game uses the first
+preset. Tire type is
 `soft`, `medium`, or `hard`, with `medium` as the default. Suspension offset is
 a signed change in metres to the calculated suspension rest length. Positive
 values move the wheel farther down from the mount; negative values move it
 toward the mount. The mount position and maximum suspension travel remain
 unchanged. Applying the same offset to every wheel raises or lowers the chassis.
-Each shared wheel's `spin.gripFactor` multiplies its pressure-derived grip;
+Each preset wheel's `gripFactor` multiplies its pressure-derived grip;
 `2.0` doubles grip and `0.5` halves it.
+
+Caster is expressed in degrees. Positive caster tilts the top of the steering
+and suspension axis toward the rear of the car; negative caster tilts it toward
+the front. The game creates this pivot at runtime at the wheel spin center, so
+the exported model does not need an additional caster object.
 
 Preset adjustments are edited once for the front axle and once for the rear
 axle. Exported manifests still contain separate `l` and `r` wheel entries, with

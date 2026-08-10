@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 5, 2),
+    "version": (0, 5, 8),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -862,8 +862,6 @@ def validate_scene(settings):
             errors.append(f"Wheel {index} joint object is required")
         if not wheel_obj:
             errors.append(f"Wheel {index} spin object is required")
-        if not math.isfinite(wheel.grip_factor) or wheel.grip_factor <= 0:
-            errors.append(f"Wheel {index} grip factor must be a positive number")
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} mount", mount_obj)
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} joint", joint_obj)
         validate_object_in_car_tree(errors, car_obj, f"Wheel {index} spin", wheel_obj)
@@ -906,6 +904,18 @@ def validate_scene(settings):
         preset_ids.add(preset.preset_id)
         if not preset.display_name.strip():
             errors.append(f"{label} preset name is required")
+        if not math.isfinite(preset.max_steering_angle) or not 1.0 <= preset.max_steering_angle <= 90.0:
+            errors.append(f"{label} max steering angle must be between 1 and 90 degrees")
+        if not math.isfinite(preset.max_degrees_of_rotation) or not 90.0 <= preset.max_degrees_of_rotation <= 2160.0:
+            errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
+        if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in (
+            preset.anti_roll,
+            preset.abs,
+            preset.esc,
+            preset.traction_control,
+            preset.brake_bias,
+        )):
+            errors.append(f"{label} assists, anti-roll, and brake bias must be between 0 and 1")
         for group in ("front", "rear"):
             wheel = getattr(preset, group)
             if wheel.tire_type not in {"soft", "medium", "hard"}:
@@ -913,13 +923,37 @@ def validate_scene(settings):
             if not all(math.isfinite(value) for value in (
                 wheel.pressure,
                 wheel.camber,
+                wheel.caster,
                 wheel.toe,
                 wheel.suspension_offset,
                 wheel.suspension_stiffness,
                 wheel.damping_relaxation,
                 wheel.damping_compression,
+                wheel.max_brake_force,
+                wheel.side_friction_stiffness,
+                wheel.side_factor,
+                wheel.forward_factor,
+                wheel.brake_factor,
+                wheel.contact_damping,
+                wheel.grip_factor,
             )):
                 errors.append(f"{label} {group} adjustments must be finite")
+            if not -15.0 <= wheel.caster <= 15.0:
+                errors.append(f"{label} {group} caster must be between -15 and 15 degrees")
+            if any(value < 0 for value in (
+                wheel.suspension_stiffness,
+                wheel.damping_relaxation,
+                wheel.damping_compression,
+                wheel.max_brake_force,
+                wheel.side_friction_stiffness,
+                wheel.side_factor,
+                wheel.forward_factor,
+                wheel.brake_factor,
+                wheel.contact_damping,
+            )):
+                errors.append(f"{label} {group} handling values must be non-negative")
+            if wheel.grip_factor <= 0:
+                errors.append(f"{label} {group} grip factor must be a positive number")
             for key in ("l", "r"):
                 rest_length = wheel_rest_lengths.get((group, key))
                 if rest_length is not None and rest_length + wheel.suspension_offset <= 0:
@@ -1037,24 +1071,24 @@ class CarWheelSettings(PropertyGroup):
     wheel_ref: PointerProperty(name="Spin", type=bpy.types.Object)
     up_local_axis: EnumProperty(name="Up Local Axis", items=AXIS_ITEMS, default="z")
     spin_local_axis: EnumProperty(name="Spin Local Axis", items=AXIS_ITEMS, default="x")
-    suspension_stiffness: FloatProperty(name="Suspension Stiffness", default=80.0)
-    damping_relaxation: FloatProperty(name="Damping Relaxation", default=2.6)
-    damping_compression: FloatProperty(name="Damping Compression", default=2.0)
     radius: FloatProperty(name="Radius", default=0.3, min=0.01)
-    max_brake_force: FloatProperty(name="Max Brake Force", default=5000.0, min=0.0)
-    pressure: FloatProperty(name="Pressure", default=2.0, min=1.3, max=2.7)
-    camber: FloatProperty(name="Camber", default=-4.0)
-    toe: FloatProperty(name="Toe", default=-0.15)
-    side_friction_stiffness: FloatProperty(name="Side Friction", default=1.0)
-    side_factor: FloatProperty(name="Side Factor", default=1.0)
-    forward_factor: FloatProperty(name="Forward Factor", default=1.6)
-    brake_factor: FloatProperty(name="Brake Factor", default=1.5)
-    contact_damping: FloatProperty(name="Contact Damping", default=0.15)
+    # Retained as hidden migration sources for blend files saved with preset schema 3.
+    suspension_stiffness: FloatProperty(default=80.0, options={"HIDDEN"})
+    damping_relaxation: FloatProperty(default=2.6, options={"HIDDEN"})
+    damping_compression: FloatProperty(default=2.0, options={"HIDDEN"})
+    max_brake_force: FloatProperty(default=1000.0, min=0.0, options={"HIDDEN"})
+    pressure: FloatProperty(default=2.0, min=1.3, max=2.7, options={"HIDDEN"})
+    camber: FloatProperty(default=-4.0, options={"HIDDEN"})
+    toe: FloatProperty(default=-0.15, options={"HIDDEN"})
+    side_friction_stiffness: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
+    side_factor: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
+    forward_factor: FloatProperty(default=1.6, min=0.0, options={"HIDDEN"})
+    brake_factor: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
+    contact_damping: FloatProperty(default=0.15, min=0.0, options={"HIDDEN"})
     grip_factor: FloatProperty(
-        name="Grip Factor",
-        description="Multiplier for this wheel's pressure-derived grip",
         default=1.0,
         min=0.01,
+        options={"HIDDEN"},
     )
 
 
@@ -1064,6 +1098,13 @@ class CarWheelPresetSettings(PropertyGroup):
     tire_type: EnumProperty(name="Tire Type", items=TIRE_TYPE_ITEMS, default="medium")
     pressure: FloatProperty(name="Pressure", default=2.0, min=1.3, max=2.7)
     camber: FloatProperty(name="Camber", default=-4.0)
+    caster: FloatProperty(
+        name="Caster",
+        description="Positive values tilt the top of the steering axis toward the rear of the car",
+        default=0.0,
+        min=-15.0,
+        max=15.0,
+    )
     toe: FloatProperty(name="Toe", default=-0.15)
     suspension_offset: FloatProperty(
         name="Suspension Offset",
@@ -1076,11 +1117,43 @@ class CarWheelPresetSettings(PropertyGroup):
     suspension_stiffness: FloatProperty(name="Suspension Stiffness", default=80.0, min=0.0)
     damping_relaxation: FloatProperty(name="Damping Relaxation", default=2.6, min=0.0)
     damping_compression: FloatProperty(name="Damping Compression", default=2.0, min=0.0)
+    max_brake_force: FloatProperty(name="Max Brake Force", default=1000.0, min=0.0)
+    side_friction_stiffness: FloatProperty(name="Side Friction", default=1.0, min=0.0)
+    side_factor: FloatProperty(name="Side Factor", default=1.0, min=0.0)
+    forward_factor: FloatProperty(name="Forward Factor", default=1.6, min=0.0)
+    brake_factor: FloatProperty(name="Brake Factor", default=1.0, min=0.0)
+    contact_damping: FloatProperty(name="Contact Damping", default=0.15, min=0.0)
+    grip_factor: FloatProperty(
+        name="Grip Factor",
+        description="Multiplier for this wheel's pressure-derived grip",
+        default=1.0,
+        min=0.01,
+    )
 
 
 class CarPresetSettings(PropertyGroup):
     preset_id: StringProperty(name="ID", default="default")
     display_name: StringProperty(name="Name", default="Default")
+    max_steering_angle: FloatProperty(name="Max Steering Angle", default=50.0, min=1.0, max=90.0)
+    max_degrees_of_rotation: FloatProperty(
+        name="Max Degrees of Rotation",
+        description="Maximum steering wheel rotation from full left lock to full right lock",
+        default=540.0,
+        min=90.0,
+        max=2160.0,
+    )
+    anti_roll: FloatProperty(name="Anti-roll", default=0.4, min=0.0, max=1.0)
+    abs: FloatProperty(name="ABS", default=1.0, min=0.0, max=1.0)
+    esc: FloatProperty(name="ESC", default=0.0, min=0.0, max=1.0)
+    traction_control: FloatProperty(name="Traction Control", default=1.0, min=0.0, max=1.0)
+    brake_bias: FloatProperty(
+        name="Brake Bias",
+        description="Front brake force proportion",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
     front: PointerProperty(type=CarWheelPresetSettings)
     rear: PointerProperty(type=CarWheelPresetSettings)
     wheels: CollectionProperty(type=CarWheelPresetSettings)
@@ -1120,17 +1193,20 @@ class CarExporterSettings(PropertyGroup):
     center_of_mass_object: PointerProperty(name="Center of Mass", type=bpy.types.Object)
     steering_wheel_object: PointerProperty(name="Steering Wheel", type=bpy.types.Object)
     steering_wheel_spin_axis: EnumProperty(name="Steering Wheel Spin Axis", items=AXIS_ITEMS, default="y")
+    # Retained as hidden migration sources for blend files saved with preset schema 4.
+    max_degrees_of_rotation: FloatProperty(default=540.0, min=90.0, max=2160.0, options={"HIDDEN"})
     headlights_material: PointerProperty(name="Headlights", type=bpy.types.Material)
     brake_lights_material: PointerProperty(name="Brake Lights", type=bpy.types.Material)
     reverse_lights_material: PointerProperty(name="Reverse Lights", type=bpy.types.Material)
     dashboard_screen_object: PointerProperty(name="Screen", type=bpy.types.Object)
     down_force: FloatProperty(name="Downforce", default=3000.0)
     air_drag: FloatProperty(name="Air Drag", default=0.5, min=0.0, max=1.0)
-    anti_roll: FloatProperty(name="Anti-roll", default=0.4)
-    abs: FloatProperty(name="ABS", default=1.0, min=0.0, max=1.0)
-    esc: FloatProperty(name="ESC", default=0.0, min=0.0, max=1.0)
-    traction_control: FloatProperty(name="Traction Control", default=1.0, min=0.0, max=1.0)
-    max_steering_angle: FloatProperty(name="Max Steering Angle", default=50.0, min=1.0, max=90.0)
+    anti_roll: FloatProperty(default=0.4, min=0.0, max=1.0, options={"HIDDEN"})
+    abs: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
+    esc: FloatProperty(default=0.0, min=0.0, max=1.0, options={"HIDDEN"})
+    traction_control: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
+    # Retained as a hidden migration source for blend files saved with preset schema 3.
+    max_steering_angle: FloatProperty(default=50.0, min=1.0, max=90.0, options={"HIDDEN"})
     use_custom_sounds: BoolProperty(name="Use Custom Sounds", default=False)
     colliders: CollectionProperty(type=CarColliderSettings)
     wheels: CollectionProperty(type=CarWheelSettings)
@@ -1251,6 +1327,7 @@ def clear_configuration_settings(settings):
     settings.center_of_mass_object = None
     settings.steering_wheel_object = None
     settings.steering_wheel_spin_axis = "y"
+    settings.max_degrees_of_rotation = 540.0
     settings.headlights_material = None
     settings.brake_lights_material = None
     settings.reverse_lights_material = None
@@ -1328,6 +1405,7 @@ def initialize_configuration_settings(settings):
     settings.esc = 0.0
     settings.traction_control = 1.0
     settings.max_steering_angle = 50.0
+    settings.max_degrees_of_rotation = 540.0
     settings.drive = "awd"
     settings.hp = 590.0
     settings.final_drive_ratio = 5.0
@@ -1392,6 +1470,11 @@ def initialize_configuration_settings(settings):
     reset_torque_curve_node()
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
+    preset = active_preset(settings)
+    if preset:
+        preset.front.caster = 6.0
+        preset.rear.caster = 0.0
+        settings.preset_schema_version = 6
     create_size_guide(settings)
 
 
@@ -1409,13 +1492,6 @@ def wheel_config(wheel):
             "upLocalAxis": BLENDER_AXIS_TO_GAME[wheel.up_local_axis],
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[wheel.spin_local_axis],
             "radius": wheel.radius,
-            "maxBrakeForce": wheel.max_brake_force,
-            "sideFrictionStiffness": wheel.side_friction_stiffness,
-            "sideFactor": wheel.side_factor,
-            "forwardFactor": wheel.forward_factor,
-            "brakeFactor": wheel.brake_factor,
-            "contactDamping": wheel.contact_damping,
-            "gripFactor": wheel.grip_factor,
         },
     }
 
@@ -1433,11 +1509,19 @@ def wheel_preset_config(wheel):
         "tireType": wheel.tire_type,
         "pressure": wheel.pressure,
         "camber": wheel.camber,
+        "caster": wheel.caster,
         "toe": wheel.toe,
         "suspensionOffset": wheel.suspension_offset,
         "suspensionStiffness": wheel.suspension_stiffness,
         "dampingRelaxation": wheel.damping_relaxation,
         "dampingCompression": wheel.damping_compression,
+        "maxBrakeForce": wheel.max_brake_force,
+        "sideFrictionStiffness": wheel.side_friction_stiffness,
+        "sideFactor": wheel.side_factor,
+        "forwardFactor": wheel.forward_factor,
+        "brakeFactor": wheel.brake_factor,
+        "contactDamping": wheel.contact_damping,
+        "gripFactor": wheel.grip_factor,
     }
 
 
@@ -1447,6 +1531,13 @@ def build_presets_config(settings):
         {
             "id": preset.preset_id,
             "name": preset.display_name,
+            "maxSteeringAngle": preset.max_steering_angle,
+            "maxDegreesOfRotation": preset.max_degrees_of_rotation,
+            "antiRoll": preset.anti_roll,
+            "abs": preset.abs,
+            "esc": preset.esc,
+            "tractionControl": preset.traction_control,
+            "brakeBias": preset.brake_bias,
             "wheels": {
                 group: {
                     key: wheel_preset_config(getattr(preset, group))
@@ -1621,7 +1712,7 @@ def build_manifest(settings):
         }
 
     manifest = {
-        "version": 2,
+        "version": 5,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
@@ -1679,11 +1770,6 @@ def build_manifest(settings):
             ],
             "downForce": settings.down_force,
             "airDrag": settings.air_drag,
-            "antiRoll": settings.anti_roll,
-            "abs": settings.abs,
-            "esc": settings.esc,
-            "tractionControl": settings.traction_control,
-            "maxSteeringAngle": settings.max_steering_angle,
         },
         "wheels": build_wheels_config(settings),
         "presets": build_presets_config(settings),
@@ -1807,42 +1893,35 @@ class CAR_EXPORTER_UL_presets(bpy.types.UIList):
 
 class CAR_EXPORTER_OT_add_preset(Operator):
     bl_idname = "car_exporter.add_preset"
-    bl_label = "Add Wheel Preset"
-    bl_description = "Add a wheel preset by copying the active preset"
+    bl_label = "Add Car Preset"
+    bl_description = "Add a car preset with default handling values"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = scene_settings(context)
-        source = active_preset(settings)
+        if len(settings.presets) > 0:
+            ensure_default_presets(settings)
         first_preset = len(settings.presets) == 0
         preset_id = "default" if first_preset else next_preset_id(settings)
         preset = settings.presets.add()
         preset.preset_id = preset_id
         preset.display_name = "Default" if first_preset else f"Preset {len(settings.presets)}"
-        if source:
-            copy_preset_wheels(source, preset)
-        else:
-            ensure_preset_wheels(preset, settings.wheels)
-            for group in ("front", "rear"):
-                source_wheel = next(
-                    wheel for wheel in preset.wheels
-                    if wheel.group == group and wheel.key == "l"
-                )
-                copy_wheel_preset_values(source_wheel, getattr(preset, group))
-            settings.preset_schema_version = 3
+        ensure_preset_wheels(preset)
+        apply_preset_values(default_preset_values(), preset)
+        settings.preset_schema_version = 6
         settings.active_preset_index = len(settings.presets) - 1
         return {"FINISHED"}
 
 
 class CAR_EXPORTER_OT_remove_preset(Operator):
     bl_idname = "car_exporter.remove_preset"
-    bl_label = "Remove Wheel Preset"
+    bl_label = "Remove Car Preset"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = scene_settings(context)
         if len(settings.presets) <= 1:
-            self.report({"ERROR"}, "At least one wheel preset is required")
+            self.report({"ERROR"}, "At least one car preset is required")
             return {"CANCELLED"}
         index = settings.active_preset_index
         if not (0 <= index < len(settings.presets)):
@@ -1854,7 +1933,7 @@ class CAR_EXPORTER_OT_remove_preset(Operator):
 
 class CAR_EXPORTER_OT_move_preset(Operator):
     bl_idname = "car_exporter.move_preset"
-    bl_label = "Move Wheel Preset"
+    bl_label = "Move Car Preset"
     bl_options = {"REGISTER", "UNDO"}
 
     direction: EnumProperty(items=(("UP", "Up", ""), ("DOWN", "Down", "")))
@@ -1899,6 +1978,7 @@ def add_wheel_from_config(settings, group, key, data=None):
     set_object_pointer(wheel, "wheel_ref", spin_data.get("obj", ""))
     wheel.up_local_axis = GAME_AXIS_TO_BLENDER.get(tuple(spin_data.get("upLocalAxis", [0, 1, 0])), "z")
     wheel.spin_local_axis = GAME_AXIS_TO_BLENDER.get(tuple(spin_data.get("spinLocalAxis", [1, 0, 0])), "x")
+    # Populate legacy storage so schema migration can preserve version 2/3 blend data.
     wheel.suspension_stiffness = mount.get("stiffness", wheel.suspension_stiffness)
     wheel.damping_relaxation = mount.get("dampingRelaxation", wheel.damping_relaxation)
     wheel.damping_compression = mount.get("dampingCompression", wheel.damping_compression)
@@ -1912,7 +1992,7 @@ def add_wheel_from_config(settings, group, key, data=None):
     wheel.forward_factor = spin_data.get("forwardFactor", wheel.forward_factor)
     wheel.brake_factor = spin_data.get("brakeFactor", wheel.brake_factor)
     wheel.contact_damping = spin_data.get("contactDamping", wheel.contact_damping)
-    wheel.grip_factor = spin_data["gripFactor"]
+    wheel.grip_factor = spin_data.get("gripFactor", wheel.grip_factor)
     return wheel
 
 
@@ -1989,14 +2069,14 @@ def ensure_default_wheels(settings):
                 "upLocalAxis": [0, 1, 0],
                 "spinLocalAxis": [1, 0, 0],
                 "radius": 0.3,
-                "maxBrakeForce": 5000,
+                "maxBrakeForce": 1000,
                 "pressure": 2.0,
                 "camber": -4.0 if front_wheel else -3.0,
                 "toe": -0.15 if front_wheel else 0.2,
                 "sideFrictionStiffness": 1.0,
                 "sideFactor": 1.0,
                 "forwardFactor": 1.6,
-                "brakeFactor": 1.5,
+                "brakeFactor": 1.0,
                 "contactDamping": 0.15,
                 "gripFactor": 1.0,
             },
@@ -2009,11 +2089,33 @@ def default_wheel_preset_values(group):
         "tire_type": "medium",
         "pressure": 2.0,
         "camber": -4.0 if front_wheel else -3.0,
+        "caster": 6.0 if front_wheel else 0.0,
         "toe": -0.15 if front_wheel else 0.2,
         "suspension_offset": 0.0,
         "suspension_stiffness": 80.0,
         "damping_relaxation": 2.6,
         "damping_compression": 2.0,
+        "max_brake_force": 1000.0,
+        "side_friction_stiffness": 1.0,
+        "side_factor": 1.0,
+        "forward_factor": 1.6,
+        "brake_factor": 1.0,
+        "contact_damping": 0.15,
+        "grip_factor": 1.0,
+    }
+
+
+def default_preset_values():
+    return {
+        "max_steering_angle": 50.0,
+        "max_degrees_of_rotation": 540.0,
+        "anti_roll": 0.4,
+        "abs": 1.0,
+        "esc": 0.0,
+        "traction_control": 1.0,
+        "brake_bias": 0.6,
+        "front": default_wheel_preset_values("front"),
+        "rear": default_wheel_preset_values("rear"),
     }
 
 
@@ -2028,11 +2130,19 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "tire_type": wheel.tire_type,
             "pressure": wheel.pressure,
             "camber": wheel.camber,
+            "caster": wheel.caster,
             "toe": wheel.toe,
             "suspension_offset": wheel.suspension_offset,
             "suspension_stiffness": wheel.suspension_stiffness,
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
+            "max_brake_force": wheel.max_brake_force,
+            "side_friction_stiffness": wheel.side_friction_stiffness,
+            "side_factor": wheel.side_factor,
+            "forward_factor": wheel.forward_factor,
+            "brake_factor": wheel.brake_factor,
+            "contact_damping": wheel.contact_damping,
+            "grip_factor": wheel.grip_factor,
         }
         for wheel in preset.wheels
     }
@@ -2041,11 +2151,19 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "tire_type": "medium",
             "pressure": wheel.pressure,
             "camber": wheel.camber,
+            "caster": 0.0,
             "toe": wheel.toe,
             "suspension_offset": 0.0,
             "suspension_stiffness": wheel.suspension_stiffness,
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
+            "max_brake_force": wheel.max_brake_force,
+            "side_friction_stiffness": wheel.side_friction_stiffness,
+            "side_factor": wheel.side_factor,
+            "forward_factor": wheel.forward_factor,
+            "brake_factor": wheel.brake_factor,
+            "contact_damping": wheel.contact_damping,
+            "grip_factor": wheel.grip_factor,
         }
         for wheel in (source_wheels or [])
     }
@@ -2058,22 +2176,52 @@ def ensure_preset_wheels(preset, source_wheels=None):
         wheel.tire_type = values["tire_type"]
         wheel.pressure = values["pressure"]
         wheel.camber = values["camber"]
+        wheel.caster = values["caster"]
         wheel.toe = values["toe"]
         wheel.suspension_offset = values["suspension_offset"]
         wheel.suspension_stiffness = values["suspension_stiffness"]
         wheel.damping_relaxation = values["damping_relaxation"]
         wheel.damping_compression = values["damping_compression"]
+        wheel.max_brake_force = values["max_brake_force"]
+        wheel.side_friction_stiffness = values["side_friction_stiffness"]
+        wheel.side_factor = values["side_factor"]
+        wheel.forward_factor = values["forward_factor"]
+        wheel.brake_factor = values["brake_factor"]
+        wheel.contact_damping = values["contact_damping"]
+        wheel.grip_factor = values["grip_factor"]
+
+
+def wheel_preset_values(source):
+    return {
+        field: getattr(source, field)
+        for field in (
+            "tire_type",
+            "pressure",
+            "camber",
+            "caster",
+            "toe",
+            "suspension_offset",
+            "suspension_stiffness",
+            "damping_relaxation",
+            "damping_compression",
+            "max_brake_force",
+            "side_friction_stiffness",
+            "side_factor",
+            "forward_factor",
+            "brake_factor",
+            "contact_damping",
+            "grip_factor",
+        )
+    }
+
+
+def apply_wheel_preset_values(values, target):
+    for field, value in values.items():
+        setattr(target, field, value)
 
 
 def copy_wheel_preset_values(source, target):
-    target.tire_type = source.tire_type
-    target.pressure = source.pressure
-    target.camber = source.camber
-    target.toe = source.toe
-    target.suspension_offset = source.suspension_offset
-    target.suspension_stiffness = source.suspension_stiffness
-    target.damping_relaxation = source.damping_relaxation
-    target.damping_compression = source.damping_compression
+    apply_wheel_preset_values(wheel_preset_values(source), target)
 
 
 def ensure_default_presets(settings):
@@ -2105,6 +2253,37 @@ def ensure_default_presets(settings):
                 if source:
                     copy_wheel_preset_values(source, getattr(preset, group))
         settings.preset_schema_version = 3
+    if settings.preset_schema_version < 4:
+        shared_wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
+        for preset in settings.presets:
+            preset.max_steering_angle = settings.max_steering_angle
+            for group in ("front", "rear"):
+                source = shared_wheels.get((group, "l")) or shared_wheels.get((group, "r"))
+                if not source:
+                    continue
+                target = getattr(preset, group)
+                target.max_brake_force = source.max_brake_force
+                target.side_friction_stiffness = source.side_friction_stiffness
+                target.side_factor = source.side_factor
+                target.forward_factor = source.forward_factor
+                target.brake_factor = source.brake_factor
+                target.contact_damping = source.contact_damping
+                target.grip_factor = source.grip_factor
+        settings.preset_schema_version = 4
+    if settings.preset_schema_version < 5:
+        for preset in settings.presets:
+            preset.max_degrees_of_rotation = settings.max_degrees_of_rotation
+            preset.anti_roll = settings.anti_roll
+            preset.abs = settings.abs
+            preset.esc = settings.esc
+            preset.traction_control = settings.traction_control
+            preset.brake_bias = 0.6
+        settings.preset_schema_version = 5
+    if settings.preset_schema_version < 6:
+        for preset in settings.presets:
+            preset.front.caster = 0.0
+            preset.rear.caster = 0.0
+        settings.preset_schema_version = 6
     settings.active_preset_index = min(
         max(settings.active_preset_index, 0),
         len(settings.presets) - 1,
@@ -2125,9 +2304,19 @@ def next_preset_id(settings):
     return f"preset_{index}"
 
 
-def copy_preset_wheels(source, target):
-    copy_wheel_preset_values(source.front, target.front)
-    copy_wheel_preset_values(source.rear, target.rear)
+def apply_preset_values(values, target):
+    for field in (
+        "max_steering_angle",
+        "max_degrees_of_rotation",
+        "anti_roll",
+        "abs",
+        "esc",
+        "traction_control",
+        "brake_bias",
+    ):
+        setattr(target, field, values[field])
+    apply_wheel_preset_values(values["front"], target.front)
+    apply_wheel_preset_values(values["rear"], target.rear)
 
 
 def schedule_defaults_initialization():
@@ -2319,23 +2508,101 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
     def execute(self, context):
         settings = scene_settings(context)
         data = json.loads(Path(abspath(self.filepath)).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            self.report({"ERROR"}, "Vehicle manifest must be an object")
+            return {"CANCELLED"}
+        manifest_version = data.get("version")
+        if manifest_version not in {4, 5}:
+            self.report({"ERROR"}, "Only vehicle manifest versions 4 and 5 can be imported")
+            return {"CANCELLED"}
         engine = data.get("engine", {})
-        if "redlineRPM" not in engine:
+        if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
             return {"CANCELLED"}
-        wheels_data = data.get("wheels") or {}
-        for group, key, _steering in WHEEL_KEYS:
-            spin_data = ((wheels_data.get(group) or {}).get(key) or {}).get("spin") or {}
-            grip_factor = spin_data.get("gripFactor")
-            if not isinstance(grip_factor, (int, float)) or not math.isfinite(grip_factor) or grip_factor <= 0:
-                self.report(
-                    {"ERROR"},
-                    f"Manifest wheels.{group}.{key}.spin.gripFactor must be a positive number",
-                )
+        body = data.get("body")
+        if not isinstance(body, dict):
+            self.report({"ERROR"}, "Manifest body must be an object")
+            return {"CANCELLED"}
+        steering_wheel = data.get("steeringWheel")
+        if not isinstance(steering_wheel, dict):
+            self.report({"ERROR"}, "Manifest steeringWheel must be an object")
+            return {"CANCELLED"}
+        presets_data = data.get("presets")
+        if not isinstance(presets_data, list) or not presets_data:
+            self.report({"ERROR"}, "Manifest presets must contain at least one preset")
+            return {"CANCELLED"}
+        for preset_index, preset_data in enumerate(presets_data):
+            if not isinstance(preset_data, dict):
+                self.report({"ERROR"}, f"Manifest preset {preset_index} must be an object")
                 return {"CANCELLED"}
+            steering_angle = preset_data.get("maxSteeringAngle")
+            if not isinstance(steering_angle, (int, float)) or not math.isfinite(steering_angle) or not 1 <= steering_angle <= 90:
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.maxSteeringAngle is invalid")
+                return {"CANCELLED"}
+            rotation = preset_data.get("maxDegreesOfRotation")
+            if not isinstance(rotation, (int, float)) or not math.isfinite(rotation) or not 90 <= rotation <= 2160:
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.maxDegreesOfRotation is invalid")
+                return {"CANCELLED"}
+            for field in ("antiRoll", "abs", "esc", "tractionControl", "brakeBias"):
+                value = preset_data.get(field)
+                if (
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                ):
+                    self.report({"ERROR"}, f"Manifest preset {preset_index}.{field} must be between 0 and 1")
+                    return {"CANCELLED"}
+            preset_wheels = preset_data.get("wheels") or {}
+            if not isinstance(preset_wheels, dict):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.wheels must be an object")
+                return {"CANCELLED"}
+            for group, key, _steering in WHEEL_KEYS:
+                group_wheels = preset_wheels.get(group)
+                if not isinstance(group_wheels, dict) or not isinstance(group_wheels.get(key), dict):
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} must be an object")
+                    return {"CANCELLED"}
+                wheel_data = group_wheels[key]
+                finite_fields = (
+                    "pressure", "camber", "toe", "suspensionOffset",
+                    "suspensionStiffness", "dampingRelaxation", "dampingCompression",
+                    "maxBrakeForce", "sideFrictionStiffness", "sideFactor",
+                    "forwardFactor", "brakeFactor", "contactDamping", "gripFactor",
+                )
+                if manifest_version >= 5:
+                    finite_fields += ("caster",)
+                if any(
+                    not isinstance(wheel_data.get(field), (int, float))
+                    or not math.isfinite(wheel_data[field])
+                    for field in finite_fields
+                ):
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} values must be finite")
+                    return {"CANCELLED"}
+                if wheel_data.get("tireType") not in {"soft", "medium", "hard"}:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} tireType is invalid")
+                    return {"CANCELLED"}
+                if not 1.3 <= wheel_data["pressure"] <= 2.7:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} pressure is invalid")
+                    return {"CANCELLED"}
+                caster = wheel_data.get("caster", 0.0)
+                if not -15.0 <= caster <= 15.0:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} caster is invalid")
+                    return {"CANCELLED"}
+                if not -0.25 <= wheel_data["suspensionOffset"] <= 0.25:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} suspensionOffset is invalid")
+                    return {"CANCELLED"}
+                non_negative_fields = (
+                    "suspensionStiffness", "dampingRelaxation", "dampingCompression",
+                    "maxBrakeForce", "sideFrictionStiffness", "sideFactor",
+                    "forwardFactor", "brakeFactor", "contactDamping",
+                )
+                if any(wheel_data[field] < 0 for field in non_negative_fields):
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} handling values must be non-negative")
+                    return {"CANCELLED"}
+                if wheel_data["gripFactor"] <= 0:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be positive")
+                    return {"CANCELLED"}
 
         settings.is_configured = True
-        body = data.get("body", {})
         settings.car_id = data.get("id", data.get("name", settings.car_id))
         settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
@@ -2363,11 +2630,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
         settings.air_drag = body.get("airDrag", settings.air_drag)
-        settings.anti_roll = body.get("antiRoll", settings.anti_roll)
-        settings.abs = body.get("abs", settings.abs)
-        settings.esc = body.get("esc", settings.esc)
-        settings.traction_control = body.get("tractionControl", settings.traction_control)
-        settings.max_steering_angle = body.get("maxSteeringAngle", settings.max_steering_angle)
 
         colliders = body.get("colliders") or []
         settings.colliders.clear()
@@ -2386,13 +2648,20 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                         add_wheel_from_config(settings, group, key, wheel_data)
         ensure_default_wheels(settings)
         settings.presets.clear()
-        settings.preset_schema_version = 3
-        for preset_data in data.get("presets") or []:
+        settings.preset_schema_version = 6
+        for preset_data in presets_data:
             if not isinstance(preset_data, dict):
                 continue
             preset = settings.presets.add()
             preset.preset_id = str(preset_data.get("id", next_preset_id(settings)))
             preset.display_name = str(preset_data.get("name", preset.preset_id))
+            preset.max_steering_angle = preset_data["maxSteeringAngle"]
+            preset.max_degrees_of_rotation = preset_data["maxDegreesOfRotation"]
+            preset.anti_roll = preset_data["antiRoll"]
+            preset.abs = preset_data["abs"]
+            preset.esc = preset_data["esc"]
+            preset.traction_control = preset_data["tractionControl"]
+            preset.brake_bias = preset_data["brakeBias"]
             preset_wheels = preset_data.get("wheels") or {}
             for group in ("front", "rear"):
                 group_wheels = preset_wheels.get(group) or {}
@@ -2401,11 +2670,19 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 wheel.tire_type = wheel_data.get("tireType", "medium")
                 wheel.pressure = wheel_data.get("pressure", 2.0)
                 wheel.camber = wheel_data.get("camber", -4.0 if group == "front" else -3.0)
+                wheel.caster = wheel_data.get("caster", 0.0)
                 wheel.toe = wheel_data.get("toe", -0.15 if group == "front" else 0.2)
                 wheel.suspension_offset = wheel_data.get("suspensionOffset", 0.0)
                 wheel.suspension_stiffness = wheel_data.get("suspensionStiffness", 80.0)
                 wheel.damping_relaxation = wheel_data.get("dampingRelaxation", 2.6)
                 wheel.damping_compression = wheel_data.get("dampingCompression", 2.0)
+                wheel.max_brake_force = wheel_data.get("maxBrakeForce", 1000.0)
+                wheel.side_friction_stiffness = wheel_data.get("sideFrictionStiffness", 1.0)
+                wheel.side_factor = wheel_data.get("sideFactor", 1.0)
+                wheel.forward_factor = wheel_data.get("forwardFactor", 1.6)
+                wheel.brake_factor = wheel_data.get("brakeFactor", 1.0)
+                wheel.contact_damping = wheel_data.get("contactDamping", 0.15)
+                wheel.grip_factor = wheel_data.get("gripFactor", 1.0)
         ensure_default_presets(settings)
         settings.active_preset_index = 0
 
@@ -2428,16 +2705,11 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.turbo_enabled = turbo.get("enabled", settings.turbo_enabled)
         settings.turbo_boost = turbo.get("boost", settings.turbo_boost)
         settings.turbo_valve = turbo.get("valve", settings.turbo_valve)
-        steering_wheel = data.get("steeringWheel", "")
-        if isinstance(steering_wheel, dict):
-            set_object_pointer(settings, "steering_wheel_object", steering_wheel.get("obj", ""))
-            settings.steering_wheel_spin_axis = GAME_AXIS_TO_BLENDER.get(
-                tuple(steering_wheel.get("spinLocalAxis", [0, 0, -1])),
-                "y",
-            )
-        else:
-            set_object_pointer(settings, "steering_wheel_object", steering_wheel)
-            settings.steering_wheel_spin_axis = "y"
+        set_object_pointer(settings, "steering_wheel_object", steering_wheel.get("obj", ""))
+        settings.steering_wheel_spin_axis = GAME_AXIS_TO_BLENDER.get(
+            tuple(steering_wheel.get("spinLocalAxis", [0, 0, -1])),
+            "y",
+        )
 
         lights = data.get("lights", {})
         for key, prop_name in (
@@ -2548,20 +2820,11 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "up_local_axis")
         draw_split_prop(layout, wheel, "spin_local_axis")
         draw_split_prop(layout, wheel, "radius")
-        row = layout.row(align=True)
-        row.label(text="Sim")
-        draw_split_prop(layout, wheel, "max_brake_force")
-        draw_split_prop(layout, wheel, "side_friction_stiffness")
-        draw_split_prop(layout, wheel, "side_factor")
-        draw_split_prop(layout, wheel, "forward_factor")
-        draw_split_prop(layout, wheel, "brake_factor")
-        draw_split_prop(layout, wheel, "contact_damping")
-        draw_split_prop(layout, wheel, "grip_factor")
 
 
 def draw_presets(layout, settings):
     header = layout.row(align=True)
-    header.label(text="Wheel Presets")
+    header.label(text="Car Presets")
     header.operator("car_exporter.add_preset", text="", icon="ADD")
     header.operator("car_exporter.remove_preset", text="", icon="REMOVE")
     move_up = header.operator("car_exporter.move_preset", text="", icon="TRIA_UP")
@@ -2579,10 +2842,17 @@ def draw_presets(layout, settings):
     )
     preset = active_preset(settings)
     if not preset:
-        layout.label(text="Add a wheel preset to configure adjustments", icon="INFO")
+        layout.label(text="Add a car preset to configure adjustments", icon="INFO")
         return
     draw_split_prop(layout, preset, "preset_id")
     draw_split_prop(layout, preset, "display_name")
+    draw_split_prop(layout, preset, "max_steering_angle")
+    draw_split_prop(layout, preset, "max_degrees_of_rotation")
+    draw_split_prop(layout, preset, "anti_roll")
+    draw_split_prop(layout, preset, "abs")
+    draw_split_prop(layout, preset, "esc")
+    draw_split_prop(layout, preset, "traction_control")
+    draw_split_prop(layout, preset, "brake_bias")
 
     for group in ("front", "rear"):
         axle_box = layout.box()
@@ -2591,11 +2861,19 @@ def draw_presets(layout, settings):
         draw_split_prop(axle_box, wheel, "tire_type")
         draw_split_prop(axle_box, wheel, "pressure")
         draw_split_prop(axle_box, wheel, "camber")
+        draw_split_prop(axle_box, wheel, "caster")
         draw_split_prop(axle_box, wheel, "toe")
         draw_split_prop(axle_box, wheel, "suspension_offset")
         draw_split_prop(axle_box, wheel, "suspension_stiffness")
         draw_split_prop(axle_box, wheel, "damping_relaxation")
         draw_split_prop(axle_box, wheel, "damping_compression")
+        draw_split_prop(axle_box, wheel, "max_brake_force")
+        draw_split_prop(axle_box, wheel, "side_friction_stiffness")
+        draw_split_prop(axle_box, wheel, "side_factor")
+        draw_split_prop(axle_box, wheel, "forward_factor")
+        draw_split_prop(axle_box, wheel, "brake_factor")
+        draw_split_prop(axle_box, wheel, "contact_damping")
+        draw_split_prop(axle_box, wheel, "grip_factor")
 
 
 def draw_cameras(layout, settings):
@@ -2704,7 +2982,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Body Physics")
         draw_split_prop(box, settings, "center_of_mass_object")
-        for prop in ("down_force", "air_drag", "anti_roll", "abs", "esc", "traction_control", "max_steering_angle"):
+        for prop in ("down_force", "air_drag"):
             draw_split_prop(box, settings, prop)
 
         box = layout.box()
