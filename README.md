@@ -219,6 +219,11 @@ Limiter
 Turbo Flutter
 ```
 
+**Pitch Offset (cents)** adjusts all loaded and off-throttle engine samples for
+the vehicle. It defaults to `0`; positive values raise pitch and negative values
+lower it. The exporter writes it as `sounds.pitchOffset` next to the logical
+sample slots.
+
 Assigned files are copied into `sounds/`. Audio is required by default because the runtime applies fixed engine sample keys every frame. Disable `Require Audio Slots` only when intentionally exporting a visual/physics-only test package.
 
 Only assigned files are written to `manifest.json`; the addon does not emit references to files that are not packaged.

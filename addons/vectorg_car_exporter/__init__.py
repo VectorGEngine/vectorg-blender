@@ -1260,6 +1260,13 @@ class CarExporterSettings(PropertyGroup):
     # Retained as a hidden migration source for blend files saved with preset schema 3.
     max_steering_angle: FloatProperty(default=50.0, min=1.0, max=90.0, options={"HIDDEN"})
     use_custom_sounds: BoolProperty(name="Use Custom Sounds", default=False)
+    sound_pitch_offset: IntProperty(
+        name="Pitch Offset (cents)",
+        description="Vehicle-wide engine sample pitch offset; 100 cents equals one semitone",
+        default=0,
+        min=-2400,
+        max=2400,
+    )
     body_colors: CollectionProperty(type=CarBodyColorSettings)
     active_body_color_index: IntProperty(name="Active Body Color", default=0)
     colliders: CollectionProperty(type=CarColliderSettings)
@@ -1401,6 +1408,7 @@ def clear_configuration_settings(settings):
     settings.traction_control = 0.0
     settings.max_steering_angle = 1.0
     settings.use_custom_sounds = False
+    settings.sound_pitch_offset = 0
     settings.drive = "awd"
     settings.hp = 1.0
     settings.final_drive_ratio = 0.01
@@ -1733,7 +1741,7 @@ def apply_imported_torque_curve(settings, torque_curve):
 
 
 def build_manifest(settings):
-    sounds = {}
+    sounds = {"pitchOffset": settings.sound_pitch_offset}
     if settings.use_custom_sounds:
         for slot, meta in SOUND_SLOTS.items():
             source_path = getattr(settings, f"sound_{slot}")
@@ -2704,6 +2712,19 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
             return {"CANCELLED"}
+        sounds = data.get("sounds", {})
+        if not isinstance(sounds, dict):
+            self.report({"ERROR"}, "Manifest sounds must be an object")
+            return {"CANCELLED"}
+        sound_pitch_offset = sounds.get("pitchOffset", 0)
+        if (
+            isinstance(sound_pitch_offset, bool)
+            or not isinstance(sound_pitch_offset, (int, float))
+            or not math.isfinite(sound_pitch_offset)
+            or not -2400 <= sound_pitch_offset <= 2400
+        ):
+            self.report({"ERROR"}, "Manifest sounds.pitchOffset must be between -2400 and 2400 cents")
+            return {"CANCELLED"}
         body = data.get("body")
         if not isinstance(body, dict):
             self.report({"ERROR"}, "Manifest body must be an object")
@@ -2824,6 +2845,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
         settings.car_class = data.get("class", settings.car_class)
+        settings.sound_pitch_offset = round(sound_pitch_offset)
         track_types = data.get("trackTypes")
         if isinstance(track_types, list):
             tags = set(track_types)
@@ -3256,6 +3278,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         box = layout.box()
         box.label(text="Audio")
+        draw_split_prop(box, settings, "sound_pitch_offset")
         draw_split_prop(box, settings, "use_custom_sounds")
         if settings.use_custom_sounds:
             for index, (slot, meta) in enumerate(SOUND_SLOTS.items()):
