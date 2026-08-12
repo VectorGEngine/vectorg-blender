@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 5, 8),
+    "version": (0, 5, 9),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -505,7 +505,7 @@ def material_texture_nodes(material):
     ]
 
 
-def export_materials(objects):
+def export_materials(objects, additional_materials=()):
     materials = []
     seen = set()
     for obj in objects:
@@ -516,7 +516,29 @@ def export_materials(objects):
             if material and material.name not in seen:
                 seen.add(material.name)
                 materials.append(material)
+    for material in additional_materials:
+        if material and material.name not in seen:
+            seen.add(material.name)
+            materials.append(material)
     return materials
+
+
+def object_with_assigned_material(material, objects):
+    if not material:
+        return None
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        for polygon in obj.data.polygons:
+            if polygon.material_index >= len(obj.material_slots):
+                continue
+            if obj.material_slots[polygon.material_index].material == material:
+                return obj
+    return None
+
+
+def material_is_assigned_to_geometry(material, objects):
+    return object_with_assigned_material(material, objects) is not None
 
 
 def upstream_texture_nodes(socket, visited=None):
@@ -538,9 +560,9 @@ def upstream_texture_nodes(socket, visited=None):
     return result
 
 
-def classify_texture_usage(objects):
+def classify_texture_usage(objects, additional_materials=()):
     usage_by_image = {}
-    for material in export_materials(objects):
+    for material in export_materials(objects, additional_materials):
         texture_nodes = material_texture_nodes(material)
         classified_nodes = set()
         for node in texture_nodes:
@@ -567,9 +589,9 @@ def classify_texture_usage(objects):
     return usage_by_image
 
 
-def alpha_material_warnings(objects):
+def alpha_material_warnings(objects, additional_materials=()):
     warnings = []
-    for material in export_materials(objects):
+    for material in export_materials(objects, additional_materials):
         has_linked_alpha = any(
             socket.name == "Alpha" and socket.is_linked
             for tree in node_trees(material.node_tree)
@@ -595,10 +617,10 @@ def image_source_exists(image):
     return bool(source and source.is_file())
 
 
-def texture_validation(objects, max_size):
+def texture_validation(objects, max_size, additional_materials=()):
     errors = []
     warnings = []
-    for image, usages in classify_texture_usage(objects).items():
+    for image, usages in classify_texture_usage(objects, additional_materials).items():
         width, height = image.size
         if width <= 0 or height <= 0:
             errors.append(f"Texture {image.name} has no pixel data")
@@ -610,7 +632,7 @@ def texture_validation(objects, max_size):
             warnings.append(f"Texture {image.name} is used as both color and data; its format will be preserved")
         if "ambiguous" in usages:
             warnings.append(f"Texture {image.name} has an unsupported or ambiguous node path; its format will be preserved")
-    warnings.extend(alpha_material_warnings(objects))
+    warnings.extend(alpha_material_warnings(objects, additional_materials))
     return errors, warnings
 
 
@@ -1014,6 +1036,29 @@ def validate_scene(settings):
             [obj for obj in bpy.context.scene.objects if obj not in guide_objects()]
         )
     }
+    car_objects = hierarchy_objects(car_obj)
+    body_color_names = set()
+    body_color_material_names = set()
+    for index, body_color in enumerate(settings.body_colors):
+        label = f"Body color {index + 1}"
+        display_name = body_color.display_name.strip()
+        normalized_name = display_name.casefold()
+        if not display_name:
+            errors.append(f"{label} name is required")
+        elif normalized_name in body_color_names:
+            errors.append(f"Duplicate body color name: {display_name}")
+        body_color_names.add(normalized_name)
+
+        material = body_color.material
+        if not material:
+            errors.append(f"{label} material is required")
+            continue
+        if material.name in body_color_material_names:
+            errors.append(f"Body color material is used more than once: {material.name}")
+        body_color_material_names.add(material.name)
+        if index == 0 and not material_is_assigned_to_geometry(material, car_objects):
+            errors.append(f"Default body color material is not assigned to car geometry: {material.name}")
+
     for label, prop_name in (
         ("Headlights", "headlights_material"),
         ("Brake lights", "brake_lights_material"),
@@ -1046,14 +1091,21 @@ def validate_scene(settings):
         errors.append("Engine RPM values must satisfy idleRPM < redlineRPM <= revLimit <= maxRPM")
 
     if car_obj:
+        body_color_materials = [body_color.material for body_color in settings.body_colors if body_color.material]
         texture_errors, texture_warnings = texture_validation(
             [obj for obj in bpy.context.scene.objects if obj not in guide_objects()],
             int(settings.max_texture_size),
+            body_color_materials,
         )
         errors.extend(texture_errors)
         warnings.extend(texture_warnings)
 
     return errors, warnings
+
+
+class CarBodyColorSettings(PropertyGroup):
+    display_name: StringProperty(name="Name", default="")
+    material: PointerProperty(name="Material", type=bpy.types.Material)
 
 
 class CarColliderSettings(PropertyGroup):
@@ -1208,6 +1260,8 @@ class CarExporterSettings(PropertyGroup):
     # Retained as a hidden migration source for blend files saved with preset schema 3.
     max_steering_angle: FloatProperty(default=50.0, min=1.0, max=90.0, options={"HIDDEN"})
     use_custom_sounds: BoolProperty(name="Use Custom Sounds", default=False)
+    body_colors: CollectionProperty(type=CarBodyColorSettings)
+    active_body_color_index: IntProperty(name="Active Body Color", default=0)
     colliders: CollectionProperty(type=CarColliderSettings)
     wheels: CollectionProperty(type=CarWheelSettings)
     presets: CollectionProperty(type=CarPresetSettings)
@@ -1328,6 +1382,8 @@ def clear_configuration_settings(settings):
     settings.steering_wheel_object = None
     settings.steering_wheel_spin_axis = "y"
     settings.max_degrees_of_rotation = 540.0
+    settings.body_colors.clear()
+    settings.active_body_color_index = 0
     settings.headlights_material = None
     settings.brake_lights_material = None
     settings.reverse_lights_material = None
@@ -1711,6 +1767,29 @@ def build_manifest(settings):
             },
         }
 
+    body = {
+        "obj": object_config_name(settings.car_root_object),
+        "centerOfMass": object_config_name(settings.center_of_mass_object),
+        "colliders": [
+            {
+                "obj": object_config_name(collider.object_ref),
+                "type": collider.collider_type,
+                "mass": collider.mass,
+            }
+            for collider in settings.colliders
+        ],
+        "downForce": settings.down_force,
+        "airDrag": settings.air_drag,
+    }
+    if settings.body_colors:
+        body["colors"] = [
+            {
+                "name": body_color.display_name.strip(),
+                "material": body_color.material.name,
+            }
+            for body_color in settings.body_colors
+        ]
+
     manifest = {
         "version": 5,
         "id": settings.car_id,
@@ -1757,20 +1836,7 @@ def build_manifest(settings):
                 "load": 0.0,
             },
         },
-        "body": {
-            "obj": object_config_name(settings.car_root_object),
-            "centerOfMass": object_config_name(settings.center_of_mass_object),
-            "colliders": [
-                {
-                    "obj": object_config_name(collider.object_ref),
-                    "type": collider.collider_type,
-                    "mass": collider.mass,
-                }
-                for collider in settings.colliders
-            ],
-            "downForce": settings.down_force,
-            "airDrag": settings.air_drag,
-        },
+        "body": body,
         "wheels": build_wheels_config(settings),
         "presets": build_presets_config(settings),
         "steeringWheel": {
@@ -1878,6 +1944,73 @@ class CAR_EXPORTER_OT_remove_collider(Operator):
             collider.collider_type = "trimesh"
             collider.mass = 0.0
             settings.colliders.remove(self.index)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_UL_body_colors(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, index):
+        row = layout.row(align=True)
+        row.label(
+            text=item.display_name or f"Color {index + 1}",
+            icon="CHECKMARK" if index == 0 else "MATERIAL",
+        )
+        row.label(text=item.material.name if item.material else "No material")
+
+
+class CAR_EXPORTER_OT_add_body_color(Operator):
+    bl_idname = "car_exporter.add_body_color"
+    bl_label = "Add Body Color"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        existing_names = {body_color.display_name.strip().casefold() for body_color in settings.body_colors}
+        if not settings.body_colors:
+            display_name = "Default"
+        else:
+            number = 2
+            while f"color {number}" in existing_names:
+                number += 1
+            display_name = f"Color {number}"
+        body_color = settings.body_colors.add()
+        body_color.display_name = display_name
+        body_color.material = None
+        settings.active_body_color_index = len(settings.body_colors) - 1
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_body_color(Operator):
+    bl_idname = "car_exporter.remove_body_color"
+    bl_label = "Remove Body Color"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_body_color_index
+        if not (0 <= index < len(settings.body_colors)):
+            return {"CANCELLED"}
+        settings.body_colors[index].material = None
+        settings.body_colors.remove(index)
+        settings.active_body_color_index = min(index, max(len(settings.body_colors) - 1, 0))
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_move_body_color(Operator):
+    bl_idname = "car_exporter.move_body_color"
+    bl_label = "Move Body Color"
+    bl_description = "Reorder body colors; index 0 is the default"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(items=(("UP", "Up", ""), ("DOWN", "Down", "")))
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_body_color_index
+        target = index - 1 if self.direction == "UP" else index + 1
+        if not (0 <= index < len(settings.body_colors) and 0 <= target < len(settings.body_colors)):
+            return {"CANCELLED"}
+        settings.body_colors.move(index, target)
+        settings.active_body_color_index = target
         return {"FINISHED"}
 
 
@@ -2365,16 +2498,67 @@ class CAR_EXPORTER_OT_remove_configuration(Operator):
         return {"FINISHED"}
 
 
+def create_body_material_export_carrier(context):
+    settings = scene_settings(context)
+    car_objects = hierarchy_objects(settings.car_root_object)
+    carrier_materials = [
+        body_color.material
+        for body_color in settings.body_colors
+        if body_color.material and not material_is_assigned_to_geometry(body_color.material, car_objects)
+    ]
+    if not carrier_materials:
+        return None
+
+    vertices = []
+    faces = []
+    for _material in carrier_materials:
+        vertex_index = len(vertices)
+        vertices.extend(((0.0, 0.0, 0.0),) * 3)
+        faces.append((vertex_index, vertex_index + 1, vertex_index + 2))
+
+    mesh = bpy.data.meshes.new("VECTORG_BODY_MATERIALS")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    for material in carrier_materials:
+        mesh.materials.append(material)
+    for index, polygon in enumerate(mesh.polygons):
+        polygon.material_index = index
+
+    carrier = bpy.data.objects.new("VECTORG_BODY_MATERIALS", mesh)
+    context.scene.collection.objects.link(carrier)
+    default_material = settings.body_colors[0].material if settings.body_colors else None
+    carrier_parent = object_with_assigned_material(default_material, car_objects)
+    if carrier_parent:
+        carrier.parent = carrier_parent
+        carrier.location = carrier_parent.data.vertices[0].co
+    elif settings.car_root_object:
+        carrier.parent = settings.car_root_object
+        carrier.location = (0.0, 0.0, 0.0)
+    return carrier
+
+
+def remove_body_material_export_carrier(carrier):
+    if not carrier:
+        return
+    mesh = carrier.data
+    bpy.data.objects.remove(carrier, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
 def export_car_glb(context, filepath, max_texture_size, optimize_color_textures, jpeg_quality):
-    export_objects = list(context.scene.objects)
-    restored_nodes, temp_images = apply_export_texture_optimization(
-        export_objects,
-        max_texture_size,
-        optimize_color_textures,
-        Path(filepath).parent,
-        jpeg_quality,
-    )
+    carrier = create_body_material_export_carrier(context)
+    restored_nodes = []
+    temp_images = []
     try:
+        export_objects = list(context.scene.objects)
+        restored_nodes, temp_images = apply_export_texture_optimization(
+            export_objects,
+            max_texture_size,
+            optimize_color_textures,
+            Path(filepath).parent,
+            jpeg_quality,
+        )
         result = bpy.ops.export_scene.gltf(
             filepath=str(filepath),
             export_format="GLB",
@@ -2387,6 +2571,7 @@ def export_car_glb(context, filepath, max_texture_size, optimize_color_textures,
             raise RuntimeError("Blender glTF export did not finish")
     finally:
         restore_export_textures(restored_nodes, temp_images)
+        remove_body_material_export_carrier(carrier)
 
 
 class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
@@ -2523,6 +2708,38 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(body, dict):
             self.report({"ERROR"}, "Manifest body must be an object")
             return {"CANCELLED"}
+        body_colors_data = []
+        if "colors" in body:
+            if manifest_version < 5:
+                self.report({"ERROR"}, "Manifest body.colors requires vehicle manifest version 5")
+                return {"CANCELLED"}
+            body_colors_data = body["colors"]
+            if not isinstance(body_colors_data, list) or not body_colors_data:
+                self.report({"ERROR"}, "Manifest body.colors must contain at least one color")
+                return {"CANCELLED"}
+            color_names = set()
+            material_names = set()
+            for color_index, body_color in enumerate(body_colors_data):
+                if not isinstance(body_color, dict):
+                    self.report({"ERROR"}, f"Manifest body.colors[{color_index}] must be an object")
+                    return {"CANCELLED"}
+                display_name = body_color.get("name")
+                material_name = body_color.get("material")
+                if not isinstance(display_name, str) or not display_name.strip():
+                    self.report({"ERROR"}, f"Manifest body.colors[{color_index}].name is invalid")
+                    return {"CANCELLED"}
+                normalized_name = display_name.strip().casefold()
+                if normalized_name in color_names:
+                    self.report({"ERROR"}, f"Duplicate manifest body color name: {display_name.strip()}")
+                    return {"CANCELLED"}
+                color_names.add(normalized_name)
+                if not isinstance(material_name, str) or not material_name.strip():
+                    self.report({"ERROR"}, f"Manifest body.colors[{color_index}].material is invalid")
+                    return {"CANCELLED"}
+                if material_name in material_names:
+                    self.report({"ERROR"}, f"Duplicate manifest body color material: {material_name}")
+                    return {"CANCELLED"}
+                material_names.add(material_name)
         steering_wheel = data.get("steeringWheel")
         if not isinstance(steering_wheel, dict):
             self.report({"ERROR"}, "Manifest steeringWheel must be an object")
@@ -2630,6 +2847,12 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
         settings.air_drag = body.get("airDrag", settings.air_drag)
+        settings.body_colors.clear()
+        for body_color_data in body_colors_data:
+            body_color = settings.body_colors.add()
+            body_color.display_name = body_color_data["name"].strip()
+            set_material_pointer(body_color, "material", body_color_data["material"])
+        settings.active_body_color_index = 0
 
         colliders = body.get("colliders") or []
         settings.colliders.clear()
@@ -2764,6 +2987,35 @@ def draw_split_label(layout, label, value, tooltip=""):
     if tooltip:
         help_op = value_row.operator("car_exporter.tooltip_label", text="", icon="HELP", emboss=False)
         help_op.tooltip = tooltip
+
+
+def draw_body_colors(layout, settings):
+    header = layout.row(align=True)
+    header.label(text="Body Colors")
+    header.operator("car_exporter.add_body_color", text="", icon="ADD")
+    header.operator("car_exporter.remove_body_color", text="", icon="REMOVE")
+    move_up = header.operator("car_exporter.move_body_color", text="", icon="TRIA_UP")
+    move_up.direction = "UP"
+    move_down = header.operator("car_exporter.move_body_color", text="", icon="TRIA_DOWN")
+    move_down.direction = "DOWN"
+    layout.template_list(
+        "CAR_EXPORTER_UL_body_colors",
+        "",
+        settings,
+        "body_colors",
+        settings,
+        "active_body_color_index",
+        rows=3,
+    )
+    index = settings.active_body_color_index
+    if not (0 <= index < len(settings.body_colors)):
+        layout.label(text="Add body colors to export selectable material names", icon="INFO")
+        return
+    body_color = settings.body_colors[index]
+    draw_split_prop(layout, body_color, "display_name")
+    draw_split_prop(layout, body_color, "material")
+    if index == 0:
+        layout.label(text="Index 0 is the default body color", icon="CHECKMARK")
 
 
 def draw_vehicle_tags(layout, settings):
@@ -2928,6 +3180,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Body")
         draw_split_prop(box, settings, "car_root_object")
+        box.separator(type="LINE")
+        draw_body_colors(box, settings)
 
         box = layout.box()
         box.label(text="Steering Wheel")
@@ -3025,15 +3279,20 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
 
 classes = (
+    CarBodyColorSettings,
     CarColliderSettings,
     CarWheelSettings,
     CarWheelPresetSettings,
     CarPresetSettings,
     CarExporterSettings,
+    CAR_EXPORTER_UL_body_colors,
     CAR_EXPORTER_UL_presets,
     CAR_EXPORTER_OT_validate_car,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
+    CAR_EXPORTER_OT_add_body_color,
+    CAR_EXPORTER_OT_remove_body_color,
+    CAR_EXPORTER_OT_move_body_color,
     CAR_EXPORTER_OT_add_preset,
     CAR_EXPORTER_OT_remove_preset,
     CAR_EXPORTER_OT_move_preset,

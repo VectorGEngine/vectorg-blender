@@ -223,6 +223,30 @@ Assigned files are copied into `sounds/`. Audio is required by default because t
 
 Only assigned files are written to `manifest.json`; the addon does not emit references to files that are not packaged.
 
+## Body Colors
+
+Add selectable paint materials under **Body > Body Colors**. Each entry has a
+display name and a Blender material. Entry `0` is the default; use the list
+arrows to change the order. The default material must be assigned to geometry
+inside the car hierarchy. The exporter embeds configured alternative materials
+in the GLB even when they are not currently assigned to visible geometry.
+
+Body colors are optional. When configured, their order is exported as:
+
+```json
+{
+  "body": {
+    "colors": [
+      { "name": "White", "material": "Body_White" },
+      { "name": "Red", "material": "Body_Red" }
+    ]
+  }
+}
+```
+
+The game can use the exported names for color selection. Runtime color
+selection is not configured by the Blender addon.
+
 ## Lights
 
 Assign the Headlights, Brake Lights, and Reverse Lights materials in the
