@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 5, 9),
+    "version": (0, 5, 10),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -1027,8 +1027,10 @@ def validate_scene(settings):
                     )
 
             screen_size = object_world_bounds_size(dashboard_screen)
-            if not screen_size or screen_size.x <= 1e-6 or screen_size.y <= 1e-6:
-                errors.append("Dashboard screen local X and Y dimensions must be greater than zero")
+            if not screen_size or screen_size.x <= 1e-6 or screen_size.z <= 1e-6:
+                errors.append(
+                    "Dashboard screen local X width and local Z length must be greater than zero"
+                )
 
     exported_material_names = {
         material.name

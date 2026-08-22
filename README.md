@@ -276,7 +276,7 @@ The selected material names are exported as:
 
 Create and position a dedicated plane in the dashboard, parent it inside the
 car root, and assign it as **Dashboard > Screen**. The plane must use local X
-for width, local Y for height, and local Z for its normal. It must have one
+for width and local Z for length, with local Y as its normal. It must have one
 dedicated material and an active UV map covering the complete 0-1 texture area.
 Do not share its material with another mesh. Any positive aspect ratio is
 accepted.
@@ -293,9 +293,9 @@ Only the selected object is exported:
 }
 ```
 
-The runtime measures the plane's physical X:Y ratio, including hierarchy
-scale. Canvas height is always 1024 pixels and width is calculated from that
-ratio. For example, a 2:1 plane creates a 2048 x 1024 canvas.
+The runtime measures the plane's physical X:Z ratio, including hierarchy scale.
+Canvas height is always 1024 pixels and width is calculated from that ratio.
+For example, a 2:1 plane creates a 2048 x 1024 canvas.
 
 The display shows five mirrored shift-light pairs across ten LEDs at the top.
 They light from the outside edges toward the center as RPM rises: green, green,
