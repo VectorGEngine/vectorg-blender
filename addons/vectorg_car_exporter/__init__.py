@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 5, 10),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -360,6 +360,16 @@ def update_hood_target_distance(settings, _context):
 
 def update_roof_target_distance(settings, _context):
     update_existing_camera_target(settings, "roof")
+
+
+def update_driver_assist_max_levels(settings, _context):
+    for preset in settings.presets:
+        preset.abs_level = min(preset.abs_level, settings.abs_max_level)
+        preset.esc_level = min(preset.esc_level, settings.esc_max_level)
+        preset.traction_control_level = min(
+            preset.traction_control_level,
+            settings.traction_control_max_level,
+        )
 
 
 def ensure_camera_targets(settings):
@@ -916,6 +926,15 @@ def validate_scene(settings):
         if front_pos is not None and rear_pos is not None and front_pos.y >= rear_pos.y:
             warnings.append(f"Front {key.upper()} wheel should be forward of rear {key.upper()} wheel on world -Y")
 
+    assist_max_levels = {
+        "ABS": settings.abs_max_level,
+        "ESC": settings.esc_max_level,
+        "Traction Control": settings.traction_control_max_level,
+    }
+    for assist_name, max_level in assist_max_levels.items():
+        if not isinstance(max_level, int) or max_level < 1:
+            errors.append(f"{assist_name} max level must be a positive integer")
+
     preset_ids = set()
     for index, preset in enumerate(settings.presets, start=1):
         label = preset.display_name.strip() or preset.preset_id or f"Preset {index}"
@@ -932,12 +951,16 @@ def validate_scene(settings):
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
         if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in (
             preset.anti_roll,
-            preset.abs,
-            preset.esc,
-            preset.traction_control,
             preset.brake_bias,
         )):
-            errors.append(f"{label} assists, anti-roll, and brake bias must be between 0 and 1")
+            errors.append(f"{label} anti-roll and brake bias must be between 0 and 1")
+        for assist_name, level, max_level in (
+            ("ABS", preset.abs_level, settings.abs_max_level),
+            ("ESC", preset.esc_level, settings.esc_max_level),
+            ("Traction Control", preset.traction_control_level, settings.traction_control_max_level),
+        ):
+            if not isinstance(level, int) or not 0 <= level <= max_level:
+                errors.append(f"{label} {assist_name} level must be between 0 and {max_level}")
         for group in ("front", "rear"):
             wheel = getattr(preset, group)
             if wheel.tire_type not in {"soft", "medium", "hard"}:
@@ -1197,9 +1220,9 @@ class CarPresetSettings(PropertyGroup):
         max=2160.0,
     )
     anti_roll: FloatProperty(name="Anti-roll", default=0.4, min=0.0, max=1.0)
-    abs: FloatProperty(name="ABS", default=1.0, min=0.0, max=1.0)
-    esc: FloatProperty(name="ESC", default=0.0, min=0.0, max=1.0)
-    traction_control: FloatProperty(name="Traction Control", default=1.0, min=0.0, max=1.0)
+    abs_level: IntProperty(name="ABS Level", default=5, min=0)
+    esc_level: IntProperty(name="ESC Level", default=0, min=0)
+    traction_control_level: IntProperty(name="Traction Control Level", default=5, min=0)
     brake_bias: FloatProperty(
         name="Brake Bias",
         description="Front brake force proportion",
@@ -1243,6 +1266,15 @@ class CarExporterSettings(PropertyGroup):
     car_class: StringProperty(name="Class", default="GT")
     vehicle_tag_tarmac: BoolProperty(name="Tarmac", default=True)
     vehicle_tag_offroad: BoolProperty(name="Offroad", default=True)
+    abs_max_level: IntProperty(
+        name="ABS Max Level", default=5, min=1, update=update_driver_assist_max_levels
+    )
+    esc_max_level: IntProperty(
+        name="ESC Max Level", default=5, min=1, update=update_driver_assist_max_levels
+    )
+    traction_control_max_level: IntProperty(
+        name="Traction Control Max Level", default=5, min=1, update=update_driver_assist_max_levels
+    )
     car_root_object: PointerProperty(name="Car Root", type=bpy.types.Object)
     center_of_mass_object: PointerProperty(name="Center of Mass", type=bpy.types.Object)
     steering_wheel_object: PointerProperty(name="Steering Wheel", type=bpy.types.Object)
@@ -1386,6 +1418,9 @@ def clear_configuration_settings(settings):
     settings.car_class = ""
     settings.vehicle_tag_tarmac = False
     settings.vehicle_tag_offroad = False
+    settings.abs_max_level = 5
+    settings.esc_max_level = 5
+    settings.traction_control_max_level = 5
     settings.car_root_object = None
     settings.center_of_mass_object = None
     settings.steering_wheel_object = None
@@ -1464,6 +1499,9 @@ def initialize_configuration_settings(settings):
     settings.car_class = "GT"
     settings.vehicle_tag_tarmac = True
     settings.vehicle_tag_offroad = True
+    settings.abs_max_level = 5
+    settings.esc_max_level = 5
+    settings.traction_control_max_level = 5
     settings.down_force = 3000.0
     settings.air_drag = 0.5
     settings.anti_roll = 0.4
@@ -1540,7 +1578,7 @@ def initialize_configuration_settings(settings):
     if preset:
         preset.front.caster = 6.0
         preset.rear.caster = 0.0
-        settings.preset_schema_version = 6
+        settings.preset_schema_version = 7
     create_size_guide(settings)
 
 
@@ -1600,9 +1638,9 @@ def build_presets_config(settings):
             "maxSteeringAngle": preset.max_steering_angle,
             "maxDegreesOfRotation": preset.max_degrees_of_rotation,
             "antiRoll": preset.anti_roll,
-            "abs": preset.abs,
-            "esc": preset.esc,
-            "tractionControl": preset.traction_control,
+            "absLevel": preset.abs_level,
+            "escLevel": preset.esc_level,
+            "tractionControlLevel": preset.traction_control_level,
             "brakeBias": preset.brake_bias,
             "wheels": {
                 group: {
@@ -1801,7 +1839,7 @@ def build_manifest(settings):
         ]
 
     manifest = {
-        "version": 5,
+        "version": 6,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
@@ -1848,6 +1886,11 @@ def build_manifest(settings):
         },
         "body": body,
         "wheels": build_wheels_config(settings),
+        "driverAssists": {
+            "abs": {"maxLevel": settings.abs_max_level},
+            "esc": {"maxLevel": settings.esc_max_level},
+            "tractionControl": {"maxLevel": settings.traction_control_max_level},
+        },
         "presets": build_presets_config(settings),
         "steeringWheel": {
             "obj": object_config_name(settings.steering_wheel_object),
@@ -2050,8 +2093,8 @@ class CAR_EXPORTER_OT_add_preset(Operator):
         preset.preset_id = preset_id
         preset.display_name = "Default" if first_preset else f"Preset {len(settings.presets)}"
         ensure_preset_wheels(preset)
-        apply_preset_values(default_preset_values(), preset)
-        settings.preset_schema_version = 6
+        apply_preset_values(default_preset_values(settings), preset)
+        settings.preset_schema_version = 7
         settings.active_preset_index = len(settings.presets) - 1
         return {"FINISHED"}
 
@@ -2248,14 +2291,14 @@ def default_wheel_preset_values(group):
     }
 
 
-def default_preset_values():
+def default_preset_values(settings):
     return {
         "max_steering_angle": 50.0,
         "max_degrees_of_rotation": 540.0,
         "anti_roll": 0.4,
-        "abs": 1.0,
-        "esc": 0.0,
-        "traction_control": 1.0,
+        "abs_level": settings.abs_max_level,
+        "esc_level": 0,
+        "traction_control_level": settings.traction_control_max_level,
         "brake_bias": 0.6,
         "front": default_wheel_preset_values("front"),
         "rear": default_wheel_preset_values("rear"),
@@ -2417,9 +2460,9 @@ def ensure_default_presets(settings):
         for preset in settings.presets:
             preset.max_degrees_of_rotation = settings.max_degrees_of_rotation
             preset.anti_roll = settings.anti_roll
-            preset.abs = settings.abs
-            preset.esc = settings.esc
-            preset.traction_control = settings.traction_control
+            preset.abs_level = settings.abs_max_level
+            preset.esc_level = 0
+            preset.traction_control_level = settings.traction_control_max_level
             preset.brake_bias = 0.6
         settings.preset_schema_version = 5
     if settings.preset_schema_version < 6:
@@ -2427,6 +2470,12 @@ def ensure_default_presets(settings):
             preset.front.caster = 0.0
             preset.rear.caster = 0.0
         settings.preset_schema_version = 6
+    if settings.preset_schema_version < 7:
+        for preset in settings.presets:
+            preset.abs_level = settings.abs_max_level
+            preset.esc_level = 0
+            preset.traction_control_level = settings.traction_control_max_level
+        settings.preset_schema_version = 7
     settings.active_preset_index = min(
         max(settings.active_preset_index, 0),
         len(settings.presets) - 1,
@@ -2452,9 +2501,9 @@ def apply_preset_values(values, target):
         "max_steering_angle",
         "max_degrees_of_rotation",
         "anti_roll",
-        "abs",
-        "esc",
-        "traction_control",
+        "abs_level",
+        "esc_level",
+        "traction_control_level",
         "brake_bias",
     ):
         setattr(target, field, values[field])
@@ -2707,8 +2756,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
         manifest_version = data.get("version")
-        if manifest_version not in {4, 5}:
-            self.report({"ERROR"}, "Only vehicle manifest versions 4 and 5 can be imported")
+        if manifest_version != 6:
+            self.report({"ERROR"}, "Only vehicle manifest version 6 can be imported")
             return {"CANCELLED"}
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
@@ -2733,9 +2782,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             return {"CANCELLED"}
         body_colors_data = []
         if "colors" in body:
-            if manifest_version < 5:
-                self.report({"ERROR"}, "Manifest body.colors requires vehicle manifest version 5")
-                return {"CANCELLED"}
             body_colors_data = body["colors"]
             if not isinstance(body_colors_data, list) or not body_colors_data:
                 self.report({"ERROR"}, "Manifest body.colors must contain at least one color")
@@ -2767,6 +2813,18 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(steering_wheel, dict):
             self.report({"ERROR"}, "Manifest steeringWheel must be an object")
             return {"CANCELLED"}
+        driver_assists = data.get("driverAssists")
+        if not isinstance(driver_assists, dict):
+            self.report({"ERROR"}, "Manifest driverAssists must be an object")
+            return {"CANCELLED"}
+        assist_max_levels = {}
+        for field in ("abs", "esc", "tractionControl"):
+            config = driver_assists.get(field)
+            max_level = config.get("maxLevel") if isinstance(config, dict) else None
+            if isinstance(max_level, bool) or not isinstance(max_level, int) or max_level < 1:
+                self.report({"ERROR"}, f"Manifest driverAssists.{field}.maxLevel must be a positive integer")
+                return {"CANCELLED"}
+            assist_max_levels[field] = max_level
         presets_data = data.get("presets")
         if not isinstance(presets_data, list) or not presets_data:
             self.report({"ERROR"}, "Manifest presets must contain at least one preset")
@@ -2783,7 +2841,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             if not isinstance(rotation, (int, float)) or not math.isfinite(rotation) or not 90 <= rotation <= 2160:
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.maxDegreesOfRotation is invalid")
                 return {"CANCELLED"}
-            for field in ("antiRoll", "abs", "esc", "tractionControl", "brakeBias"):
+            for field in ("antiRoll", "brakeBias"):
                 value = preset_data.get(field)
                 if (
                     not isinstance(value, (int, float))
@@ -2791,6 +2849,18 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     or not 0 <= value <= 1
                 ):
                     self.report({"ERROR"}, f"Manifest preset {preset_index}.{field} must be between 0 and 1")
+                    return {"CANCELLED"}
+            for field, max_level in (
+                ("absLevel", assist_max_levels["abs"]),
+                ("escLevel", assist_max_levels["esc"]),
+                ("tractionControlLevel", assist_max_levels["tractionControl"]),
+            ):
+                value = preset_data.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= max_level:
+                    self.report(
+                        {"ERROR"},
+                        f"Manifest preset {preset_index}.{field} must be an integer between 0 and {max_level}",
+                    )
                     return {"CANCELLED"}
             preset_wheels = preset_data.get("wheels") or {}
             if not isinstance(preset_wheels, dict):
@@ -2871,6 +2941,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
         settings.air_drag = body.get("airDrag", settings.air_drag)
+        settings.abs_max_level = assist_max_levels["abs"]
+        settings.esc_max_level = assist_max_levels["esc"]
+        settings.traction_control_max_level = assist_max_levels["tractionControl"]
         settings.body_colors.clear()
         for body_color_data in body_colors_data:
             body_color = settings.body_colors.add()
@@ -2895,7 +2968,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                         add_wheel_from_config(settings, group, key, wheel_data)
         ensure_default_wheels(settings)
         settings.presets.clear()
-        settings.preset_schema_version = 6
+        settings.preset_schema_version = 7
         for preset_data in presets_data:
             if not isinstance(preset_data, dict):
                 continue
@@ -2905,9 +2978,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.max_steering_angle = preset_data["maxSteeringAngle"]
             preset.max_degrees_of_rotation = preset_data["maxDegreesOfRotation"]
             preset.anti_roll = preset_data["antiRoll"]
-            preset.abs = preset_data["abs"]
-            preset.esc = preset_data["esc"]
-            preset.traction_control = preset_data["tractionControl"]
+            preset.abs_level = preset_data["absLevel"]
+            preset.esc_level = preset_data["escLevel"]
+            preset.traction_control_level = preset_data["tractionControlLevel"]
             preset.brake_bias = preset_data["brakeBias"]
             preset_wheels = preset_data.get("wheels") or {}
             for group in ("front", "rear"):
@@ -3125,9 +3198,9 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "max_steering_angle")
     draw_split_prop(layout, preset, "max_degrees_of_rotation")
     draw_split_prop(layout, preset, "anti_roll")
-    draw_split_prop(layout, preset, "abs")
-    draw_split_prop(layout, preset, "esc")
-    draw_split_prop(layout, preset, "traction_control")
+    draw_split_prop(layout, preset, "abs_level")
+    draw_split_prop(layout, preset, "esc_level")
+    draw_split_prop(layout, preset, "traction_control_level")
     draw_split_prop(layout, preset, "brake_bias")
 
     for group in ("front", "rear"):
@@ -3270,6 +3343,12 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Wheel Setup")
         draw_wheels(box, settings)
+
+        box = layout.box()
+        box.label(text="Driver Assists")
+        draw_split_prop(box, settings, "abs_max_level")
+        draw_split_prop(box, settings, "esc_max_level")
+        draw_split_prop(box, settings, "traction_control_max_level")
 
         box = layout.box()
         draw_presets(box, settings)

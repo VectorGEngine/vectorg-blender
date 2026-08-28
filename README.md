@@ -29,7 +29,7 @@ src/files/models/vehicles/<car_id>/sounds/
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
@@ -51,6 +51,11 @@ src/files/models/vehicles/<car_id>/sounds/
     "obj": "steering_wheel",
     "spinLocalAxis": [0, 1, 0]
   },
+  "driverAssists": {
+    "abs": { "maxLevel": 5 },
+    "esc": { "maxLevel": 5 },
+    "tractionControl": { "maxLevel": 5 }
+  },
   "presets": [
     {
       "id": "default",
@@ -58,9 +63,9 @@ src/files/models/vehicles/<car_id>/sounds/
       "maxSteeringAngle": 50.0,
       "maxDegreesOfRotation": 540.0,
       "antiRoll": 0.4,
-      "abs": 1.0,
-      "esc": 0.0,
-      "tractionControl": 1.0,
+      "absLevel": 5,
+      "escLevel": 0,
+      "tractionControlLevel": 5,
       "brakeBias": 0.6,
       "wheels": {
         "front": {
@@ -102,9 +107,11 @@ The game applies auto blip only when both its gameplay setting and the vehicle's
 
 Wheel object selections, axes, radius, and steering behavior are shared by
 every preset. Car presets contain steering limits, steering-wheel rotation,
-anti-roll, driver assists, brake bias, and per-axle tire, suspension, braking,
-friction, damping, and grip configuration. The current game uses the first
-preset. Tire type is
+anti-roll, driver-assist levels, brake bias, and per-axle tire, suspension,
+braking, friction, damping, and grip configuration. Each assist level is an
+integer from zero through the car-wide `driverAssists.<assist>.maxLevel`, and
+runtime strength is `level / maxLevel`. New exporter configurations default
+every maximum level to 5. The current game uses the first preset. Tire type is
 `soft`, `medium`, or `hard`, with `medium` as the default. Suspension offset is
 a signed change in metres to the calculated suspension rest length. Positive
 values move the wheel farther down from the mount; negative values move it
