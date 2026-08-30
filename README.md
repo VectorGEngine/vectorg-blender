@@ -62,7 +62,10 @@ src/files/models/vehicles/<car_id>/sounds/
       "name": "Default",
       "maxSteeringAngle": 50.0,
       "maxDegreesOfRotation": 540.0,
-      "antiRoll": 0.4,
+      "antiRollBars": {
+        "front": 15.0,
+        "rear": 15.0
+      },
       "absLevel": 5,
       "escLevel": 0,
       "tractionControlLevel": 5,

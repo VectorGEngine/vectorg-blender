@@ -1008,11 +1008,14 @@ def validate_scene(settings):
             errors.append(f"{label} max steering angle must be between 1 and 90 degrees")
         if not math.isfinite(preset.max_degrees_of_rotation) or not 90.0 <= preset.max_degrees_of_rotation <= 2160.0:
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
-        if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in (
-            preset.anti_roll,
-            preset.brake_bias,
-        )):
-            errors.append(f"{label} anti-roll and brake bias must be between 0 and 1")
+        if not math.isfinite(preset.brake_bias) or not 0.0 <= preset.brake_bias <= 1.0:
+            errors.append(f"{label} brake bias must be between 0 and 1")
+        for axle, stiffness in (
+            ("front", preset.front_anti_roll_bar_stiffness),
+            ("rear", preset.rear_anti_roll_bar_stiffness),
+        ):
+            if not math.isfinite(stiffness) or not 1.0 <= stiffness <= 40.0:
+                errors.append(f"{label} {axle} anti-roll bar stiffness must be between 1 and 40")
         for assist_name, level, max_level in (
             ("ABS", preset.abs_level, settings.abs_max_level),
             ("ESC", preset.esc_level, settings.esc_max_level),
@@ -1283,7 +1286,24 @@ class CarPresetSettings(PropertyGroup):
         min=90.0,
         max=2160.0,
     )
-    anti_roll: FloatProperty(name="Anti-roll", default=0.4, min=0.0, max=1.0)
+    front_anti_roll_bar_stiffness: FloatProperty(
+        name="Front Anti-Roll Bar",
+        description="Linear front-axle anti-roll coupling stiffness",
+        default=15.0,
+        min=1.0,
+        max=40.0,
+        step=25,
+        precision=2,
+    )
+    rear_anti_roll_bar_stiffness: FloatProperty(
+        name="Rear Anti-Roll Bar",
+        description="Linear rear-axle anti-roll coupling stiffness",
+        default=15.0,
+        min=1.0,
+        max=40.0,
+        step=25,
+        precision=2,
+    )
     abs_level: IntProperty(name="ABS Level", default=5, min=0)
     esc_level: IntProperty(name="ESC Level", default=0, min=0)
     traction_control_level: IntProperty(name="Traction Control Level", default=5, min=0)
@@ -1352,7 +1372,6 @@ class CarExporterSettings(PropertyGroup):
     # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
     air_drag: FloatProperty(name="Air Drag", default=0.5, min=0.0, max=1.0)
-    anti_roll: FloatProperty(default=0.4, min=0.0, max=1.0, options={"HIDDEN"})
     abs: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
     esc: FloatProperty(default=0.0, min=0.0, max=1.0, options={"HIDDEN"})
     traction_control: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
@@ -1513,7 +1532,6 @@ def clear_configuration_settings(settings):
     settings.preset_schema_version = 0
     settings.down_force = 0.0
     settings.air_drag = 0.0
-    settings.anti_roll = 0.0
     settings.abs = 0.0
     settings.esc = 0.0
     settings.traction_control = 0.0
@@ -1578,7 +1596,6 @@ def initialize_configuration_settings(settings):
     settings.traction_control_max_level = 5
     settings.down_force = 3000.0
     settings.air_drag = 0.5
-    settings.anti_roll = 0.4
     settings.abs = 1.0
     settings.esc = 0.0
     settings.traction_control = 1.0
@@ -1652,7 +1669,7 @@ def initialize_configuration_settings(settings):
     if preset:
         preset.front.caster = 6.0
         preset.rear.caster = 0.0
-        settings.preset_schema_version = 7
+        settings.preset_schema_version = 8
     create_size_guide(settings)
 
 
@@ -1711,7 +1728,10 @@ def build_presets_config(settings):
             "name": preset.display_name,
             "maxSteeringAngle": preset.max_steering_angle,
             "maxDegreesOfRotation": preset.max_degrees_of_rotation,
-            "antiRoll": preset.anti_roll,
+            "antiRollBars": {
+                "front": preset.front_anti_roll_bar_stiffness,
+                "rear": preset.rear_anti_roll_bar_stiffness,
+            },
             "absLevel": preset.abs_level,
             "escLevel": preset.esc_level,
             "tractionControlLevel": preset.traction_control_level,
@@ -2262,7 +2282,7 @@ class CAR_EXPORTER_OT_add_preset(Operator):
         preset.display_name = "Default" if first_preset else f"Preset {len(settings.presets)}"
         ensure_preset_wheels(preset)
         apply_preset_values(default_preset_values(settings), preset)
-        settings.preset_schema_version = 7
+        settings.preset_schema_version = 8
         settings.active_preset_index = len(settings.presets) - 1
         return {"FINISHED"}
 
@@ -2463,7 +2483,8 @@ def default_preset_values(settings):
     return {
         "max_steering_angle": 50.0,
         "max_degrees_of_rotation": 540.0,
-        "anti_roll": 0.4,
+        "front_anti_roll_bar_stiffness": 15.0,
+        "rear_anti_roll_bar_stiffness": 15.0,
         "abs_level": settings.abs_max_level,
         "esc_level": 0,
         "traction_control_level": settings.traction_control_max_level,
@@ -2627,7 +2648,6 @@ def ensure_default_presets(settings):
     if settings.preset_schema_version < 5:
         for preset in settings.presets:
             preset.max_degrees_of_rotation = settings.max_degrees_of_rotation
-            preset.anti_roll = settings.anti_roll
             preset.abs_level = settings.abs_max_level
             preset.esc_level = 0
             preset.traction_control_level = settings.traction_control_max_level
@@ -2644,6 +2664,11 @@ def ensure_default_presets(settings):
             preset.esc_level = 0
             preset.traction_control_level = settings.traction_control_max_level
         settings.preset_schema_version = 7
+    if settings.preset_schema_version < 8:
+        for preset in settings.presets:
+            preset.front_anti_roll_bar_stiffness = 15.0
+            preset.rear_anti_roll_bar_stiffness = 15.0
+        settings.preset_schema_version = 8
     settings.active_preset_index = min(
         max(settings.active_preset_index, 0),
         len(settings.presets) - 1,
@@ -2668,7 +2693,8 @@ def apply_preset_values(values, target):
     for field in (
         "max_steering_angle",
         "max_degrees_of_rotation",
-        "anti_roll",
+        "front_anti_roll_bar_stiffness",
+        "rear_anti_roll_bar_stiffness",
         "abs_level",
         "esc_level",
         "traction_control_level",
@@ -3053,14 +3079,26 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             if not isinstance(rotation, (int, float)) or not math.isfinite(rotation) or not 90 <= rotation <= 2160:
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.maxDegreesOfRotation is invalid")
                 return {"CANCELLED"}
-            for field in ("antiRoll", "brakeBias"):
-                value = preset_data.get(field)
+            brake_bias = preset_data.get("brakeBias")
+            if (
+                not isinstance(brake_bias, (int, float))
+                or not math.isfinite(brake_bias)
+                or not 0 <= brake_bias <= 1
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.brakeBias must be between 0 and 1")
+                return {"CANCELLED"}
+            anti_roll_bars = preset_data.get("antiRollBars")
+            if not isinstance(anti_roll_bars, dict):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.antiRollBars must be an object")
+                return {"CANCELLED"}
+            for axle in ("front", "rear"):
+                value = anti_roll_bars.get(axle)
                 if (
                     not isinstance(value, (int, float))
                     or not math.isfinite(value)
-                    or not 0 <= value <= 1
+                    or not 1 <= value <= 40
                 ):
-                    self.report({"ERROR"}, f"Manifest preset {preset_index}.{field} must be between 0 and 1")
+                    self.report({"ERROR"}, f"Manifest preset {preset_index}.antiRollBars.{axle} must be between 1 and 40")
                     return {"CANCELLED"}
             for field, max_level in (
                 ("absLevel", assist_max_levels["abs"]),
@@ -3224,7 +3262,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             point.max_force = settings.down_force
             self.report({"WARNING"}, "Imported version 6 downforce as one center-of-mass point")
         settings.presets.clear()
-        settings.preset_schema_version = 7
+        settings.preset_schema_version = 8
         for preset_data in presets_data:
             if not isinstance(preset_data, dict):
                 continue
@@ -3233,7 +3271,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.display_name = str(preset_data.get("name", preset.preset_id))
             preset.max_steering_angle = preset_data["maxSteeringAngle"]
             preset.max_degrees_of_rotation = preset_data["maxDegreesOfRotation"]
-            preset.anti_roll = preset_data["antiRoll"]
+            preset.front_anti_roll_bar_stiffness = preset_data["antiRollBars"]["front"]
+            preset.rear_anti_roll_bar_stiffness = preset_data["antiRollBars"]["rear"]
             preset.abs_level = preset_data["absLevel"]
             preset.esc_level = preset_data["escLevel"]
             preset.traction_control_level = preset_data["tractionControlLevel"]
@@ -3453,7 +3492,8 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "display_name")
     draw_split_prop(layout, preset, "max_steering_angle")
     draw_split_prop(layout, preset, "max_degrees_of_rotation")
-    draw_split_prop(layout, preset, "anti_roll")
+    draw_split_prop(layout, preset, "front_anti_roll_bar_stiffness")
+    draw_split_prop(layout, preset, "rear_anti_roll_bar_stiffness")
     draw_split_prop(layout, preset, "abs_level")
     draw_split_prop(layout, preset, "esc_level")
     draw_split_prop(layout, preset, "traction_control_level")
