@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -73,6 +73,8 @@ TORQUE_CURVE_NODE = "Torque Curve"
 CAMERA_PREFIXES = ("chase", "cockpit", "hood", "roof")
 GUIDE_PREFIX = "CAR_EXPORTER_GUIDE_"
 GUIDE_PROP = "car_exporter_helper"
+DOWNFORCE_HELPER_PROP = "vectorg_downforce_helper"
+CENTER_OF_MASS_HELPER_PROP = "vectorg_center_of_mass_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 DEFAULT_MAX_TEXTURE_SIZE = 4096
 DEFAULT_JPEG_QUALITY = 85
@@ -144,6 +146,41 @@ def relative_to_car(car_obj, obj):
     if not car_obj or not obj:
         return None
     return car_obj.matrix_world.inverted() @ obj.matrix_world.translation
+
+
+def blender_position_to_game(position):
+    return [position.x, position.z, -position.y]
+
+
+def game_position_to_blender(position):
+    return Vector((position[0], -position[2], position[1]))
+
+
+def next_helper_name(prefix):
+    index = 1
+    while bpy.data.objects.get(f"{prefix}_{index:02d}"):
+        index += 1
+    return f"{prefix}_{index:02d}"
+
+
+def create_car_helper(context, settings, name, display_type, display_size, helper_prop):
+    car_obj = settings.car_root_object
+    if not car_obj:
+        return None
+    helper = bpy.data.objects.new(name, None)
+    helper.empty_display_type = display_type
+    helper.empty_display_size = display_size
+    helper.show_in_front = True
+    helper.hide_render = True
+    helper[helper_prop] = True
+    link_collection = car_obj.users_collection[0] if car_obj.users_collection else context.scene.collection
+    link_collection.objects.link(helper)
+    helper.parent = car_obj
+    helper.matrix_parent_inverse.identity()
+    helper.location = car_obj.matrix_world.inverted() @ context.scene.cursor.location
+    helper.lock_rotation = (True, True, True)
+    helper.lock_scale = (True, True, True)
+    return helper
 
 
 def object_world_bounds_size(obj):
@@ -385,6 +422,10 @@ def guide_objects():
     ]
 
 
+def downforce_helper_objects():
+    return [obj for obj in bpy.data.objects if obj.get(DOWNFORCE_HELPER_PROP)]
+
+
 def remove_size_guide():
     for obj in guide_objects():
         data = obj.data
@@ -472,7 +513,7 @@ def create_size_guide(settings):
 
 
 def with_helpers_unlinked(callback):
-    helpers = guide_objects()
+    helpers = guide_objects() + downforce_helper_objects()
     states = [(obj, list(obj.users_collection)) for obj in helpers]
     try:
         for obj, collections in states:
@@ -849,6 +890,24 @@ def validate_scene(settings):
         for label, obj in required[1:]:
             validate_object_in_car_tree(errors, car_obj, label, obj)
 
+    downforce_objects = set()
+    for index, point in enumerate(settings.down_force_points, start=1):
+        point_obj = point.object_ref
+        if not point_obj:
+            errors.append(f"Downforce point {index} object is required")
+            continue
+        if point_obj.type != "EMPTY":
+            errors.append(f"Downforce point {index} must be an Empty object")
+        if point_obj in downforce_objects:
+            errors.append(f"Downforce point object is used more than once: {object_config_name(point_obj)}")
+        downforce_objects.add(point_obj)
+        validate_object_in_car_tree(errors, car_obj, f"Downforce point {index}", point_obj)
+        position = relative_to_car(car_obj, point_obj)
+        if position is None or not all(math.isfinite(value) for value in position):
+            errors.append(f"Downforce point {index} position must be finite")
+        if not math.isfinite(point.max_force) or point.max_force < 0:
+            errors.append(f"Downforce point {index} max force must be non-negative")
+
     for label, prefix in (
         ("Chase camera", "chase"),
         ("Cockpit camera", "cockpit"),
@@ -1139,6 +1198,11 @@ class CarColliderSettings(PropertyGroup):
     mass: FloatProperty(name="Mass", default=1230.0, min=0.0)
 
 
+class CarDownForcePointSettings(PropertyGroup):
+    object_ref: PointerProperty(name="Point", type=bpy.types.Object)
+    max_force: FloatProperty(name="Max Force", default=3000.0, min=0.0)
+
+
 class CarWheelSettings(PropertyGroup):
     group: StringProperty(name="Group", default="front")
     key: StringProperty(name="Key", default="l")
@@ -1285,6 +1349,7 @@ class CarExporterSettings(PropertyGroup):
     brake_lights_material: PointerProperty(name="Brake Lights", type=bpy.types.Material)
     reverse_lights_material: PointerProperty(name="Reverse Lights", type=bpy.types.Material)
     dashboard_screen_object: PointerProperty(name="Screen", type=bpy.types.Object)
+    # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
     air_drag: FloatProperty(name="Air Drag", default=0.5, min=0.0, max=1.0)
     anti_roll: FloatProperty(default=0.4, min=0.0, max=1.0, options={"HIDDEN"})
@@ -1304,6 +1369,7 @@ class CarExporterSettings(PropertyGroup):
     body_colors: CollectionProperty(type=CarBodyColorSettings)
     active_body_color_index: IntProperty(name="Active Body Color", default=0)
     colliders: CollectionProperty(type=CarColliderSettings)
+    down_force_points: CollectionProperty(type=CarDownForcePointSettings)
     wheels: CollectionProperty(type=CarWheelSettings)
     presets: CollectionProperty(type=CarPresetSettings)
     active_preset_index: IntProperty(name="Active Preset", default=0)
@@ -1408,6 +1474,13 @@ class CarExporterSettings(PropertyGroup):
 
 
 def clear_configuration_settings(settings):
+    center_of_mass = settings.center_of_mass_object
+    if center_of_mass and center_of_mass.get(CENTER_OF_MASS_HELPER_PROP):
+        bpy.data.objects.remove(center_of_mass, do_unlink=True)
+    for point in settings.down_force_points:
+        helper = point.object_ref
+        if helper and helper.get(DOWNFORCE_HELPER_PROP):
+            bpy.data.objects.remove(helper, do_unlink=True)
     settings.is_configured = False
     settings.car_id = ""
     settings.package_version = "1"
@@ -1433,6 +1506,7 @@ def clear_configuration_settings(settings):
     settings.reverse_lights_material = None
     settings.dashboard_screen_object = None
     settings.colliders.clear()
+    settings.down_force_points.clear()
     settings.wheels.clear()
     settings.presets.clear()
     settings.active_preset_index = 0
@@ -1826,7 +1900,15 @@ def build_manifest(settings):
             }
             for collider in settings.colliders
         ],
-        "downForce": settings.down_force,
+        "downForcePoints": [
+            {
+                "position": blender_position_to_game(
+                    relative_to_car(settings.car_root_object, point.object_ref)
+                ),
+                "maxForce": point.max_force,
+            }
+            for point in settings.down_force_points
+        ],
         "airDrag": settings.air_drag,
     }
     if settings.body_colors:
@@ -1839,7 +1921,7 @@ def build_manifest(settings):
         ]
 
     manifest = {
-        "version": 6,
+        "version": 7,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
@@ -1997,6 +2079,92 @@ class CAR_EXPORTER_OT_remove_collider(Operator):
             collider.collider_type = "trimesh"
             collider.mass = 0.0
             settings.colliders.remove(self.index)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_add_center_of_mass(Operator):
+    bl_idname = "car_exporter.add_center_of_mass"
+    bl_label = "Add Center of Mass"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if not settings.car_root_object:
+            self.report({"ERROR"}, "Select Car Root before adding Center of Mass")
+            return {"CANCELLED"}
+        if settings.center_of_mass_object:
+            self.report({"ERROR"}, "Center of Mass already exists")
+            return {"CANCELLED"}
+        helper = create_car_helper(
+            context,
+            settings,
+            "centerOfMass" if not bpy.data.objects.get("centerOfMass") else next_helper_name("centerOfMass"),
+            "SPHERE",
+            0.18,
+            CENTER_OF_MASS_HELPER_PROP,
+        )
+        helper.hide_render = False
+        settings.center_of_mass_object = helper
+        context.view_layer.objects.active = helper
+        helper.select_set(True)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_center_of_mass(Operator):
+    bl_idname = "car_exporter.remove_center_of_mass"
+    bl_label = "Remove Center of Mass"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        helper = settings.center_of_mass_object
+        settings.center_of_mass_object = None
+        if helper and helper.get(CENTER_OF_MASS_HELPER_PROP):
+            bpy.data.objects.remove(helper, do_unlink=True)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_add_downforce_point(Operator):
+    bl_idname = "car_exporter.add_downforce_point"
+    bl_label = "Add Downforce Point"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if not settings.car_root_object:
+            self.report({"ERROR"}, "Select Car Root before adding a downforce point")
+            return {"CANCELLED"}
+        helper = create_car_helper(
+            context,
+            settings,
+            next_helper_name("downforce"),
+            "SINGLE_ARROW",
+            0.4,
+            DOWNFORCE_HELPER_PROP,
+        )
+        helper.rotation_euler = (math.pi, 0.0, 0.0)
+        point = settings.down_force_points.add()
+        point.object_ref = helper
+        point.max_force = 3000.0
+        context.view_layer.objects.active = helper
+        helper.select_set(True)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_downforce_point(Operator):
+    bl_idname = "car_exporter.remove_downforce_point"
+    bl_label = "Remove Downforce Point"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty()
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if 0 <= self.index < len(settings.down_force_points):
+            helper = settings.down_force_points[self.index].object_ref
+            settings.down_force_points.remove(self.index)
+            if helper and helper.get(DOWNFORCE_HELPER_PROP):
+                bpy.data.objects.remove(helper, do_unlink=True)
         return {"FINISHED"}
 
 
@@ -2756,8 +2924,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
         manifest_version = data.get("version")
-        if manifest_version != 6:
-            self.report({"ERROR"}, "Only vehicle manifest version 6 can be imported")
+        if manifest_version not in {6, 7}:
+            self.report({"ERROR"}, "Only vehicle manifest versions 6 and 7 can be imported")
             return {"CANCELLED"}
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
@@ -2780,6 +2948,50 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(body, dict):
             self.report({"ERROR"}, "Manifest body must be an object")
             return {"CANCELLED"}
+        downforce_points_data = body.get("downForcePoints", [])
+        if manifest_version == 7:
+            if not isinstance(downforce_points_data, list):
+                self.report({"ERROR"}, "Manifest body.downForcePoints must be an array")
+                return {"CANCELLED"}
+            for point_index, point_data in enumerate(downforce_points_data):
+                if not isinstance(point_data, dict):
+                    self.report({"ERROR"}, f"Manifest downforce point {point_index} must be an object")
+                    return {"CANCELLED"}
+                position = point_data.get("position")
+                if (
+                    not isinstance(position, list)
+                    or len(position) != 3
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        for value in position
+                    )
+                ):
+                    self.report({"ERROR"}, f"Manifest downforce point {point_index} position is invalid")
+                    return {"CANCELLED"}
+                max_force = point_data.get("maxForce")
+                if (
+                    isinstance(max_force, bool)
+                    or not isinstance(max_force, (int, float))
+                    or not math.isfinite(max_force)
+                    or max_force < 0
+                ):
+                    self.report({"ERROR"}, f"Manifest downforce point {point_index} maxForce is invalid")
+                    return {"CANCELLED"}
+            if "downForce" in body:
+                self.report({"ERROR"}, "Manifest version 7 must use body.downForcePoints")
+                return {"CANCELLED"}
+        else:
+            legacy_down_force = body.get("downForce")
+            if (
+                isinstance(legacy_down_force, bool)
+                or not isinstance(legacy_down_force, (int, float))
+                or not math.isfinite(legacy_down_force)
+                or legacy_down_force < 0
+            ):
+                self.report({"ERROR"}, "Manifest body.downForce must be non-negative")
+                return {"CANCELLED"}
         body_colors_data = []
         if "colors" in body:
             body_colors_data = body["colors"]
@@ -2938,9 +3150,34 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.auto_blip_duration = engine.get("autoBlipDuration", settings.auto_blip_duration)
         settings.torque_factor = engine.get("torqueFactor", settings.torque_factor)
         set_object_pointer(settings, "car_root_object", body.get("obj", ""))
+        if not settings.car_root_object and (
+            downforce_points_data or (manifest_version == 6 and body.get("downForce", 0) > 0)
+        ):
+            self.report({"ERROR"}, "Manifest car root object is required to import downforce points")
+            return {"CANCELLED"}
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.down_force = body.get("downForce", settings.down_force)
         settings.air_drag = body.get("airDrag", settings.air_drag)
+        for point in settings.down_force_points:
+            helper = point.object_ref
+            if helper and helper.get(DOWNFORCE_HELPER_PROP):
+                bpy.data.objects.remove(helper, do_unlink=True)
+        settings.down_force_points.clear()
+        if manifest_version == 7:
+            for point_data in downforce_points_data:
+                helper = create_car_helper(
+                    context,
+                    settings,
+                    next_helper_name("downforce"),
+                    "SINGLE_ARROW",
+                    0.4,
+                    DOWNFORCE_HELPER_PROP,
+                )
+                helper.location = game_position_to_blender(point_data["position"])
+                helper.rotation_euler = (math.pi, 0.0, 0.0)
+                point = settings.down_force_points.add()
+                point.object_ref = helper
+                point.max_force = point_data["maxForce"]
         settings.abs_max_level = assist_max_levels["abs"]
         settings.esc_max_level = assist_max_levels["esc"]
         settings.traction_control_max_level = assist_max_levels["tractionControl"]
@@ -2967,6 +3204,25 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     for key, wheel_data in group_wheels.items():
                         add_wheel_from_config(settings, group, key, wheel_data)
         ensure_default_wheels(settings)
+        if manifest_version == 6 and settings.down_force > 0:
+            helper = create_car_helper(
+                context,
+                settings,
+                next_helper_name("downforce"),
+                "SINGLE_ARROW",
+                0.4,
+                DOWNFORCE_HELPER_PROP,
+            )
+            if settings.center_of_mass_object:
+                helper.location = relative_to_car(
+                    settings.car_root_object,
+                    settings.center_of_mass_object,
+                )
+            helper.rotation_euler = (math.pi, 0.0, 0.0)
+            point = settings.down_force_points.add()
+            point.object_ref = helper
+            point.max_force = settings.down_force
+            self.report({"WARNING"}, "Imported version 6 downforce as one center-of-mass point")
         settings.presets.clear()
         settings.preset_schema_version = 7
         for preset_data in presets_data:
@@ -3246,6 +3502,30 @@ def draw_cameras(layout, settings):
         draw_split_label(layout, "FOV", f"{camera_fov(settings, prefix):.1f}", tooltip="Adjust FOV from Camera Properties")
 
 
+def draw_body_physics(layout, settings):
+    layout.label(text="Center of Mass")
+    if settings.center_of_mass_object:
+        row = layout.row(align=True)
+        row.prop(settings, "center_of_mass_object", text="")
+        row.operator("car_exporter.remove_center_of_mass", text="", icon="X")
+    else:
+        layout.operator("car_exporter.add_center_of_mass", icon="ADD")
+
+    layout.separator(type="LINE")
+    layout.label(text="Downforce Points")
+    for index, point in enumerate(settings.down_force_points):
+        point_box = layout.box()
+        header = point_box.row(align=True)
+        header.label(text=f"Point {index + 1}", icon="EMPTY_SINGLE_ARROW")
+        remove = header.operator("car_exporter.remove_downforce_point", text="", icon="X")
+        remove.index = index
+        draw_split_prop(point_box, point, "object_ref", label="Helper")
+        draw_split_prop(point_box, point, "max_force")
+    layout.operator("car_exporter.add_downforce_point", icon="ADD")
+    layout.separator(type="LINE")
+    draw_split_prop(layout, settings, "air_drag")
+
+
 class CAR_EXPORTER_PT_car_export(Panel):
     bl_label = "VectorG Car Exporter"
     bl_idname = "CAR_EXPORTER_PT_car_export"
@@ -3332,9 +3612,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         box = layout.box()
         box.label(text="Body Physics")
-        draw_split_prop(box, settings, "center_of_mass_object")
-        for prop in ("down_force", "air_drag"):
-            draw_split_prop(box, settings, prop)
+        draw_body_physics(box, settings)
 
         box = layout.box()
         box.label(text="Colliders")
@@ -3385,6 +3663,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
 classes = (
     CarBodyColorSettings,
     CarColliderSettings,
+    CarDownForcePointSettings,
     CarWheelSettings,
     CarWheelPresetSettings,
     CarPresetSettings,
@@ -3394,6 +3673,10 @@ classes = (
     CAR_EXPORTER_OT_validate_car,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
+    CAR_EXPORTER_OT_add_center_of_mass,
+    CAR_EXPORTER_OT_remove_center_of_mass,
+    CAR_EXPORTER_OT_add_downforce_point,
+    CAR_EXPORTER_OT_remove_downforce_point,
     CAR_EXPORTER_OT_add_body_color,
     CAR_EXPORTER_OT_remove_body_color,
     CAR_EXPORTER_OT_move_body_color,

@@ -29,7 +29,7 @@ src/files/models/vehicles/<car_id>/sounds/
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
@@ -104,6 +104,33 @@ The Torque Curve section exports `engine.torqueFactor`, which scales drive and
 engine-braking torque before tire-force limits are applied.
 The game applies auto blip only when both its gameplay setting and the vehicle's
 `engine.autoBlip` capability are enabled.
+
+## Body Physics Helpers
+
+Create the center of mass from **Body Physics > Add Center of Mass**. The addon
+creates a sphere Empty at the 3D cursor, parents it to the car root, and exports
+it as the `body.centerOfMass` node used by the game. Only its location is
+editable.
+
+Create aerodynamic load points with **Add Downforce Point**. Each point has its
+own maximum force in newtons. The arrow is fixed to car local `-Z`, matching
+game chassis local `-Y`; its rotation and scale are intentionally locked.
+Downforce helpers are authoring-only and are not written to the GLB. Their
+car-local positions are exported in metres:
+
+```json
+"downForcePoints": [
+  {
+    "position": [0.0, 0.35, -1.2],
+    "maxForce": 1800.0
+  }
+]
+```
+
+At runtime each point independently reaches `maxForce` at the vehicle's geared
+maximum speed, following a capped square-law speed curve. Point placement
+controls the resulting pitch moment; point rotation does not affect force
+direction.
 
 Wheel object selections, axes, radius, and steering behavior are shared by
 every preset. Car presets contain steering limits, steering-wheel rotation,
