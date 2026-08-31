@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -161,6 +161,21 @@ def next_helper_name(prefix):
     while bpy.data.objects.get(f"{prefix}_{index:02d}"):
         index += 1
     return f"{prefix}_{index:02d}"
+
+
+def downforce_point_display_name(point, index):
+    return point.display_name.strip() or f"Downforce {index + 1}"
+
+
+def next_downforce_point_display_name(settings):
+    existing_names = {
+        downforce_point_display_name(point, index).casefold()
+        for index, point in enumerate(settings.down_force_points)
+    }
+    index = 1
+    while f"downforce {index}" in existing_names:
+        index += 1
+    return f"Downforce {index}"
 
 
 def create_car_helper(context, settings, name, display_type, display_size, helper_prop):
@@ -891,7 +906,13 @@ def validate_scene(settings):
             validate_object_in_car_tree(errors, car_obj, label, obj)
 
     downforce_objects = set()
+    downforce_names = set()
     for index, point in enumerate(settings.down_force_points, start=1):
+        display_name = downforce_point_display_name(point, index - 1)
+        normalized_name = display_name.casefold()
+        if normalized_name in downforce_names:
+            errors.append(f"Duplicate downforce point name: {display_name}")
+        downforce_names.add(normalized_name)
         point_obj = point.object_ref
         if not point_obj:
             errors.append(f"Downforce point {index} object is required")
@@ -1010,6 +1031,14 @@ def validate_scene(settings):
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
         if not math.isfinite(preset.brake_bias) or not 0.0 <= preset.brake_bias <= 1.0:
             errors.append(f"{label} brake bias must be between 0 and 1")
+        if not math.isfinite(preset.final_drive_ratio) or preset.final_drive_ratio <= 0:
+            errors.append(f"{label} final drive ratio must be positive")
+        if not math.isfinite(preset.reverse_ratio) or preset.reverse_ratio >= 0:
+            errors.append(f"{label} reverse ratio must be negative")
+        for gear_index in range(1, preset.forward_gear_count + 1):
+            gear_ratio = getattr(preset, f"gear_{gear_index}")
+            if not math.isfinite(gear_ratio) or gear_ratio <= 0:
+                errors.append(f"{label} gear {gear_index} ratio must be positive")
         for axle, stiffness in (
             ("front", preset.front_anti_roll_bar_stiffness),
             ("rear", preset.rear_anti_roll_bar_stiffness),
@@ -1202,6 +1231,7 @@ class CarColliderSettings(PropertyGroup):
 
 
 class CarDownForcePointSettings(PropertyGroup):
+    display_name: StringProperty(name="Name", default="")
     object_ref: PointerProperty(name="Point", type=bpy.types.Object)
     max_force: FloatProperty(name="Max Force", default=3000.0, min=0.0)
 
@@ -1315,6 +1345,24 @@ class CarPresetSettings(PropertyGroup):
         max=1.0,
         subtype="FACTOR",
     )
+    final_drive_ratio: FloatProperty(name="Final Drive Ratio", default=5.0, min=0.01)
+    reverse_ratio: FloatProperty(name="Reverse", default=-3.57)
+    forward_gear_count: IntProperty(name="Forward Gears", default=6, min=1, max=15)
+    gear_1: FloatProperty(name="Gear 1", default=4.08, min=0.01)
+    gear_2: FloatProperty(name="Gear 2", default=2.7, min=0.01)
+    gear_3: FloatProperty(name="Gear 3", default=1.9, min=0.01)
+    gear_4: FloatProperty(name="Gear 4", default=1.4, min=0.01)
+    gear_5: FloatProperty(name="Gear 5", default=1.06, min=0.01)
+    gear_6: FloatProperty(name="Gear 6", default=0.85, min=0.01)
+    gear_7: FloatProperty(name="Gear 7", default=0.70, min=0.01)
+    gear_8: FloatProperty(name="Gear 8", default=0.58, min=0.01)
+    gear_9: FloatProperty(name="Gear 9", default=0.50, min=0.01)
+    gear_10: FloatProperty(name="Gear 10", default=0.44, min=0.01)
+    gear_11: FloatProperty(name="Gear 11", default=0.40, min=0.01)
+    gear_12: FloatProperty(name="Gear 12", default=0.36, min=0.01)
+    gear_13: FloatProperty(name="Gear 13", default=0.33, min=0.01)
+    gear_14: FloatProperty(name="Gear 14", default=0.30, min=0.01)
+    gear_15: FloatProperty(name="Gear 15", default=0.28, min=0.01)
     front: PointerProperty(type=CarWheelPresetSettings)
     rear: PointerProperty(type=CarWheelPresetSettings)
     wheels: CollectionProperty(type=CarWheelPresetSettings)
@@ -1400,7 +1448,6 @@ class CarExporterSettings(PropertyGroup):
 
     drive: EnumProperty(name="Drive", items=(("awd", "AWD", ""), ("fwd", "FWD", ""), ("rwd", "RWD", "")), default="awd")
     hp: FloatProperty(name="HP", default=590.0, min=1.0)
-    final_drive_ratio: FloatProperty(name="Final Drive Ratio", default=5.0, min=0.01)
     max_rpm: IntProperty(name="Max RPM", default=8000, min=1)
     idle_rpm: IntProperty(name="Idle RPM", default=1000, min=1)
     redline_rpm: IntProperty(name="Redline RPM", default=7000, min=1)
@@ -1425,24 +1472,6 @@ class CarExporterSettings(PropertyGroup):
         default=1.0,
         min=0.01,
     )
-
-    reverse_ratio: FloatProperty(name="Reverse", default=-3.57)
-    forward_gear_count: IntProperty(name="Forward Gears", default=6, min=1, max=15)
-    gear_1: FloatProperty(name="Gear 1", default=4.08)
-    gear_2: FloatProperty(name="Gear 2", default=2.7)
-    gear_3: FloatProperty(name="Gear 3", default=1.9)
-    gear_4: FloatProperty(name="Gear 4", default=1.4)
-    gear_5: FloatProperty(name="Gear 5", default=1.06)
-    gear_6: FloatProperty(name="Gear 6", default=0.85)
-    gear_7: FloatProperty(name="Gear 7", default=0.70)
-    gear_8: FloatProperty(name="Gear 8", default=0.58)
-    gear_9: FloatProperty(name="Gear 9", default=0.50)
-    gear_10: FloatProperty(name="Gear 10", default=0.44)
-    gear_11: FloatProperty(name="Gear 11", default=0.40)
-    gear_12: FloatProperty(name="Gear 12", default=0.36)
-    gear_13: FloatProperty(name="Gear 13", default=0.33)
-    gear_14: FloatProperty(name="Gear 14", default=0.30)
-    gear_15: FloatProperty(name="Gear 15", default=0.28)
 
     torque_1000: FloatProperty(name="1000 RPM", default=422)
     torque_2000: FloatProperty(name="2000 RPM", default=506)
@@ -1540,7 +1569,6 @@ def clear_configuration_settings(settings):
     settings.sound_pitch_offset = 0
     settings.drive = "awd"
     settings.hp = 1.0
-    settings.final_drive_ratio = 0.01
     settings.max_rpm = 1
     settings.idle_rpm = 1
     settings.redline_rpm = 1
@@ -1556,10 +1584,6 @@ def clear_configuration_settings(settings):
     settings.turbo_valve = False
     settings.max_torque = 1.0
     settings.torque_factor = 0.01
-    settings.reverse_ratio = 0.0
-    settings.forward_gear_count = 1
-    for index in range(1, 16):
-        setattr(settings, f"gear_{index}", 0.0)
     for rpm in (1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000):
         setattr(settings, f"torque_{rpm}", 0.0)
     for prefix in CAMERA_PREFIXES:
@@ -1603,7 +1627,6 @@ def initialize_configuration_settings(settings):
     settings.max_degrees_of_rotation = 540.0
     settings.drive = "awd"
     settings.hp = 590.0
-    settings.final_drive_ratio = 5.0
     settings.max_rpm = 8000
     settings.idle_rpm = 1000
     settings.redline_rpm = 7000
@@ -1619,26 +1642,6 @@ def initialize_configuration_settings(settings):
     settings.turbo_valve = False
     settings.max_torque = 590.0
     settings.torque_factor = 1.0
-    settings.reverse_ratio = -3.57
-    settings.forward_gear_count = 6
-    for index, value in {
-        1: 4.08,
-        2: 2.7,
-        3: 1.9,
-        4: 1.4,
-        5: 1.06,
-        6: 0.85,
-        7: 0.70,
-        8: 0.58,
-        9: 0.50,
-        10: 0.44,
-        11: 0.40,
-        12: 0.36,
-        13: 0.33,
-        14: 0.30,
-        15: 0.28,
-    }.items():
-        setattr(settings, f"gear_{index}", value)
     for rpm, value in {
         1000: 422.292,
         2000: 506.974,
@@ -1736,6 +1739,16 @@ def build_presets_config(settings):
             "escLevel": preset.esc_level,
             "tractionControlLevel": preset.traction_control_level,
             "brakeBias": preset.brake_bias,
+            "gearing": {
+                "finalDriveRatio": preset.final_drive_ratio,
+                "gearRatios": {
+                    **{"0": 0, "-1": preset.reverse_ratio},
+                    **{
+                        str(index): getattr(preset, f"gear_{index}")
+                        for index in range(1, preset.forward_gear_count + 1)
+                    },
+                },
+            },
             "wheels": {
                 group: {
                     key: wheel_preset_config(getattr(preset, group))
@@ -1922,12 +1935,13 @@ def build_manifest(settings):
         ],
         "downForcePoints": [
             {
+                "name": downforce_point_display_name(point, index),
                 "position": blender_position_to_game(
                     relative_to_car(settings.car_root_object, point.object_ref)
                 ),
                 "maxForce": point.max_force,
             }
-            for point in settings.down_force_points
+            for index, point in enumerate(settings.down_force_points)
         ],
         "airDrag": settings.air_drag,
     }
@@ -1941,7 +1955,7 @@ def build_manifest(settings):
         ]
 
     manifest = {
-        "version": 7,
+        "version": 8,
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
@@ -1959,7 +1973,6 @@ def build_manifest(settings):
         "engine": {
             "hp": settings.hp,
             "drive": settings.drive,
-            "finalDriveRatio": settings.final_drive_ratio,
             "maxRPM": settings.max_rpm,
             "idleRPM": settings.idle_rpm,
             "redlineRPM": settings.redline_rpm,
@@ -1971,13 +1984,6 @@ def build_manifest(settings):
             "autoBlip": settings.auto_blip,
             "autoBlipDuration": settings.auto_blip_duration,
             "torqueFactor": settings.torque_factor,
-            "gearRatios": {
-                **{"0": 0, "-1": settings.reverse_ratio},
-                **{
-                    str(index): getattr(settings, f"gear_{index}")
-                    for index in range(1, settings.forward_gear_count + 1)
-                },
-            },
             "torqueCurve": sample_torque_curve(settings),
             "turbo": {
                 "enabled": settings.turbo_enabled,
@@ -2163,7 +2169,9 @@ class CAR_EXPORTER_OT_add_downforce_point(Operator):
             DOWNFORCE_HELPER_PROP,
         )
         helper.rotation_euler = (math.pi, 0.0, 0.0)
+        display_name = next_downforce_point_display_name(settings)
         point = settings.down_force_points.add()
+        point.display_name = display_name
         point.object_ref = helper
         point.max_force = 3000.0
         context.view_layer.objects.active = helper
@@ -2489,6 +2497,26 @@ def default_preset_values(settings):
         "esc_level": 0,
         "traction_control_level": settings.traction_control_max_level,
         "brake_bias": 0.6,
+        "final_drive_ratio": 5.0,
+        "reverse_ratio": -3.57,
+        "forward_gear_count": 6,
+        "gear_ratios": {
+            1: 4.08,
+            2: 2.7,
+            3: 1.9,
+            4: 1.4,
+            5: 1.06,
+            6: 0.85,
+            7: 0.70,
+            8: 0.58,
+            9: 0.50,
+            10: 0.44,
+            11: 0.40,
+            12: 0.36,
+            13: 0.33,
+            14: 0.30,
+            15: 0.28,
+        },
         "front": default_wheel_preset_values("front"),
         "rear": default_wheel_preset_values("rear"),
     }
@@ -2699,8 +2727,13 @@ def apply_preset_values(values, target):
         "esc_level",
         "traction_control_level",
         "brake_bias",
+        "final_drive_ratio",
+        "reverse_ratio",
+        "forward_gear_count",
     ):
         setattr(target, field, values[field])
+    for index, ratio in values["gear_ratios"].items():
+        setattr(target, f"gear_{index}", ratio)
     apply_wheel_preset_values(values["front"], target.front)
     apply_wheel_preset_values(values["rear"], target.rear)
 
@@ -2950,12 +2983,15 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
         manifest_version = data.get("version")
-        if manifest_version not in {6, 7}:
-            self.report({"ERROR"}, "Only vehicle manifest versions 6 and 7 can be imported")
+        if manifest_version != 8:
+            self.report({"ERROR"}, "Only vehicle manifest version 8 can be imported")
             return {"CANCELLED"}
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
+            return {"CANCELLED"}
+        if "finalDriveRatio" in engine or "gearRatios" in engine:
+            self.report({"ERROR"}, "Manifest version 8 gearing must be configured by presets")
             return {"CANCELLED"}
         sounds = data.get("sounds", {})
         if not isinstance(sounds, dict):
@@ -2975,14 +3011,24 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Manifest body must be an object")
             return {"CANCELLED"}
         downforce_points_data = body.get("downForcePoints", [])
-        if manifest_version == 7:
+        if manifest_version == 8:
             if not isinstance(downforce_points_data, list):
                 self.report({"ERROR"}, "Manifest body.downForcePoints must be an array")
                 return {"CANCELLED"}
+            downforce_point_names = set()
             for point_index, point_data in enumerate(downforce_points_data):
                 if not isinstance(point_data, dict):
                     self.report({"ERROR"}, f"Manifest downforce point {point_index} must be an object")
                     return {"CANCELLED"}
+                display_name = point_data.get("name")
+                if not isinstance(display_name, str) or not display_name.strip():
+                    self.report({"ERROR"}, f"Manifest downforce point {point_index} name is invalid")
+                    return {"CANCELLED"}
+                normalized_name = display_name.strip().casefold()
+                if normalized_name in downforce_point_names:
+                    self.report({"ERROR"}, f"Duplicate manifest downforce point name: {display_name.strip()}")
+                    return {"CANCELLED"}
+                downforce_point_names.add(normalized_name)
                 position = point_data.get("position")
                 if (
                     not isinstance(position, list)
@@ -3006,17 +3052,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     self.report({"ERROR"}, f"Manifest downforce point {point_index} maxForce is invalid")
                     return {"CANCELLED"}
             if "downForce" in body:
-                self.report({"ERROR"}, "Manifest version 7 must use body.downForcePoints")
-                return {"CANCELLED"}
-        else:
-            legacy_down_force = body.get("downForce")
-            if (
-                isinstance(legacy_down_force, bool)
-                or not isinstance(legacy_down_force, (int, float))
-                or not math.isfinite(legacy_down_force)
-                or legacy_down_force < 0
-            ):
-                self.report({"ERROR"}, "Manifest body.downForce must be non-negative")
+                self.report({"ERROR"}, "Manifest version 8 must use body.downForcePoints")
                 return {"CANCELLED"}
         body_colors_data = []
         if "colors" in body:
@@ -3070,6 +3106,48 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         for preset_index, preset_data in enumerate(presets_data):
             if not isinstance(preset_data, dict):
                 self.report({"ERROR"}, f"Manifest preset {preset_index} must be an object")
+                return {"CANCELLED"}
+            gearing = preset_data.get("gearing")
+            if not isinstance(gearing, dict):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.gearing must be an object")
+                return {"CANCELLED"}
+            final_drive_ratio = gearing.get("finalDriveRatio")
+            if (
+                not isinstance(final_drive_ratio, (int, float))
+                or not math.isfinite(final_drive_ratio)
+                or final_drive_ratio <= 0
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.gearing.finalDriveRatio must be positive")
+                return {"CANCELLED"}
+            gear_ratios = gearing.get("gearRatios")
+            if not isinstance(gear_ratios, dict) or gear_ratios.get("0") != 0:
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.gearing.gearRatios is invalid")
+                return {"CANCELLED"}
+            reverse_ratio = gear_ratios.get("-1")
+            if (
+                not isinstance(reverse_ratio, (int, float))
+                or not math.isfinite(reverse_ratio)
+                or reverse_ratio >= 0
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index} reverse ratio must be negative")
+                return {"CANCELLED"}
+            positive_gears = sorted(
+                int(key) for key in gear_ratios
+                if isinstance(key, str) and key.isdigit() and int(key) > 0
+            )
+            if not positive_gears or positive_gears != list(range(1, len(positive_gears) + 1)) or len(positive_gears) > 15:
+                self.report({"ERROR"}, f"Manifest preset {preset_index} forward gears must be contiguous from 1 to 15")
+                return {"CANCELLED"}
+            if any(
+                not isinstance(gear_ratios[str(index)], (int, float))
+                or not math.isfinite(gear_ratios[str(index)])
+                or gear_ratios[str(index)] <= 0
+                for index in positive_gears
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index} forward gear ratios must be positive")
+                return {"CANCELLED"}
+            if set(gear_ratios) != {"-1", "0", *(str(index) for index in positive_gears)}:
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.gearing.gearRatios contains unsupported gears")
                 return {"CANCELLED"}
             steering_angle = preset_data.get("maxSteeringAngle")
             if not isinstance(steering_angle, (int, float)) or not math.isfinite(steering_angle) or not 1 <= steering_angle <= 90:
@@ -3128,8 +3206,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     "maxBrakeForce", "sideFrictionStiffness", "sideFactor",
                     "forwardFactor", "brakeFactor", "contactDamping", "gripFactor",
                 )
-                if manifest_version >= 5:
-                    finite_fields += ("caster",)
+                finite_fields += ("caster",)
                 if any(
                     not isinstance(wheel_data.get(field), (int, float))
                     or not math.isfinite(wheel_data[field])
@@ -3175,7 +3252,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             settings.vehicle_tag_offroad = "offroad" in tags
         settings.drive = engine.get("drive", settings.drive)
         settings.hp = engine.get("hp", settings.hp)
-        settings.final_drive_ratio = engine.get("finalDriveRatio", settings.final_drive_ratio)
         settings.max_rpm = engine.get("maxRPM", settings.max_rpm)
         settings.idle_rpm = engine.get("idleRPM", settings.idle_rpm)
         settings.redline_rpm = engine["redlineRPM"]
@@ -3188,21 +3264,18 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.auto_blip_duration = engine.get("autoBlipDuration", settings.auto_blip_duration)
         settings.torque_factor = engine.get("torqueFactor", settings.torque_factor)
         set_object_pointer(settings, "car_root_object", body.get("obj", ""))
-        if not settings.car_root_object and (
-            downforce_points_data or (manifest_version == 6 and body.get("downForce", 0) > 0)
-        ):
+        if not settings.car_root_object and downforce_points_data:
             self.report({"ERROR"}, "Manifest car root object is required to import downforce points")
             return {"CANCELLED"}
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
-        settings.down_force = body.get("downForce", settings.down_force)
         settings.air_drag = body.get("airDrag", settings.air_drag)
         for point in settings.down_force_points:
             helper = point.object_ref
             if helper and helper.get(DOWNFORCE_HELPER_PROP):
                 bpy.data.objects.remove(helper, do_unlink=True)
         settings.down_force_points.clear()
-        if manifest_version == 7:
-            for point_data in downforce_points_data:
+        if manifest_version == 8:
+            for point_index, point_data in enumerate(downforce_points_data):
                 helper = create_car_helper(
                     context,
                     settings,
@@ -3214,6 +3287,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 helper.location = game_position_to_blender(point_data["position"])
                 helper.rotation_euler = (math.pi, 0.0, 0.0)
                 point = settings.down_force_points.add()
+                point.display_name = point_data["name"].strip()
                 point.object_ref = helper
                 point.max_force = point_data["maxForce"]
         settings.abs_max_level = assist_max_levels["abs"]
@@ -3242,25 +3316,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     for key, wheel_data in group_wheels.items():
                         add_wheel_from_config(settings, group, key, wheel_data)
         ensure_default_wheels(settings)
-        if manifest_version == 6 and settings.down_force > 0:
-            helper = create_car_helper(
-                context,
-                settings,
-                next_helper_name("downforce"),
-                "SINGLE_ARROW",
-                0.4,
-                DOWNFORCE_HELPER_PROP,
-            )
-            if settings.center_of_mass_object:
-                helper.location = relative_to_car(
-                    settings.car_root_object,
-                    settings.center_of_mass_object,
-                )
-            helper.rotation_euler = (math.pi, 0.0, 0.0)
-            point = settings.down_force_points.add()
-            point.object_ref = helper
-            point.max_force = settings.down_force
-            self.report({"WARNING"}, "Imported version 6 downforce as one center-of-mass point")
         settings.presets.clear()
         settings.preset_schema_version = 8
         for preset_data in presets_data:
@@ -3277,6 +3332,14 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.esc_level = preset_data["escLevel"]
             preset.traction_control_level = preset_data["tractionControlLevel"]
             preset.brake_bias = preset_data["brakeBias"]
+            gearing = preset_data["gearing"]
+            ratios = gearing["gearRatios"]
+            preset.final_drive_ratio = gearing["finalDriveRatio"]
+            preset.reverse_ratio = ratios["-1"]
+            positive_gears = sorted(int(key) for key in ratios if key.isdigit() and int(key) > 0)
+            preset.forward_gear_count = len(positive_gears)
+            for gear_index in positive_gears:
+                setattr(preset, f"gear_{gear_index}", ratios[str(gear_index)])
             preset_wheels = preset_data.get("wheels") or {}
             for group in ("front", "rear"):
                 group_wheels = preset_wheels.get(group) or {}
@@ -3300,14 +3363,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 wheel.grip_factor = wheel_data.get("gripFactor", 1.0)
         ensure_default_presets(settings)
         settings.active_preset_index = 0
-
-        ratios = engine.get("gearRatios", {})
-        settings.reverse_ratio = ratios.get("-1", settings.reverse_ratio)
-        positive_gears = sorted(int(key) for key in ratios.keys() if key.isdigit() and int(key) > 0)
-        if positive_gears:
-            settings.forward_gear_count = min(max(positive_gears), 15)
-        for index in range(1, 16):
-            setattr(settings, f"gear_{index}", ratios.get(str(index), getattr(settings, f"gear_{index}")))
 
         torque = engine.get("torqueCurve", {})
         if torque:
@@ -3499,6 +3554,14 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "traction_control_level")
     draw_split_prop(layout, preset, "brake_bias")
 
+    gearing_box = layout.box()
+    gearing_box.label(text="Gearing")
+    draw_split_prop(gearing_box, preset, "reverse_ratio")
+    draw_split_prop(gearing_box, preset, "forward_gear_count")
+    for index in range(1, preset.forward_gear_count + 1):
+        draw_split_prop(gearing_box, preset, f"gear_{index}")
+    draw_split_prop(gearing_box, preset, "final_drive_ratio")
+
     for group in ("front", "rear"):
         axle_box = layout.box()
         axle_box.label(text=f"{group.title()} Wheels")
@@ -3556,9 +3619,10 @@ def draw_body_physics(layout, settings):
     for index, point in enumerate(settings.down_force_points):
         point_box = layout.box()
         header = point_box.row(align=True)
-        header.label(text=f"Point {index + 1}", icon="EMPTY_SINGLE_ARROW")
+        header.label(text=downforce_point_display_name(point, index), icon="TRIA_DOWN")
         remove = header.operator("car_exporter.remove_downforce_point", text="", icon="X")
         remove.index = index
+        draw_split_prop(point_box, point, "display_name")
         draw_split_prop(point_box, point, "object_ref", label="Helper")
         draw_split_prop(point_box, point, "max_force")
     layout.operator("car_exporter.add_downforce_point", icon="ADD")
@@ -3644,11 +3708,6 @@ class CAR_EXPORTER_PT_car_export(Panel):
         auto_blip_duration_row = box.row()
         auto_blip_duration_row.enabled = settings.auto_blip
         draw_split_prop(auto_blip_duration_row, settings, "auto_blip_duration")
-        draw_split_prop(box, settings, "reverse_ratio")
-        draw_split_prop(box, settings, "forward_gear_count")
-        for index in range(1, settings.forward_gear_count + 1):
-            draw_split_prop(box, settings, f"gear_{index}")
-        draw_split_prop(box, settings, "final_drive_ratio")
 
         box = layout.box()
         box.label(text="Body Physics")

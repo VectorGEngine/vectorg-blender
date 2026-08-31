@@ -29,18 +29,12 @@ src/files/models/vehicles/<car_id>/sounds/
 
 ```json
 {
-  "version": 7,
+  "version": 8,
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
   "engine": {
     "torqueFactor": 1.0,
-    "finalDriveRatio": 5.0,
-    "gearRatios": {
-      "-1": -3.57,
-      "0": 0,
-      "1": 4.08
-    },
     "idleRPM": 1000,
     "redlineRPM": 7000,
     "revLimit": 7900,
@@ -70,6 +64,14 @@ src/files/models/vehicles/<car_id>/sounds/
       "escLevel": 0,
       "tractionControlLevel": 5,
       "brakeBias": 0.6,
+      "gearing": {
+        "finalDriveRatio": 5.0,
+        "gearRatios": {
+          "-1": -3.57,
+          "0": 0,
+          "1": 4.08
+        }
+      },
       "wheels": {
         "front": {
           "l": {
@@ -101,8 +103,7 @@ Increment **Package Version** intentionally whenever exported package contents
 change. Importing an existing car manifest preserves its `packageVersion`.
 Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
-The Gears section exports the final drive as `engine.finalDriveRatio` and the
-individual ratios as `engine.gearRatios`.
+Each preset exports its final drive and individual ratios under `gearing`.
 The Torque Curve section exports `engine.torqueFactor`, which scales drive and
 engine-braking torque before tire-force limits are applied.
 The game applies auto blip only when both its gameplay setting and the vehicle's
@@ -116,14 +117,16 @@ it as the `body.centerOfMass` node used by the game. Only its location is
 editable.
 
 Create aerodynamic load points with **Add Downforce Point**. Each point has its
-own maximum force in newtons. The arrow is fixed to car local `-Z`, matching
-game chassis local `-Y`; its rotation and scale are intentionally locked.
-Downforce helpers are authoring-only and are not written to the GLB. Their
-car-local positions are exported in metres:
+own editable name and maximum force in newtons. The name is shown in the Body
+Physics panel and written to the manifest. The arrow is fixed to car local
+`-Z`, matching game chassis local `-Y`; its rotation and scale are intentionally
+locked. Downforce helpers are authoring-only and are not written to the GLB.
+Their car-local positions are exported in metres:
 
 ```json
 "downForcePoints": [
   {
+    "name": "Front",
     "position": [0.0, 0.35, -1.2],
     "maxForce": 1800.0
   }
