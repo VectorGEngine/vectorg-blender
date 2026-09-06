@@ -54,7 +54,8 @@ Every shared and layout `VISUALS` root contains two behavior roots:
    `FOLIAGE_CARDS`.
 6. Parent driving collision meshes under the appropriate generated surface.
 7. Parent walls, barriers, fences, and props under `OBSTACLES`.
-8. Add spawn points, one start/finish volume, and ordered checkpoints.
+8. Add at least one spawn point. For racing layouts, also add the required
+   start/finish volumes and ordered checkpoints.
 9. Position and rotate the generated objects in the viewport. Local `-Y` is
    the forward crossing direction.
 10. Select **Validate Track**, then **Export Track Zip**.
@@ -77,8 +78,10 @@ sections.
 The route file also stores the projected distance of the start, finish, and
 checkpoint events. Circular routes are rebased so the start/finish event is
 distance zero. Point-to-point start and finish events must project within 10
-metres of their respective curve endpoints. Every race event must be within 30
-metres of the route, and checkpoint distance must increase in checkpoint order.
+metres of their respective curve endpoints. Freeform routes keep the curve's
+natural first point as distance zero and require no race events. Every race
+event that is present must be within 30 metres of the route, and checkpoint
+distance must increase in checkpoint order.
 
 SVG maps automatically rotate their principal axis horizontally unless the
 layout is nearly square. Draw the curve in driving direction. Circular layouts
@@ -126,7 +129,9 @@ order from their order in the `EVENTS` hierarchy. Changing its display **Name**
 only changes player-facing metadata.
 
 Choose **Route Type** per layout. Circular routes use one `start_finish` event;
-point-to-point routes use separate `start` and `finish` events.
+point-to-point routes use separate `start` and `finish` events. Freeform routes
+may use an open or cyclic map curve and require no race events. At least one
+spawn point remains required for every route type.
 
 Collision roots contain `tarmac`, `concrete`, `curb`, `grass`, `gravel`,
 `dirt`, `mud`, `sand`, `snow`, `ice`, and `OBSTACLES` as direct children.

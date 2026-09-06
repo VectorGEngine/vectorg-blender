@@ -332,7 +332,18 @@ def camera_object_poll(_self, obj):
 def camera_fov(settings, prefix):
     camera_obj = getattr(settings, f"{prefix}_camera_object")
     if camera_obj and camera_obj.type == "CAMERA" and camera_obj.data:
-        return math.degrees(camera_obj.data.angle)
+        camera = camera_obj.data
+        render = bpy.context.scene.render
+        render_width = render.resolution_x * render.pixel_aspect_x
+        render_height = render.resolution_y * render.pixel_aspect_y
+        aspect_ratio = render_width / render_height
+        vertical_fit = camera.sensor_fit == "VERTICAL" or (
+            camera.sensor_fit == "AUTO" and aspect_ratio < 1.0
+        )
+        vertical_angle = camera.angle if vertical_fit else 2.0 * math.atan(
+            math.tan(camera.angle * 0.5) / aspect_ratio
+        )
+        return math.degrees(vertical_angle)
     return getattr(settings, f"{prefix}_fov")
 
 
@@ -1066,10 +1077,8 @@ def validate_scene(settings):
                 wheel.damping_relaxation,
                 wheel.damping_compression,
                 wheel.max_brake_force,
-                wheel.side_friction_stiffness,
                 wheel.side_factor,
                 wheel.forward_factor,
-                wheel.brake_factor,
                 wheel.contact_damping,
                 wheel.grip_factor,
             )):
@@ -1081,10 +1090,8 @@ def validate_scene(settings):
                 wheel.damping_relaxation,
                 wheel.damping_compression,
                 wheel.max_brake_force,
-                wheel.side_friction_stiffness,
                 wheel.side_factor,
                 wheel.forward_factor,
-                wheel.brake_factor,
                 wheel.contact_damping,
             )):
                 errors.append(f"{label} {group} handling values must be non-negative")
@@ -1254,10 +1261,8 @@ class CarWheelSettings(PropertyGroup):
     pressure: FloatProperty(default=2.0, min=1.3, max=2.7, options={"HIDDEN"})
     camber: FloatProperty(default=-4.0, options={"HIDDEN"})
     toe: FloatProperty(default=-0.15, options={"HIDDEN"})
-    side_friction_stiffness: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
     side_factor: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
     forward_factor: FloatProperty(default=1.6, min=0.0, options={"HIDDEN"})
-    brake_factor: FloatProperty(default=1.0, min=0.0, options={"HIDDEN"})
     contact_damping: FloatProperty(default=0.15, min=0.0, options={"HIDDEN"})
     grip_factor: FloatProperty(
         default=1.0,
@@ -1292,10 +1297,8 @@ class CarWheelPresetSettings(PropertyGroup):
     damping_relaxation: FloatProperty(name="Damping Relaxation", default=2.6, min=0.0)
     damping_compression: FloatProperty(name="Damping Compression", default=2.0, min=0.0)
     max_brake_force: FloatProperty(name="Max Brake Force", default=1000.0, min=0.0)
-    side_friction_stiffness: FloatProperty(name="Side Friction", default=1.0, min=0.0)
     side_factor: FloatProperty(name="Side Factor", default=1.0, min=0.0)
     forward_factor: FloatProperty(name="Forward Factor", default=1.6, min=0.0)
-    brake_factor: FloatProperty(name="Brake Factor", default=1.0, min=0.0)
     contact_damping: FloatProperty(name="Contact Damping", default=0.15, min=0.0)
     grip_factor: FloatProperty(
         name="Grip Factor",
@@ -1486,19 +1489,14 @@ class CarExporterSettings(PropertyGroup):
     cockpit_camera_object: PointerProperty(name="Cockpit", type=bpy.types.Object, poll=camera_object_poll, update=update_cockpit_camera_object)
     hood_camera_object: PointerProperty(name="Hood", type=bpy.types.Object, poll=camera_object_poll, update=update_hood_camera_object)
     roof_camera_object: PointerProperty(name="Roof", type=bpy.types.Object, poll=camera_object_poll, update=update_roof_camera_object)
-    chase_fov: FloatProperty(name="Chase FOV", default=65)
-    cockpit_fov: FloatProperty(name="Cockpit FOV", default=54)
-    hood_fov: FloatProperty(name="Hood FOV", default=71)
-    roof_fov: FloatProperty(name="Roof FOV", default=71)
+    chase_fov: FloatProperty(name="Chase FOV", default=39.5)
+    cockpit_fov: FloatProperty(name="Cockpit FOV", default=32.3)
+    hood_fov: FloatProperty(name="Hood FOV", default=44.1)
+    roof_fov: FloatProperty(name="Roof FOV", default=44.1)
     chase_target_distance: FloatProperty(name="Target Distance", default=5.0, min=0.01, update=update_chase_target_distance)
     cockpit_target_distance: FloatProperty(name="Target Distance", default=1.0, min=0.01, update=update_cockpit_target_distance)
     hood_target_distance: FloatProperty(name="Target Distance", default=2.0, min=0.01, update=update_hood_target_distance)
     roof_target_distance: FloatProperty(name="Target Distance", default=2.0, min=0.01, update=update_roof_target_distance)
-    chase_shake: FloatProperty(name="Shake Intensity", default=16.0)
-    cockpit_shake: FloatProperty(name="Shake Intensity", default=1.0)
-    hood_shake: FloatProperty(name="Shake Intensity", default=1.1)
-    roof_shake: FloatProperty(name="Shake Intensity", default=1.1)
-
     sound_tranny_on: StringProperty(name="Transmission On", subtype="FILE_PATH", default="")
     sound_tranny_off: StringProperty(name="Transmission Off", subtype="FILE_PATH", default="")
     sound_on_high: StringProperty(name="On High", subtype="FILE_PATH", default="")
@@ -1590,7 +1588,6 @@ def clear_configuration_settings(settings):
         setattr(settings, f"{prefix}_camera_object", None)
         setattr(settings, f"{prefix}_fov", 0.0)
         setattr(settings, f"{prefix}_target_distance", 0.01)
-        setattr(settings, f"{prefix}_shake", 0.0)
     for slot, meta in SOUND_SLOTS.items():
         setattr(settings, f"sound_{slot}", "")
         setattr(settings, f"sound_{slot}_volume", meta["volume"])
@@ -1653,18 +1650,14 @@ def initialize_configuration_settings(settings):
         8000: 460.2,
     }.items():
         setattr(settings, f"torque_{rpm}", value)
-    settings.chase_fov = 65.10000147006308
-    settings.cockpit_fov = 54.43222611864906
-    settings.hood_fov = 71.50777759085639
-    settings.roof_fov = 71.50777759085639
+    settings.chase_fov = 39.500591632003015
+    settings.cockpit_fov = 32.268804142808847
+    settings.hood_fov = 44.095897188516894
+    settings.roof_fov = 44.095897188516894
     settings.chase_target_distance = 5.0
     settings.cockpit_target_distance = 1.0
     settings.hood_target_distance = 2.0
     settings.roof_target_distance = 2.0
-    settings.chase_shake = 16.0
-    settings.cockpit_shake = 1.0
-    settings.hood_shake = 1.1
-    settings.roof_shake = 1.1
     reset_torque_curve_node()
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
@@ -1714,10 +1707,8 @@ def wheel_preset_config(wheel):
         "dampingRelaxation": wheel.damping_relaxation,
         "dampingCompression": wheel.damping_compression,
         "maxBrakeForce": wheel.max_brake_force,
-        "sideFrictionStiffness": wheel.side_friction_stiffness,
         "sideFactor": wheel.side_factor,
         "forwardFactor": wheel.forward_factor,
-        "brakeFactor": wheel.brake_factor,
         "contactDamping": wheel.contact_damping,
         "gripFactor": wheel.grip_factor,
     }
@@ -2009,22 +2000,18 @@ def build_manifest(settings):
             "chase_cam": {
                 "obj": object_config_name(settings.chase_camera_object),
                 "fov": camera_fov(settings, "chase"),
-                "shake": settings.chase_shake,
             },
             "cockpit_cam": {
                 "obj": object_config_name(settings.cockpit_camera_object),
                 "fov": camera_fov(settings, "cockpit"),
-                "shake": settings.cockpit_shake,
             },
             "hood_cam": {
                 "obj": object_config_name(settings.hood_camera_object),
                 "fov": camera_fov(settings, "hood"),
-                "shake": settings.hood_shake,
             },
             "roof_cam": {
                 "obj": object_config_name(settings.roof_camera_object),
                 "fov": camera_fov(settings, "roof"),
-                "shake": settings.roof_shake,
             },
         },
         "sounds": sounds,
@@ -2369,10 +2356,8 @@ def add_wheel_from_config(settings, group, key, data=None):
     wheel.pressure = spin_data.get("pressure", wheel.pressure)
     wheel.camber = spin_data.get("camber", wheel.camber)
     wheel.toe = spin_data.get("toe", wheel.toe)
-    wheel.side_friction_stiffness = spin_data.get("sideFrictionStiffness", wheel.side_friction_stiffness)
     wheel.side_factor = spin_data.get("sideFactor", wheel.side_factor)
     wheel.forward_factor = spin_data.get("forwardFactor", wheel.forward_factor)
-    wheel.brake_factor = spin_data.get("brakeFactor", wheel.brake_factor)
     wheel.contact_damping = spin_data.get("contactDamping", wheel.contact_damping)
     wheel.grip_factor = spin_data.get("gripFactor", wheel.grip_factor)
     return wheel
@@ -2400,10 +2385,8 @@ def ensure_default_wheels(settings):
             "pressure": wheel.pressure,
             "camber": wheel.camber,
             "toe": wheel.toe,
-            "side_friction_stiffness": wheel.side_friction_stiffness,
             "side_factor": wheel.side_factor,
             "forward_factor": wheel.forward_factor,
-            "brake_factor": wheel.brake_factor,
             "contact_damping": wheel.contact_damping,
             "grip_factor": wheel.grip_factor,
         }
@@ -2430,10 +2413,8 @@ def ensure_default_wheels(settings):
             wheel.pressure = imported["pressure"]
             wheel.camber = imported["camber"]
             wheel.toe = imported["toe"]
-            wheel.side_friction_stiffness = imported["side_friction_stiffness"]
             wheel.side_factor = imported["side_factor"]
             wheel.forward_factor = imported["forward_factor"]
-            wheel.brake_factor = imported["brake_factor"]
             wheel.contact_damping = imported["contact_damping"]
             wheel.grip_factor = imported["grip_factor"]
             continue
@@ -2455,10 +2436,8 @@ def ensure_default_wheels(settings):
                 "pressure": 2.0,
                 "camber": -4.0 if front_wheel else -3.0,
                 "toe": -0.15 if front_wheel else 0.2,
-                "sideFrictionStiffness": 1.0,
                 "sideFactor": 1.0,
                 "forwardFactor": 1.6,
-                "brakeFactor": 1.0,
                 "contactDamping": 0.15,
                 "gripFactor": 1.0,
             },
@@ -2478,10 +2457,8 @@ def default_wheel_preset_values(group):
         "damping_relaxation": 2.6,
         "damping_compression": 2.0,
         "max_brake_force": 1000.0,
-        "side_friction_stiffness": 1.0,
         "side_factor": 1.0,
         "forward_factor": 1.6,
-        "brake_factor": 1.0,
         "contact_damping": 0.15,
         "grip_factor": 1.0,
     }
@@ -2540,10 +2517,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
             "max_brake_force": wheel.max_brake_force,
-            "side_friction_stiffness": wheel.side_friction_stiffness,
             "side_factor": wheel.side_factor,
             "forward_factor": wheel.forward_factor,
-            "brake_factor": wheel.brake_factor,
             "contact_damping": wheel.contact_damping,
             "grip_factor": wheel.grip_factor,
         }
@@ -2561,10 +2536,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
             "max_brake_force": wheel.max_brake_force,
-            "side_friction_stiffness": wheel.side_friction_stiffness,
             "side_factor": wheel.side_factor,
             "forward_factor": wheel.forward_factor,
-            "brake_factor": wheel.brake_factor,
             "contact_damping": wheel.contact_damping,
             "grip_factor": wheel.grip_factor,
         }
@@ -2586,10 +2559,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
         wheel.damping_relaxation = values["damping_relaxation"]
         wheel.damping_compression = values["damping_compression"]
         wheel.max_brake_force = values["max_brake_force"]
-        wheel.side_friction_stiffness = values["side_friction_stiffness"]
         wheel.side_factor = values["side_factor"]
         wheel.forward_factor = values["forward_factor"]
-        wheel.brake_factor = values["brake_factor"]
         wheel.contact_damping = values["contact_damping"]
         wheel.grip_factor = values["grip_factor"]
 
@@ -2608,10 +2579,8 @@ def wheel_preset_values(source):
             "damping_relaxation",
             "damping_compression",
             "max_brake_force",
-            "side_friction_stiffness",
             "side_factor",
             "forward_factor",
-            "brake_factor",
             "contact_damping",
             "grip_factor",
         )
@@ -2666,10 +2635,8 @@ def ensure_default_presets(settings):
                     continue
                 target = getattr(preset, group)
                 target.max_brake_force = source.max_brake_force
-                target.side_friction_stiffness = source.side_friction_stiffness
                 target.side_factor = source.side_factor
                 target.forward_factor = source.forward_factor
-                target.brake_factor = source.brake_factor
                 target.contact_damping = source.contact_damping
                 target.grip_factor = source.grip_factor
         settings.preset_schema_version = 4
@@ -2982,6 +2949,18 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(data, dict):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
+        removed_wheel_fields = {"sideFrictionStiffness", "brakeFactor"}
+        pending_values = [data]
+        while pending_values:
+            value = pending_values.pop()
+            if isinstance(value, dict):
+                removed = removed_wheel_fields.intersection(value)
+                if removed:
+                    self.report({"ERROR"}, f"Vehicle manifest field {sorted(removed)[0]} is no longer supported")
+                    return {"CANCELLED"}
+                pending_values.extend(value.values())
+            elif isinstance(value, list):
+                pending_values.extend(value)
         manifest_version = data.get("version")
         if manifest_version != 8:
             self.report({"ERROR"}, "Only vehicle manifest version 8 can be imported")
@@ -3203,8 +3182,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 finite_fields = (
                     "pressure", "camber", "toe", "suspensionOffset",
                     "suspensionStiffness", "dampingRelaxation", "dampingCompression",
-                    "maxBrakeForce", "sideFrictionStiffness", "sideFactor",
-                    "forwardFactor", "brakeFactor", "contactDamping", "gripFactor",
+                    "maxBrakeForce", "sideFactor", "forwardFactor", "contactDamping", "gripFactor",
                 )
                 finite_fields += ("caster",)
                 if any(
@@ -3229,8 +3207,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     return {"CANCELLED"}
                 non_negative_fields = (
                     "suspensionStiffness", "dampingRelaxation", "dampingCompression",
-                    "maxBrakeForce", "sideFrictionStiffness", "sideFactor",
-                    "forwardFactor", "brakeFactor", "contactDamping",
+                    "maxBrakeForce", "sideFactor", "forwardFactor", "contactDamping",
                 )
                 if any(wheel_data[field] < 0 for field in non_negative_fields):
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} handling values must be non-negative")
@@ -3355,10 +3332,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 wheel.damping_relaxation = wheel_data.get("dampingRelaxation", 2.6)
                 wheel.damping_compression = wheel_data.get("dampingCompression", 2.0)
                 wheel.max_brake_force = wheel_data.get("maxBrakeForce", 1000.0)
-                wheel.side_friction_stiffness = wheel_data.get("sideFrictionStiffness", 1.0)
                 wheel.side_factor = wheel_data.get("sideFactor", 1.0)
                 wheel.forward_factor = wheel_data.get("forwardFactor", 1.6)
-                wheel.brake_factor = wheel_data.get("brakeFactor", 1.0)
                 wheel.contact_damping = wheel_data.get("contactDamping", 0.15)
                 wheel.grip_factor = wheel_data.get("gripFactor", 1.0)
         ensure_default_presets(settings)
@@ -3408,7 +3383,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             camera = cameras.get(name, {})
             set_object_pointer(settings, f"{attr}_camera_object", camera.get("obj", ""))
             setattr(settings, f"{attr}_fov", camera.get("fov", getattr(settings, f"{attr}_fov")))
-            setattr(settings, f"{attr}_shake", camera.get("shake", getattr(settings, f"{attr}_shake")))
 
         create_size_guide(settings)
         self.report({"INFO"}, "Imported config values into scene settings")
@@ -3576,10 +3550,8 @@ def draw_presets(layout, settings):
         draw_split_prop(axle_box, wheel, "damping_relaxation")
         draw_split_prop(axle_box, wheel, "damping_compression")
         draw_split_prop(axle_box, wheel, "max_brake_force")
-        draw_split_prop(axle_box, wheel, "side_friction_stiffness")
         draw_split_prop(axle_box, wheel, "side_factor")
         draw_split_prop(axle_box, wheel, "forward_factor")
-        draw_split_prop(axle_box, wheel, "brake_factor")
         draw_split_prop(axle_box, wheel, "contact_damping")
         draw_split_prop(axle_box, wheel, "grip_factor")
 
@@ -3601,8 +3573,7 @@ def draw_cameras(layout, settings):
         if not getattr(settings, f"{prefix}_camera_object"):
             continue
         draw_split_prop(layout, settings, f"{prefix}_target_distance", label="Target Distance")
-        draw_split_prop(layout, settings, f"{prefix}_shake", label="Shake Intensity")
-        draw_split_label(layout, "FOV", f"{camera_fov(settings, prefix):.1f}", tooltip="Adjust FOV from Camera Properties")
+        draw_split_label(layout, "Vertical FOV", f"{camera_fov(settings, prefix):.1f}", tooltip="Adjust FOV from Camera Properties")
 
 
 def draw_body_physics(layout, settings):

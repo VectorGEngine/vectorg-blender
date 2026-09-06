@@ -25,6 +25,9 @@ src/files/models/vehicles/<car_id>/manifest.json
 src/files/models/vehicles/<car_id>/sounds/
 ```
 
+Camera `fov` values in `manifest.json` are vertical angles in degrees. The
+exporter derives them from the Blender camera and the scene render aspect ratio.
+
 `manifest.json` identifies the exported model explicitly:
 
 ```json
@@ -85,10 +88,8 @@ src/files/models/vehicles/<car_id>/sounds/
             "dampingRelaxation": 2.6,
             "dampingCompression": 2.0,
             "maxBrakeForce": 1000.0,
-            "sideFrictionStiffness": 1.0,
             "sideFactor": 1.0,
             "forwardFactor": 1.6,
-            "brakeFactor": 1.0,
             "contactDamping": 0.15,
             "gripFactor": 1.0
           }

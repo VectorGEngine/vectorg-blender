@@ -1374,7 +1374,7 @@ def layout_route_data(layout):
     if len(samples) < 2:
         raise ValueError("must contain at least two route samples")
 
-    if closed:
+    if closed and layout.route_type == "circular":
         start_finish = next(
             (
                 obj for obj in route_event_objects(layout)
@@ -1967,7 +1967,7 @@ def validate_scene(settings):
                 errors.append(f"{label} cannot use separate start or finish events for a circular route")
             if not checkpoints:
                 errors.append(f"{label} needs at least one checkpoint")
-        else:
+        elif layout.route_type == "point_to_point":
             if start_finish:
                 errors.append(f"{label} cannot use a start/finish event for a point-to-point route")
             if len(starts) != 1:
@@ -2079,6 +2079,7 @@ class TrackLayoutSettings(PropertyGroup):
         items=(
             ("circular", "Circular", "Start and finish use one shared event"),
             ("point_to_point", "Point to Point", "Start and finish use separate events"),
+            ("freeform", "Freeform", "Open or closed route with no required race events"),
         ),
         default="circular",
     )
@@ -2755,12 +2756,13 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             box.operator("track_exporter.add_spawn_point", icon="EMPTY_AXIS")
             if current.route_type == "circular":
                 box.operator("track_exporter.add_start_finish", icon="MESH_CUBE")
-            else:
+                box.operator("track_exporter.add_checkpoint", icon="MESH_CUBE")
+            elif current.route_type == "point_to_point":
                 start_op = box.operator("track_exporter.add_route_endpoint", text="Add Start", icon="MESH_CUBE")
                 start_op.event_type = "start"
                 finish_op = box.operator("track_exporter.add_route_endpoint", text="Add Finish", icon="MESH_CUBE")
                 finish_op.event_type = "finish"
-            box.operator("track_exporter.add_checkpoint", icon="MESH_CUBE")
+                box.operator("track_exporter.add_checkpoint", icon="MESH_CUBE")
             box.separator()
             box.label(text="Layout Colliders")
             static_op = box.operator(
