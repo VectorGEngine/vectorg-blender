@@ -88,9 +88,6 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
             "dampingRelaxation": 2.6,
             "dampingCompression": 2.0,
             "maxBrakeForce": 1000.0,
-            "sideFactor": 1.0,
-            "forwardFactor": 1.6,
-            "contactDamping": 0.15,
             "gripFactor": 1.0
           }
         }
@@ -142,7 +139,7 @@ direction.
 Wheel object selections, axes, radius, and steering behavior are shared by
 every preset. Car presets contain steering limits, steering-wheel rotation,
 anti-roll, driver-assist levels, brake bias, and per-axle tire, suspension,
-braking, friction, damping, and grip configuration. Each assist level is an
+braking and grip configuration. Each assist level is an
 integer from zero through the car-wide `driverAssists.<assist>.maxLevel`, and
 runtime strength is `level / maxLevel`. New exporter configurations default
 every maximum level to 5. The current game uses the first preset. Tire type is
