@@ -84,6 +84,9 @@ SURFACE_IDS = (
     "sand",
     "snow",
     "ice",
+    "wet_tarmac",
+    "wet_concrete",
+    "wet_curb",
 )
 def scene_settings(context):
     return context.scene.track_exporter
@@ -255,7 +258,7 @@ def layout_named_objects(layout):
     }
 
 
-def apply_generated_names(name_map):
+def apply_generated_names(name_map, validate_only=False):
     """Rename a group atomically enough to avoid accidental Blender suffixes."""
     name_map = {obj: name for obj, name in name_map.items() if obj and obj.name != name}
     sources = set(name_map)
@@ -269,6 +272,8 @@ def apply_generated_names(name_map):
     ]
     if conflicts or duplicate_names:
         return False, sorted(set(conflicts) | duplicate_names)
+    if validate_only:
+        return True, []
 
     for index, obj in enumerate(name_map):
         temporary_name = f"__vectorg_rename_{index}__"
@@ -280,7 +285,7 @@ def apply_generated_names(name_map):
     return True, []
 
 
-def sync_layout_node_names(layout):
+def sync_layout_node_names(layout, validate_only=False):
     root = layout.root_object
     if not root or not layout.layout_id:
         return
@@ -288,7 +293,8 @@ def sync_layout_node_names(layout):
     layout_id = layout.layout_id
     named = layout_named_objects(layout)
     name_map = {root: layout_root_name(layout_id)}
-    root["vectorg_layout_id"] = layout_id
+    if not validate_only:
+        root["vectorg_layout_id"] = layout_id
 
     role_names = {
         ROLE_VISUALS: f"{layout_id}_VISUALS",
@@ -321,7 +327,8 @@ def sync_layout_node_names(layout):
     for index, obj in enumerate(ordered_objects(named["spawns"], "spawn"), start=1):
         name_map[obj] = f"{layout_id}_spawn_{index:02d}"
     for index, obj in enumerate(named["checkpoints"], start=1):
-        obj[ORDER_PROPERTY] = index
+        if not validate_only:
+            obj[ORDER_PROPERTY] = index
         name_map[obj] = f"{layout_id}_checkpoint_{index:02d}"
     events = object_with_role(root, ROLE_EVENTS)
     for event_type in ("start_finish", "start", "finish"):
@@ -335,11 +342,14 @@ def sync_layout_node_names(layout):
     if layout.map_curve:
         name_map[layout.map_curve] = f"{layout_id}_map_curve"
 
-    for obj in [root, *descendants(root)]:
-        obj.pop("vectorg_generated_kind", None)
-        obj.pop("vectorg_generated_index", None)
+    if not validate_only:
+        for obj in [root, *descendants(root)]:
+            obj.pop("vectorg_generated_kind", None)
+            obj.pop("vectorg_generated_index", None)
 
-    success, conflicts = apply_generated_names(name_map)
+    success, conflicts = apply_generated_names(name_map, validate_only=validate_only)
+    if validate_only:
+        return success
     if conflicts:
         layout["vectorg_name_conflicts"] = ", ".join(conflicts)
     elif "vectorg_name_conflicts" in layout:
@@ -601,6 +611,43 @@ def ensure_surface_group(context, collision_root, surface_id):
     group = create_empty(context, f"{collision_root.name}_{surface_id}", collision_root, ROLE_SURFACE)
     group[SURFACE_PROPERTY] = surface_id
     return group
+
+
+def refresh_track_structure(context):
+    settings = scene_settings(context)
+    if len({layout.layout_id for layout in settings.layouts}) != len(settings.layouts):
+        return False, "Layout IDs must be unique before refreshing"
+    scopes = [("Shared", settings.shared_root_object, None)]
+    scopes.extend((layout.layout_id, layout.root_object, layout) for layout in settings.layouts)
+    collision_roots = []
+    missing_names = set()
+    seen_roots = set()
+    for label, root, layout in scopes:
+        collisions = direct_child_with_role(root, ROLE_COLLISIONS) if root else None
+        if not collisions:
+            return False, f"{label}: collision root is missing"
+        if root in seen_roots:
+            return False, f"{label}: hierarchy root is assigned more than once"
+        seen_roots.add(root)
+        if layout and (not valid_id(layout.layout_id) or not sync_layout_node_names(layout, validate_only=True)):
+            return False, f"{label}: invalid layout ID or generated object names already in use"
+        prefix = f"{layout.layout_id}_COLLISIONS" if layout else collisions.name
+        for surface_id in SURFACE_IDS:
+            if find_surface_group(collisions, surface_id):
+                continue
+            name = f"{prefix}_{surface_id}"
+            if name in missing_names or bpy.data.objects.get(name):
+                return False, f"Cannot create surface group; name already in use: {name}"
+            missing_names.add(name)
+        collision_roots.append(collisions)
+
+    for collisions in collision_roots:
+        for surface_id in SURFACE_IDS:
+            ensure_surface_group(context, collisions, surface_id)
+    for layout in settings.layouts:
+        if not sync_layout_node_names(layout):
+            return False, f"{layout.layout_id}: generated object names already in use"
+    return True, "Track surface groups and layout object names refreshed"
 
 
 def node_trees(root_tree):
@@ -2255,20 +2302,16 @@ class TRACK_EXPORTER_OT_move_layout(Operator):
 
 class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
     bl_idname = "track_exporter.refresh_layout_names"
-    bl_label = "Refresh Layout Names"
-    bl_description = "Apply the current layout ID to its generated object names"
+    bl_label = "Refresh Track Structure"
+    bl_description = "Create missing surface groups in Shared and every layout, and refresh layout object names"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        layout = active_layout(scene_settings(context))
-        if not layout or not layout.root_object:
-            self.report({"ERROR"}, "Active layout root is missing")
+        success, message = refresh_track_structure(context)
+        if not success:
+            self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        if not sync_layout_node_names(layout):
-            conflicts = layout.get("vectorg_name_conflicts", "")
-            self.report({"ERROR"}, f"Cannot rename objects; names already in use: {conflicts}")
-            return {"CANCELLED"}
-        self.report({"INFO"}, "Layout object names refreshed")
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -2689,7 +2732,12 @@ class TRACK_EXPORTER_PT_track_export(Panel):
 
         box = layout.box()
         box.label(text="Package")
-        draw_split_prop(box, settings, "track_id")
+        id_row = box.row(align=True)
+        id_split = id_row.split(factor=0.4, align=True)
+        id_split.label(text="Track ID")
+        id_value = id_split.row(align=True)
+        id_value.prop(settings, "track_id", text="")
+        id_value.operator("track_exporter.refresh_layout_names", text="", icon="FILE_REFRESH")
         draw_split_prop(box, settings, "package_version")
         draw_split_prop(box, settings, "display_name")
         draw_split_prop(box, settings, "max_texture_size")

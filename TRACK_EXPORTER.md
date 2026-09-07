@@ -123,9 +123,15 @@ The generated route data has this shape:
 ```
 
 Changing a layout's **ID** renames its generated hierarchy nodes, addon-created
-spawn points, route events, and layout box colliders. Use the refresh icon next
-to the ID to normalize copied objects and their names; it also assigns checkpoint
-order from their order in the `EVENTS` hierarchy. Changing its display **Name**
+spawn points, route events, and layout box colliders. The refresh icons beside
+**Track ID** and layout **ID** perform the same operation: create missing surface
+groups in Shared and every configured layout, then normalize every layout's
+generated object names. Refresh also assigns checkpoint order from their order
+in the `EVENTS` hierarchy. Existing geometry and surface groups are preserved;
+repeated refreshes do not create duplicates. Use either button after updating
+the add-on to add the new surface groups to an older track. Missing collision
+roots and naming conflicts must be corrected before refreshing.
+Changing its display **Name**
 only changes player-facing metadata.
 
 Choose **Route Type** per layout. Circular routes use one `start_finish` event;
@@ -134,7 +140,13 @@ may use an open or cyclic map curve and require no race events. At least one
 spawn point remains required for every route type.
 
 Collision roots contain `tarmac`, `concrete`, `curb`, `grass`, `gravel`,
-`dirt`, `mud`, `sand`, `snow`, `ice`, and `OBSTACLES` as direct children.
+`dirt`, `mud`, `sand`, `snow`, `ice`, `wet_tarmac`, `wet_concrete`, `wet_curb`,
+and `OBSTACLES` as direct children.
+
+The `wet_` groups work like every other surface group. Geometry placed there
+stays wet in both Dry and Wet races. In a Wet race, the game also resolves normal
+surfaces to their configured `wet_` counterpart when one exists; otherwise it
+keeps the authored surface. Snow and ice are persistent surfaces too.
 
 All meshes under a drivable surface group are colliders for that surface.
 `OBSTACLES` may contain any organizational hierarchy. Obstacle meshes do not

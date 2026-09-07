@@ -147,7 +147,9 @@ braking and grip configuration. Each assist level is an
 integer from zero through the car-wide `driverAssists.<assist>.maxLevel`, and
 runtime strength is `level / maxLevel`. New exporter configurations default
 every maximum level to 5. The current game uses the first preset. Tire type is
-`soft`, `medium`, or `hard`, with `medium` as the default. Suspension offset is
+`soft`, `medium`, `hard`, `wet`, or `snow`, with `medium` as the default.
+Wet tires specialize in wet roads; Snow tires represent studless winter tires
+for snow and ice. Grip tables are configured in the game. Suspension offset is
 a signed change in metres to the calculated suspension rest length. Positive
 values move the wheel farther down from the mount; negative values move it
 toward the mount. The mount position and maximum suspension travel remain

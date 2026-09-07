@@ -48,10 +48,13 @@ WHEEL_LABELS = {
 }
 
 TIRE_TYPE_ITEMS = (
-    ("soft", "Soft", "Highest configured tire grip"),
+    ("soft", "Soft", "Highest configured dry-road tire grip"),
     ("medium", "Medium", "Balanced configured tire grip"),
-    ("hard", "Hard", "Lowest configured tire grip"),
+    ("hard", "Hard", "Lowest configured dry-road tire grip"),
+    ("wet", "Wet", "Tire grip optimized for wet roads"),
+    ("snow", "Snow", "Studless winter tire grip optimized for snow and ice"),
 )
+TIRE_TYPES = frozenset(item[0] for item in TIRE_TYPE_ITEMS)
 
 SOUND_SLOTS = {
     "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
@@ -1134,7 +1137,7 @@ def validate_scene(settings):
                 errors.append(f"{label} {assist_name} level must be between 0 and {max_level}")
         for group in ("front", "rear"):
             wheel = getattr(preset, group)
-            if wheel.tire_type not in {"soft", "medium", "hard"}:
+            if wheel.tire_type not in TIRE_TYPES:
                 errors.append(f"{label} {group} tire type is invalid")
             if not all(math.isfinite(value) for value in (
                 wheel.pressure,
@@ -3785,7 +3788,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 ):
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} values must be finite")
                     return {"CANCELLED"}
-                if wheel_data.get("tireType") not in {"soft", "medium", "hard"}:
+                if wheel_data.get("tireType") not in TIRE_TYPES:
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} tireType is invalid")
                     return {"CANCELLED"}
                 if not 1.3 <= wheel_data["pressure"] <= 2.7:
