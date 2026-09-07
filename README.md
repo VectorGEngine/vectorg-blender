@@ -109,14 +109,18 @@ The game applies auto blip only when both its gameplay setting and the vehicle's
 
 ## Body Physics Helpers
 
+Collider mass is entered and exported in kilograms.
+
 Create the center of mass from **Body Physics > Add Center of Mass**. The addon
 creates a sphere Empty at the 3D cursor, parents it to the car root, and exports
 it as the `body.centerOfMass` node used by the game. Only its location is
 editable.
 
 Create aerodynamic load points with **Add Downforce Point**. Each point has its
-own editable name and maximum force in newtons. The name is shown in the Body
-Physics panel and written to the manifest. The arrow is fixed to car local
+own editable name and maximum downforce entered in kilograms, representing the
+equivalent weight added at maximum speed. The addon converts kilograms to
+newtons using `kg * 9.81` when writing the manifest. The name is shown in the
+Body Physics panel and written to the manifest. The arrow is fixed to car local
 `-Z`, matching game chassis local `-Y`; its rotation and scale are intentionally
 locked. Downforce helpers are authoring-only and are not written to the GLB.
 Their car-local positions are exported in metres:
@@ -150,6 +154,15 @@ toward the mount. The mount position and maximum suspension travel remain
 unchanged. Applying the same offset to every wheel raises or lowers the chassis.
 Each preset wheel's `gripFactor` multiplies its pressure-derived grip;
 `2.0` doubles grip and `0.5` halves it.
+
+**Max Brake Force (kg)** is the equivalent braking force available at each
+wheel. Vehicle manifest version 8 exports this value in newtons using
+`kg * 9.81`; the engine converts that force to a timestep-scaled impulse.
+**Calculate Brake Force** estimates front and rear values that exceed peak tire
+grip by 15 percent at maximum speed on dry tarmac with ABS off. The estimate
+uses collider mass, wheel and center-of-mass positions, maximum downforce, tire
+pressure and grip, and brake bias. Existing numeric brake values are not
+converted when opening older Blender files.
 
 Caster is expressed in degrees. Positive caster tilts the top of the steering
 and suspension axis toward the rear of the car; negative caster tilts it toward
@@ -251,10 +264,10 @@ Audio uses fixed logical slots instead of free-form files:
 ```text
 Transmission On
 Transmission Off
-On Low / Mid / High
-Off Low / Mid / High
+On Low / High
+Off Low / High
 Limiter
-Turbo Flutter
+Turbo
 ```
 
 **Pitch Offset (cents)** adjusts all loaded and off-throttle engine samples for
@@ -262,9 +275,13 @@ the vehicle. It defaults to `0`; positive values raise pitch and negative values
 lower it. The exporter writes it as `sounds.pitchOffset` next to the logical
 sample slots.
 
-Assigned files are copied into `sounds/`. Audio is required by default because the runtime applies fixed engine sample keys every frame. Disable `Require Audio Slots` only when intentionally exporting a visual/physics-only test package.
+Each sound has an enabled checkbox that defaults on. An enabled sound with an
+assigned file exports that custom sample. An enabled sound without a file is
+omitted from the vehicle manifest so the game uses its default sample. A
+disabled sound is written as `null`, which explicitly disables the game default.
 
-Only assigned files are written to `manifest.json`; the addon does not emit references to files that are not packaged.
+Assigned and enabled files are copied into `sounds/`. Disabled files are not
+packaged.
 
 ## Body Colors
 

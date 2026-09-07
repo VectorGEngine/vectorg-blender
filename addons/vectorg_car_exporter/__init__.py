@@ -61,9 +61,8 @@ SOUND_SLOTS = {
     "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "loop": True, "volume": 0.3},
     "off_low": {"label": "Off Low", "default": "BAC_Mono_offlow.wav", "rpm": 1000, "loop": True, "volume": 0.3},
     "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "loop": True, "volume": 0.4},
-    "turbo_flutter": {"label": "Turbo Flutter", "default": "turbo_flutter.wav", "rpm": 8000, "loop": False, "volume": 0.6},
+    "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "loop": False, "volume": 0.6},
 }
-OPTIONAL_SOUND_SLOTS = {"tranny_on", "tranny_off", "limiter", "turbo_flutter"}
 SOUND_RPM_SLOTS = {"on_high", "on_low", "off_high", "off_low"}
 
 ORIENTATION_DOT_THRESHOLD = math.cos(math.radians(1.0))
@@ -74,6 +73,9 @@ CAMERA_PREFIXES = ("chase", "cockpit", "hood", "roof")
 GUIDE_PREFIX = "CAR_EXPORTER_GUIDE_"
 GUIDE_PROP = "car_exporter_helper"
 DOWNFORCE_HELPER_PROP = "vectorg_downforce_helper"
+NEWTONS_PER_KILOGRAM = 9.81
+BRAKE_LOCK_MARGIN = 1.15
+TARMAC_TIRE_PEAK_FRICTION = {"soft": 1.3, "medium": 1.2, "hard": 1.1}
 CENTER_OF_MASS_HELPER_PROP = "vectorg_center_of_mass_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 DEFAULT_MAX_TEXTURE_SIZE = 4096
@@ -176,6 +178,87 @@ def next_downforce_point_display_name(settings):
     while f"downforce {index}" in existing_names:
         index += 1
     return f"Downforce {index}"
+
+
+def pressure_grip_multiplier(pressure):
+    progress = min(max((pressure - 1.3) / (2.7 - 1.3), 0.0), 1.0)
+    return 1.0 + (0.7 - 1.0) * progress
+
+
+def preset_tarmac_grip(wheel):
+    return (
+        TARMAC_TIRE_PEAK_FRICTION[wheel.tire_type]
+        * pressure_grip_multiplier(wheel.pressure)
+        * wheel.grip_factor
+    )
+
+
+def calculate_max_speed_brake_force_kg(settings, preset):
+    total_mass = sum(collider.mass for collider in settings.colliders)
+    if total_mass <= 0.0:
+        raise ValueError("Collider mass must be greater than zero")
+    if not settings.car_root_object or not settings.center_of_mass_object:
+        raise ValueError("Car Root and Center of Mass are required")
+
+    shared_wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
+    wheel_positions = {}
+    contact_heights = []
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = shared_wheels.get((group, key))
+        if not wheel or not wheel.suspension_ref or not wheel.wheel_ref:
+            raise ValueError("All wheel mounts and spin objects are required")
+        mount_position = blender_position_to_game(
+            relative_to_car(settings.car_root_object, wheel.suspension_ref)
+        )
+        spin_position = blender_position_to_game(
+            relative_to_car(settings.car_root_object, wheel.wheel_ref)
+        )
+        wheel_positions[(group, key)] = mount_position
+        contact_heights.append(spin_position[1] - wheel.radius)
+
+    front_z = sum(wheel_positions[("front", key)][2] for key in ("l", "r")) / 2.0
+    rear_z = sum(wheel_positions[("rear", key)][2] for key in ("l", "r")) / 2.0
+    axle_span = front_z - rear_z
+    wheelbase = abs(axle_span)
+    if wheelbase <= 1.0e-4:
+        raise ValueError("Front and rear wheel mounts must define a wheelbase")
+
+    center_of_mass = blender_position_to_game(
+        relative_to_car(settings.car_root_object, settings.center_of_mass_object)
+    )
+    front_static_fraction = min(max((center_of_mass[2] - rear_z) / axle_span, 0.0), 1.0)
+    center_of_mass_height = max(center_of_mass[1] - sum(contact_heights) / len(contact_heights), 0.0)
+
+    front_load = total_mass * front_static_fraction
+    rear_load = total_mass * (1.0 - front_static_fraction)
+    for point in settings.down_force_points:
+        if not point.object_ref:
+            raise ValueError("Every downforce point must have a helper object")
+        position = blender_position_to_game(
+            relative_to_car(settings.car_root_object, point.object_ref)
+        )
+        front_fraction = (position[2] - rear_z) / axle_span
+        force_kg = point.max_force / NEWTONS_PER_KILOGRAM
+        front_load += force_kg * front_fraction
+        rear_load += force_kg * (1.0 - front_fraction)
+
+    front_grip = preset_tarmac_grip(preset.front)
+    rear_grip = preset_tarmac_grip(preset.rear)
+    denominator = total_mass - total_mass * center_of_mass_height / wheelbase * (front_grip - rear_grip)
+    if denominator <= 1.0e-4:
+        raise ValueError("Vehicle geometry and tire grip produce an invalid brake-force estimate")
+    deceleration_g = (front_grip * front_load + rear_grip * rear_load) / denominator
+    load_transfer = total_mass * deceleration_g * center_of_mass_height / wheelbase
+    front_load += load_transfer
+    rear_load -= load_transfer
+    if front_load <= 0.0 or rear_load <= 0.0:
+        raise ValueError("Predicted braking unloads an axle; adjust the vehicle setup")
+    if preset.brake_bias <= 0.0 or preset.brake_bias >= 1.0:
+        raise ValueError("Brake Bias must be greater than 0 and less than 1")
+
+    front_force_kg = front_load * 0.5 * front_grip / preset.brake_bias * BRAKE_LOCK_MARGIN
+    rear_force_kg = rear_load * 0.5 * rear_grip / (1.0 - preset.brake_bias) * BRAKE_LOCK_MARGIN
+    return front_force_kg, rear_force_kg, deceleration_g
 
 
 def create_car_helper(context, settings, name, display_type, display_size, helper_prop):
@@ -1187,11 +1270,10 @@ def validate_scene(settings):
 
     if settings.use_custom_sounds:
         for slot in SOUND_SLOTS:
+            if not getattr(settings, f"sound_{slot}_enabled"):
+                continue
             path = getattr(settings, f"sound_{slot}")
-            if not path:
-                if slot not in OPTIONAL_SOUND_SLOTS:
-                    errors.append(f"Sound slot is not assigned: {slot}")
-            elif not os.path.isfile(abspath(path)):
+            if path and not os.path.isfile(abspath(path)):
                 errors.append(f"Sound file for {slot} does not exist: {path}")
 
     if not settings.car_id:
@@ -1221,32 +1303,107 @@ def validate_scene(settings):
 
 
 class CarBodyColorSettings(PropertyGroup):
-    display_name: StringProperty(name="Name", default="")
-    material: PointerProperty(name="Material", type=bpy.types.Material)
+    display_name: StringProperty(
+        name="Name",
+        description="Player-facing name for this selectable body color",
+        default="",
+    )
+    material: PointerProperty(
+        name="Material",
+        description="Body material associated with this selectable color",
+        type=bpy.types.Material,
+    )
 
 
 class CarColliderSettings(PropertyGroup):
-    object_ref: PointerProperty(name="Object", type=bpy.types.Object, update=update_collider_object)
-    collider_type: EnumProperty(name="Type", items=(("trimesh", "Trimesh", ""), ("box", "Box", "")), default="trimesh")
-    mass: FloatProperty(name="Mass", default=1230.0, min=0.0)
+    object_ref: PointerProperty(
+        name="Object",
+        description="Mesh object used as this physics collider",
+        type=bpy.types.Object,
+        update=update_collider_object,
+    )
+    collider_type: EnumProperty(
+        name="Type",
+        description="Collision shape generated from the selected object",
+        items=(("trimesh", "Trimesh", ""), ("box", "Box", "")),
+        default="trimesh",
+    )
+    mass: FloatProperty(
+        name="Mass (kg)",
+        description="Collider mass in kilograms",
+        default=1230.0,
+        min=0.0,
+    )
 
 
 class CarDownForcePointSettings(PropertyGroup):
-    display_name: StringProperty(name="Name", default="")
-    object_ref: PointerProperty(name="Point", type=bpy.types.Object)
+    def get_max_force_kg(self):
+        return self.max_force / NEWTONS_PER_KILOGRAM
+
+    def set_max_force_kg(self, value):
+        self.max_force = value * NEWTONS_PER_KILOGRAM
+
+    display_name: StringProperty(
+        name="Name",
+        description="Name used to identify this aerodynamic load point",
+        default="",
+    )
+    object_ref: PointerProperty(
+        name="Point",
+        description="Helper object defining where this downforce is applied",
+        type=bpy.types.Object,
+    )
     max_force: FloatProperty(name="Max Force", default=3000.0, min=0.0)
+    max_force_kg: FloatProperty(
+        name="Max Downforce (kg)",
+        description="Equivalent weight added by this downforce point at maximum speed",
+        min=0.0,
+        get=get_max_force_kg,
+        set=set_max_force_kg,
+    )
 
 
 class CarWheelSettings(PropertyGroup):
     group: StringProperty(name="Group", default="front")
     key: StringProperty(name="Key", default="l")
-    steering: BoolProperty(name="Steering", default=False)
-    suspension_ref: PointerProperty(name="Mount", type=bpy.types.Object)
-    hub_ref: PointerProperty(name="Joint", type=bpy.types.Object)
-    wheel_ref: PointerProperty(name="Spin", type=bpy.types.Object)
-    up_local_axis: EnumProperty(name="Up Local Axis", items=AXIS_ITEMS, default="z")
-    spin_local_axis: EnumProperty(name="Spin Local Axis", items=AXIS_ITEMS, default="x")
-    radius: FloatProperty(name="Radius", default=0.3, min=0.01)
+    steering: BoolProperty(
+        name="Steering",
+        description="Allow this wheel to turn with steering input",
+        default=False,
+    )
+    suspension_ref: PointerProperty(
+        name="Mount",
+        description="Object marking where the suspension attaches to the chassis",
+        type=bpy.types.Object,
+    )
+    hub_ref: PointerProperty(
+        name="Joint",
+        description="Object that receives steering and wheel-alignment rotation",
+        type=bpy.types.Object,
+    )
+    wheel_ref: PointerProperty(
+        name="Spin",
+        description="Object that visually rotates with wheel speed",
+        type=bpy.types.Object,
+    )
+    up_local_axis: EnumProperty(
+        name="Up Local Axis",
+        description="Wheel object's local axis that points upward",
+        items=AXIS_ITEMS,
+        default="z",
+    )
+    spin_local_axis: EnumProperty(
+        name="Spin Local Axis",
+        description="Wheel object's local axis around which the wheel rotates",
+        items=AXIS_ITEMS,
+        default="x",
+    )
+    radius: FloatProperty(
+        name="Radius (m)",
+        description="Wheel radius in metres, measured from the wheel centre to the tire contact surface",
+        default=0.3,
+        min=0.01,
+    )
     # Retained as hidden migration sources for blend files saved with preset schema 3.
     suspension_stiffness: FloatProperty(default=80.0, options={"HIDDEN"})
     damping_relaxation: FloatProperty(default=2.6, options={"HIDDEN"})
@@ -1263,31 +1420,78 @@ class CarWheelSettings(PropertyGroup):
 
 
 class CarWheelPresetSettings(PropertyGroup):
+    def get_max_brake_force_kg(self):
+        return self.max_brake_force / NEWTONS_PER_KILOGRAM
+
+    def set_max_brake_force_kg(self, value):
+        self.max_brake_force = value * NEWTONS_PER_KILOGRAM
+
     group: StringProperty(name="Group", default="front")
     key: StringProperty(name="Key", default="l")
-    tire_type: EnumProperty(name="Tire Type", items=TIRE_TYPE_ITEMS, default="medium")
-    pressure: FloatProperty(name="Pressure", default=2.0, min=1.3, max=2.7)
-    camber: FloatProperty(name="Camber", default=-4.0)
+    tire_type: EnumProperty(
+        name="Tire Compound",
+        description="Tire compound used to determine available grip",
+        items=TIRE_TYPE_ITEMS,
+        default="medium",
+    )
+    pressure: FloatProperty(
+        name="Tire Pressure (bar)",
+        description="Tire inflation pressure in bar; higher pressure reduces available grip",
+        default=2.0,
+        min=1.3,
+        max=2.7,
+    )
+    camber: FloatProperty(
+        name="Camber (°)",
+        description="Wheel tilt viewed from the front; negative tilts the top inward and positive tilts it outward",
+        default=-4.0,
+    )
     caster: FloatProperty(
-        name="Caster",
-        description="Positive values tilt the top of the steering axis toward the rear of the car",
+        name="Caster (°)",
+        description="Steering-axis tilt viewed from the side; positive tilts the top toward the rear and negative toward the front",
         default=0.0,
         min=-15.0,
         max=15.0,
     )
-    toe: FloatProperty(name="Toe", default=-0.15)
+    toe: FloatProperty(
+        name="Toe (°)",
+        description="Wheel direction viewed from above; negative points the fronts inward and positive points them outward",
+        default=-0.15,
+    )
     suspension_offset: FloatProperty(
-        name="Suspension Offset",
-        description="Signed change to suspension rest length; positive pushes the wheel farther from the mount",
+        name="Suspension Offset (m)",
+        description="Change to suspension rest length in metres; positive moves the wheel farther from the mount and negative moves it closer",
         default=0.0,
         min=-0.25,
         max=0.25,
         unit="LENGTH",
     )
-    suspension_stiffness: FloatProperty(name="Suspension Stiffness", default=80.0, min=0.0)
-    damping_relaxation: FloatProperty(name="Damping Relaxation", default=2.6, min=0.0)
-    damping_compression: FloatProperty(name="Damping Compression", default=2.0, min=0.0)
-    max_brake_force: FloatProperty(name="Max Brake Force", default=1000.0, min=0.0)
+    suspension_stiffness: FloatProperty(
+        name="Suspension Stiffness",
+        description="Spring strength based on compression distance; higher values make the suspension firmer and reduce compression",
+        default=80.0,
+        min=0.0,
+    )
+    damping_relaxation: FloatProperty(
+        name="Damping Relaxation",
+        description="Resistance while the suspension extends; higher values slow rebound and reduce bouncing",
+        default=2.6,
+        min=0.0,
+    )
+    damping_compression: FloatProperty(
+        name="Damping Compression",
+        description="Resistance while the suspension compresses; higher values resist rapid compression over bumps",
+        default=2.0,
+        min=0.0,
+    )
+    max_brake_force: FloatProperty(name="Max Brake Force (N)", default=1000.0, min=0.0)
+    max_brake_force_kg: FloatProperty(
+        name="Max Brake Force (kg)",
+        description="Equivalent braking force available at each wheel; exported in newtons",
+        min=0.0,
+        get=get_max_brake_force_kg,
+        set=set_max_brake_force_kg,
+    )
     grip_factor: FloatProperty(
         name="Grip Factor",
         description="Multiplier for this wheel's pressure-derived grip",
@@ -1297,12 +1501,26 @@ class CarWheelPresetSettings(PropertyGroup):
 
 
 class CarPresetSettings(PropertyGroup):
-    preset_id: StringProperty(name="ID", default="default")
-    display_name: StringProperty(name="Name", default="Default")
-    max_steering_angle: FloatProperty(name="Max Steering Angle", default=50.0, min=1.0, max=90.0)
+    preset_id: StringProperty(
+        name="ID",
+        description="Stable unique identifier stored with this preset",
+        default="default",
+    )
+    display_name: StringProperty(
+        name="Name",
+        description="Player-facing name for this vehicle preset",
+        default="Default",
+    )
+    max_steering_angle: FloatProperty(
+        name="Maximum Steering Angle (°)",
+        description="Maximum angle the road wheels can turn from straight ahead",
+        default=50.0,
+        min=1.0,
+        max=90.0,
+    )
     max_degrees_of_rotation: FloatProperty(
-        name="Max Degrees of Rotation",
-        description="Maximum steering wheel rotation from full left lock to full right lock",
+        name="Steering Wheel Rotation (°)",
+        description="Total steering wheel rotation from full left lock to full right lock",
         default=540.0,
         min=90.0,
         max=2160.0,
@@ -1325,9 +1543,24 @@ class CarPresetSettings(PropertyGroup):
         step=25,
         precision=2,
     )
-    abs_level: IntProperty(name="ABS Level", default=5, min=0)
-    esc_level: IntProperty(name="ESC Level", default=0, min=0)
-    traction_control_level: IntProperty(name="Traction Control Level", default=5, min=0)
+    abs_level: IntProperty(
+        name="ABS Level",
+        description="Default anti-lock braking level for this preset; zero disables ABS",
+        default=5,
+        min=0,
+    )
+    esc_level: IntProperty(
+        name="ESC Level",
+        description="Default electronic stability control level for this preset; zero disables ESC",
+        default=0,
+        min=0,
+    )
+    traction_control_level: IntProperty(
+        name="Traction Control Level",
+        description="Default traction control level for this preset; zero disables traction control",
+        default=5,
+        min=0,
+    )
     brake_bias: FloatProperty(
         name="Brake Bias",
         description="Front brake force proportion",
@@ -1336,24 +1569,39 @@ class CarPresetSettings(PropertyGroup):
         max=1.0,
         subtype="FACTOR",
     )
-    final_drive_ratio: FloatProperty(name="Final Drive Ratio", default=5.0, min=0.01)
-    reverse_ratio: FloatProperty(name="Reverse", default=-3.57)
-    forward_gear_count: IntProperty(name="Forward Gears", default=6, min=1, max=15)
-    gear_1: FloatProperty(name="Gear 1", default=4.08, min=0.01)
-    gear_2: FloatProperty(name="Gear 2", default=2.7, min=0.01)
-    gear_3: FloatProperty(name="Gear 3", default=1.9, min=0.01)
-    gear_4: FloatProperty(name="Gear 4", default=1.4, min=0.01)
-    gear_5: FloatProperty(name="Gear 5", default=1.06, min=0.01)
-    gear_6: FloatProperty(name="Gear 6", default=0.85, min=0.01)
-    gear_7: FloatProperty(name="Gear 7", default=0.70, min=0.01)
-    gear_8: FloatProperty(name="Gear 8", default=0.58, min=0.01)
-    gear_9: FloatProperty(name="Gear 9", default=0.50, min=0.01)
-    gear_10: FloatProperty(name="Gear 10", default=0.44, min=0.01)
-    gear_11: FloatProperty(name="Gear 11", default=0.40, min=0.01)
-    gear_12: FloatProperty(name="Gear 12", default=0.36, min=0.01)
-    gear_13: FloatProperty(name="Gear 13", default=0.33, min=0.01)
-    gear_14: FloatProperty(name="Gear 14", default=0.30, min=0.01)
-    gear_15: FloatProperty(name="Gear 15", default=0.28, min=0.01)
+    final_drive_ratio: FloatProperty(
+        name="Final Drive Ratio",
+        description="Multiplier applied to every selected gear ratio before torque reaches the wheels",
+        default=5.0,
+        min=0.01,
+    )
+    reverse_ratio: FloatProperty(
+        name="Reverse",
+        description="Reverse gear ratio; negative values produce reverse wheel rotation",
+        default=-3.57,
+    )
+    forward_gear_count: IntProperty(
+        name="Forward Gears",
+        description="Number of forward gear ratios exported for this preset",
+        default=6,
+        min=1,
+        max=15,
+    )
+    gear_1: FloatProperty(name="Gear 1", description="First-gear ratio", default=4.08, min=0.01)
+    gear_2: FloatProperty(name="Gear 2", description="Second-gear ratio", default=2.7, min=0.01)
+    gear_3: FloatProperty(name="Gear 3", description="Third-gear ratio", default=1.9, min=0.01)
+    gear_4: FloatProperty(name="Gear 4", description="Fourth-gear ratio", default=1.4, min=0.01)
+    gear_5: FloatProperty(name="Gear 5", description="Fifth-gear ratio", default=1.06, min=0.01)
+    gear_6: FloatProperty(name="Gear 6", description="Sixth-gear ratio", default=0.85, min=0.01)
+    gear_7: FloatProperty(name="Gear 7", description="Seventh-gear ratio", default=0.70, min=0.01)
+    gear_8: FloatProperty(name="Gear 8", description="Eighth-gear ratio", default=0.58, min=0.01)
+    gear_9: FloatProperty(name="Gear 9", description="Ninth-gear ratio", default=0.50, min=0.01)
+    gear_10: FloatProperty(name="Gear 10", description="Tenth-gear ratio", default=0.44, min=0.01)
+    gear_11: FloatProperty(name="Gear 11", description="Eleventh-gear ratio", default=0.40, min=0.01)
+    gear_12: FloatProperty(name="Gear 12", description="Twelfth-gear ratio", default=0.36, min=0.01)
+    gear_13: FloatProperty(name="Gear 13", description="Thirteenth-gear ratio", default=0.33, min=0.01)
+    gear_14: FloatProperty(name="Gear 14", description="Fourteenth-gear ratio", default=0.30, min=0.01)
+    gear_15: FloatProperty(name="Gear 15", description="Fifteenth-gear ratio", default=0.28, min=0.01)
     front: PointerProperty(type=CarWheelPresetSettings)
     rear: PointerProperty(type=CarWheelPresetSettings)
     wheels: CollectionProperty(type=CarWheelPresetSettings)
@@ -1361,13 +1609,21 @@ class CarPresetSettings(PropertyGroup):
 
 class CarExporterSettings(PropertyGroup):
     is_configured: BoolProperty(name="Configured", default=False)
-    car_id: StringProperty(name="Car ID", default="my_car")
+    car_id: StringProperty(
+        name="Car ID",
+        description="Stable package identifier used in filenames and game data",
+        default="my_car",
+    )
     package_version: StringProperty(
         name="Package Version",
         description="Explicit asset revision; increment when package contents change",
         default="1",
     )
-    display_name: StringProperty(name="Display Name", default="My Car")
+    display_name: StringProperty(
+        name="Display Name",
+        description="Player-facing vehicle name shown in the game",
+        default="My Car",
+    )
     max_texture_size: EnumProperty(
         name="Maximum Texture Size",
         description="Maximum exported material-texture dimension",
@@ -1386,37 +1642,104 @@ class CarExporterSettings(PropertyGroup):
         min=1,
         max=100,
     )
-    car_class: StringProperty(name="Class", default="GT")
-    vehicle_tag_tarmac: BoolProperty(name="Tarmac", default=True)
-    vehicle_tag_offroad: BoolProperty(name="Offroad", default=True)
+    car_class: StringProperty(
+        name="Class",
+        description="Player-facing vehicle class used for grouping and display",
+        default="GT",
+    )
+    vehicle_tag_tarmac: BoolProperty(
+        name="Tarmac",
+        description="Mark this vehicle as suitable for tarmac tracks",
+        default=True,
+    )
+    vehicle_tag_offroad: BoolProperty(
+        name="Offroad",
+        description="Mark this vehicle as suitable for off-road tracks",
+        default=True,
+    )
     abs_max_level: IntProperty(
-        name="ABS Max Level", default=5, min=1, update=update_driver_assist_max_levels
+        name="ABS Max Level",
+        description="Highest player-selectable ABS level; preset levels are measured against this maximum",
+        default=5,
+        min=1,
+        update=update_driver_assist_max_levels,
     )
     esc_max_level: IntProperty(
-        name="ESC Max Level", default=5, min=1, update=update_driver_assist_max_levels
+        name="ESC Max Level",
+        description="Highest player-selectable ESC level; preset levels are measured against this maximum",
+        default=5,
+        min=1,
+        update=update_driver_assist_max_levels,
     )
     traction_control_max_level: IntProperty(
-        name="Traction Control Max Level", default=5, min=1, update=update_driver_assist_max_levels
+        name="Traction Control Max Level",
+        description="Highest player-selectable traction control level; preset levels are measured against this maximum",
+        default=5,
+        min=1,
+        update=update_driver_assist_max_levels,
     )
-    car_root_object: PointerProperty(name="Car Root", type=bpy.types.Object)
-    center_of_mass_object: PointerProperty(name="Center of Mass", type=bpy.types.Object)
-    steering_wheel_object: PointerProperty(name="Steering Wheel", type=bpy.types.Object)
-    steering_wheel_spin_axis: EnumProperty(name="Steering Wheel Spin Axis", items=AXIS_ITEMS, default="y")
+    car_root_object: PointerProperty(
+        name="Car Root",
+        description="Root object containing the complete vehicle hierarchy",
+        type=bpy.types.Object,
+    )
+    center_of_mass_object: PointerProperty(
+        name="Center of Mass",
+        description="Helper object defining the vehicle's center of mass",
+        type=bpy.types.Object,
+    )
+    steering_wheel_object: PointerProperty(
+        name="Steering Wheel",
+        description="Object visually rotated by player steering input",
+        type=bpy.types.Object,
+    )
+    steering_wheel_spin_axis: EnumProperty(
+        name="Steering Wheel Spin Axis",
+        description="Steering wheel's local rotation axis",
+        items=AXIS_ITEMS,
+        default="y",
+    )
     # Retained as hidden migration sources for blend files saved with preset schema 4.
     max_degrees_of_rotation: FloatProperty(default=540.0, min=90.0, max=2160.0, options={"HIDDEN"})
-    headlights_material: PointerProperty(name="Headlights", type=bpy.types.Material)
-    brake_lights_material: PointerProperty(name="Brake Lights", type=bpy.types.Material)
-    reverse_lights_material: PointerProperty(name="Reverse Lights", type=bpy.types.Material)
-    dashboard_screen_object: PointerProperty(name="Screen", type=bpy.types.Object)
+    headlights_material: PointerProperty(
+        name="Headlights",
+        description="Emissive material controlled by the vehicle headlights",
+        type=bpy.types.Material,
+    )
+    brake_lights_material: PointerProperty(
+        name="Brake Lights",
+        description="Emissive material illuminated while braking",
+        type=bpy.types.Material,
+    )
+    reverse_lights_material: PointerProperty(
+        name="Reverse Lights",
+        description="Emissive material illuminated while reversing",
+        type=bpy.types.Material,
+    )
+    dashboard_screen_object: PointerProperty(
+        name="Screen",
+        description="Mesh object used as the in-game dashboard display",
+        type=bpy.types.Object,
+    )
     # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
-    air_drag: FloatProperty(name="Air Drag", default=0.5, min=0.0, max=1.0)
+    air_drag: FloatProperty(
+        name="Air Drag",
+        description="Aerodynamic drag coefficient; higher values create more resistance as speed increases",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+    )
     abs: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
     esc: FloatProperty(default=0.0, min=0.0, max=1.0, options={"HIDDEN"})
     traction_control: FloatProperty(default=1.0, min=0.0, max=1.0, options={"HIDDEN"})
     # Retained as a hidden migration source for blend files saved with preset schema 3.
     max_steering_angle: FloatProperty(default=50.0, min=1.0, max=90.0, options={"HIDDEN"})
-    use_custom_sounds: BoolProperty(name="Use Custom Sounds", default=False)
+    use_custom_sounds: BoolProperty(
+        name="Use Custom Sounds",
+        description="Configure each vehicle sound to inherit the default, use a custom file, or be disabled",
+        default=False,
+    )
     sound_pitch_offset: IntProperty(
         name="Pitch Offset (cents)",
         description="Vehicle-wide engine sample pitch offset; 100 cents equals one semitone",
@@ -1437,26 +1760,98 @@ class CarExporterSettings(PropertyGroup):
     guide_wheelbase: FloatProperty(name="Wheelbase", default=2.7, min=0.1, unit="LENGTH")
     guide_track_width: FloatProperty(name="Track Width", default=1.65, min=0.1, unit="LENGTH")
 
-    drive: EnumProperty(name="Drive", items=(("awd", "AWD", ""), ("fwd", "FWD", ""), ("rwd", "RWD", "")), default="awd")
-    hp: FloatProperty(name="HP", default=590.0, min=1.0)
-    max_rpm: IntProperty(name="Max RPM", default=8000, min=1)
-    idle_rpm: IntProperty(name="Idle RPM", default=1000, min=1)
-    redline_rpm: IntProperty(name="Redline RPM", default=7000, min=1)
-    rev_limit: IntProperty(name="Rev Limit", default=7900, min=1)
-    engine_inertia: FloatProperty(name="Engine Inertia", default=0.2, min=0.01)
-    engine_friction_torque: FloatProperty(name="Friction Torque", default=70.0, min=0.0)
-    clutch_response: FloatProperty(name="Clutch Response", default=12.0, min=0.0)
-    shift_cooldown: FloatProperty(name="Gear Change Cooldown", default=0.0, min=0.0, unit="TIME")
+    drive: EnumProperty(
+        name="Drive",
+        description="Wheels powered by the engine: all, front, or rear",
+        items=(("awd", "AWD", ""), ("fwd", "FWD", ""), ("rwd", "RWD", "")),
+        default="awd",
+    )
+    hp: FloatProperty(
+        name="Power (hp) — Display Only",
+        description="Rated engine power shown to players; the torque curve controls vehicle physics",
+        default=590.0,
+        min=1.0,
+    )
+    max_rpm: IntProperty(
+        name="Max RPM",
+        description="Maximum engine speed represented by the torque curve",
+        default=8000,
+        min=1,
+    )
+    idle_rpm: IntProperty(
+        name="Idle RPM",
+        description="Minimum running engine speed when the engine is idling",
+        default=1000,
+        min=1,
+    )
+    redline_rpm: IntProperty(
+        name="Redline RPM",
+        description="Engine speed marking the start of the redline range",
+        default=7000,
+        min=1,
+    )
+    rev_limit: IntProperty(
+        name="Rev Limit",
+        description="Engine speed where combustion torque is cut to prevent further revving",
+        default=7900,
+        min=1,
+    )
+    engine_inertia: FloatProperty(
+        name="Engine Inertia (kg·m²)",
+        description="Resistance to RPM changes; higher values make the engine rev more slowly",
+        default=0.2,
+        min=0.01,
+    )
+    engine_friction_torque: FloatProperty(
+        name="Friction Torque (N·m)",
+        description="Internal engine drag; higher values make RPM fall faster when the throttle is released",
+        default=70.0,
+        min=0.0,
+    )
+    clutch_response: FloatProperty(
+        name="Clutch Response (s⁻¹)",
+        description="Rate at which the clutch synchronizes engine and wheel RPM; higher values engage faster and more sharply",
+        default=12.0,
+        min=0.0,
+    )
+    shift_cooldown: FloatProperty(
+        name="Gear Change Cooldown (s)",
+        description="Minimum time before another gear change is allowed; zero disables the delay",
+        default=0.0,
+        min=0.0,
+        unit="TIME",
+    )
     auto_blip: BoolProperty(
         name="Auto Blip",
         description="Allow the game auto-blip setting to operate for this vehicle",
         default=True,
     )
-    auto_blip_duration: FloatProperty(name="Auto Blip Duration", default=0.2, min=0.0, max=1.0, unit="TIME")
-    turbo_enabled: BoolProperty(name="Turbo Enabled", default=True)
-    turbo_boost: FloatProperty(name="Turbo Boost", default=1.35, min=1.0)
-    turbo_valve: BoolProperty(name="Turbo Valve", default=False)
-    max_torque: FloatProperty(name="Max Torque", default=590.0, min=1.0)
+    auto_blip_duration: FloatProperty(
+        name="Auto Blip Duration (s)",
+        description="Maximum time allowed for clutch-open RPM matching during an automatic downshift blip",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+        unit="TIME",
+    )
+    turbo_enabled: BoolProperty(
+        name="Turbo Enabled",
+        description="Enable turbo boost for this engine",
+        default=True,
+    )
+    turbo_boost: FloatProperty(
+        name="Turbo Boost",
+        description="Maximum turbo torque multiplier at full spool; 1.0 adds no boost",
+        default=1.35,
+        min=1.0,
+        max=2.0,
+    )
+    max_torque: FloatProperty(
+        name="Maximum Torque (N·m)",
+        description="Peak torque used to scale the editable torque curve",
+        default=590.0,
+        min=1.0,
+    )
     torque_factor: FloatProperty(
         name="Torque Factor",
         description="Multiplier applied to drive and engine-braking torque before tire-force limits",
@@ -1473,38 +1868,234 @@ class CarExporterSettings(PropertyGroup):
     torque_7000: FloatProperty(name="7000 RPM", default=523)
     torque_8000: FloatProperty(name="8000 RPM", default=460)
 
-    chase_camera_object: PointerProperty(name="Chase", type=bpy.types.Object, poll=camera_object_poll, update=update_chase_camera_object)
-    cockpit_camera_object: PointerProperty(name="Cockpit", type=bpy.types.Object, poll=camera_object_poll, update=update_cockpit_camera_object)
-    hood_camera_object: PointerProperty(name="Hood", type=bpy.types.Object, poll=camera_object_poll, update=update_hood_camera_object)
-    roof_camera_object: PointerProperty(name="Roof", type=bpy.types.Object, poll=camera_object_poll, update=update_roof_camera_object)
+    chase_camera_object: PointerProperty(
+        name="Chase",
+        description="Camera object used for the chase view",
+        type=bpy.types.Object,
+        poll=camera_object_poll,
+        update=update_chase_camera_object,
+    )
+    cockpit_camera_object: PointerProperty(
+        name="Cockpit",
+        description="Camera object used for the cockpit view",
+        type=bpy.types.Object,
+        poll=camera_object_poll,
+        update=update_cockpit_camera_object,
+    )
+    hood_camera_object: PointerProperty(
+        name="Hood",
+        description="Camera object used for the hood view",
+        type=bpy.types.Object,
+        poll=camera_object_poll,
+        update=update_hood_camera_object,
+    )
+    roof_camera_object: PointerProperty(
+        name="Roof",
+        description="Camera object used for the roof view",
+        type=bpy.types.Object,
+        poll=camera_object_poll,
+        update=update_roof_camera_object,
+    )
     chase_fov: FloatProperty(name="Chase FOV", default=39.5)
     cockpit_fov: FloatProperty(name="Cockpit FOV", default=32.3)
     hood_fov: FloatProperty(name="Hood FOV", default=44.1)
     roof_fov: FloatProperty(name="Roof FOV", default=44.1)
-    chase_target_distance: FloatProperty(name="Target Distance", default=5.0, min=0.01, update=update_chase_target_distance)
-    cockpit_target_distance: FloatProperty(name="Target Distance", default=1.0, min=0.01, update=update_cockpit_target_distance)
-    hood_target_distance: FloatProperty(name="Target Distance", default=2.0, min=0.01, update=update_hood_target_distance)
-    roof_target_distance: FloatProperty(name="Target Distance", default=2.0, min=0.01, update=update_roof_target_distance)
-    sound_tranny_on: StringProperty(name="Transmission On", subtype="FILE_PATH", default="")
-    sound_tranny_off: StringProperty(name="Transmission Off", subtype="FILE_PATH", default="")
-    sound_on_high: StringProperty(name="On High", subtype="FILE_PATH", default="")
-    sound_on_low: StringProperty(name="On Low", subtype="FILE_PATH", default="")
-    sound_off_high: StringProperty(name="Off High", subtype="FILE_PATH", default="")
-    sound_off_low: StringProperty(name="Off Low", subtype="FILE_PATH", default="")
-    sound_limiter: StringProperty(name="Limiter", subtype="FILE_PATH", default="")
-    sound_turbo_flutter: StringProperty(name="Turbo Flutter", subtype="FILE_PATH", default="")
-    sound_tranny_on_volume: FloatProperty(name="Volume", default=0.6, min=0.0, soft_max=1.0)
-    sound_tranny_off_volume: FloatProperty(name="Volume", default=0.1, min=0.0, soft_max=1.0)
-    sound_on_high_rpm: IntProperty(name="RPM", default=1000, min=0)
-    sound_on_high_volume: FloatProperty(name="Volume", default=0.5, min=0.0, soft_max=1.0)
-    sound_on_low_rpm: IntProperty(name="RPM", default=1000, min=0)
-    sound_on_low_volume: FloatProperty(name="Volume", default=0.4, min=0.0, soft_max=1.0)
-    sound_off_high_rpm: IntProperty(name="RPM", default=1000, min=0)
-    sound_off_high_volume: FloatProperty(name="Volume", default=0.3, min=0.0, soft_max=1.0)
-    sound_off_low_rpm: IntProperty(name="RPM", default=1000, min=0)
-    sound_off_low_volume: FloatProperty(name="Volume", default=0.3, min=0.0, soft_max=1.0)
-    sound_limiter_volume: FloatProperty(name="Volume", default=0.4, min=0.0, soft_max=1.0)
-    sound_turbo_flutter_volume: FloatProperty(name="Volume", default=0.6, min=0.0, soft_max=1.0)
+    chase_target_distance: FloatProperty(
+        name="Target Distance",
+        description="Distance in metres from the chase camera to its viewing target",
+        default=5.0,
+        min=0.01,
+        update=update_chase_target_distance,
+    )
+    cockpit_target_distance: FloatProperty(
+        name="Target Distance",
+        description="Distance in metres from the cockpit camera to its viewing target",
+        default=1.0,
+        min=0.01,
+        update=update_cockpit_target_distance,
+    )
+    hood_target_distance: FloatProperty(
+        name="Target Distance",
+        description="Distance in metres from the hood camera to its viewing target",
+        default=2.0,
+        min=0.01,
+        update=update_hood_target_distance,
+    )
+    roof_target_distance: FloatProperty(
+        name="Target Distance",
+        description="Distance in metres from the roof camera to its viewing target",
+        default=2.0,
+        min=0.01,
+        update=update_roof_target_distance,
+    )
+    sound_tranny_on: StringProperty(
+        name="Transmission On",
+        description="Transmission sound file played while engine torque is applied",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_tranny_on_enabled: BoolProperty(
+        name="Transmission On Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_tranny_off: StringProperty(
+        name="Transmission Off",
+        description="Transmission sound file played while coasting or using engine braking",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_tranny_off_enabled: BoolProperty(
+        name="Transmission Off Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_on_high: StringProperty(
+        name="On High",
+        description="High-RPM engine sound file used while throttle is applied",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_on_high_enabled: BoolProperty(
+        name="On High Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_on_low: StringProperty(
+        name="On Low",
+        description="Low-RPM engine sound file used while throttle is applied",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_on_low_enabled: BoolProperty(
+        name="On Low Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_off_high: StringProperty(
+        name="Off High",
+        description="High-RPM engine sound file used while the throttle is released",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_off_high_enabled: BoolProperty(
+        name="Off High Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_off_low: StringProperty(
+        name="Off Low",
+        description="Low-RPM engine sound file used while the throttle is released",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_off_low_enabled: BoolProperty(
+        name="Off Low Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_limiter: StringProperty(
+        name="Limiter",
+        description="Sound file played while the engine is touching the rev limiter",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_limiter_enabled: BoolProperty(
+        name="Limiter Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_turbo: StringProperty(
+        name="Turbo",
+        description="Turbo sound file played after boost is released",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sound_turbo_enabled: BoolProperty(
+        name="Turbo Enabled",
+        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_tranny_on_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the transmission-on sound",
+        default=0.6,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_tranny_off_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the transmission-off sound",
+        default=0.1,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_on_high_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the high-RPM throttle-on sample",
+        default=1000,
+        min=0,
+    )
+    sound_on_high_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the high-RPM throttle-on sound",
+        default=0.5,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_on_low_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the low-RPM throttle-on sample",
+        default=1000,
+        min=0,
+    )
+    sound_on_low_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the low-RPM throttle-on sound",
+        default=0.4,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_off_high_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the high-RPM throttle-off sample",
+        default=1000,
+        min=0,
+    )
+    sound_off_high_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the high-RPM throttle-off sound",
+        default=0.3,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_off_low_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the low-RPM throttle-off sample",
+        default=1000,
+        min=0,
+    )
+    sound_off_low_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the low-RPM throttle-off sound",
+        default=0.3,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_limiter_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the rev-limiter sound",
+        default=0.4,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_turbo_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the turbo sound",
+        default=0.6,
+        min=0.0,
+        soft_max=1.0,
+    )
 
 
 def clear_configuration_settings(settings):
@@ -1567,7 +2158,6 @@ def clear_configuration_settings(settings):
     settings.auto_blip_duration = 0.0
     settings.turbo_enabled = False
     settings.turbo_boost = 1.0
-    settings.turbo_valve = False
     settings.max_torque = 1.0
     settings.torque_factor = 0.01
     for rpm in (1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000):
@@ -1577,6 +2167,7 @@ def clear_configuration_settings(settings):
         setattr(settings, f"{prefix}_fov", 0.0)
         setattr(settings, f"{prefix}_target_distance", 0.01)
     for slot, meta in SOUND_SLOTS.items():
+        setattr(settings, f"sound_{slot}_enabled", True)
         setattr(settings, f"sound_{slot}", "")
         setattr(settings, f"sound_{slot}_volume", meta["volume"])
         if slot in SOUND_RPM_SLOTS:
@@ -1624,7 +2215,6 @@ def initialize_configuration_settings(settings):
     settings.auto_blip_duration = 0.2
     settings.turbo_enabled = True
     settings.turbo_boost = 1.35
-    settings.turbo_valve = False
     settings.max_torque = 590.0
     settings.torque_factor = 1.0
     for rpm, value in {
@@ -1867,10 +2457,11 @@ def build_manifest(settings):
     sounds = {"pitchOffset": settings.sound_pitch_offset}
     if settings.use_custom_sounds:
         for slot, meta in SOUND_SLOTS.items():
+            if not getattr(settings, f"sound_{slot}_enabled"):
+                sounds[slot] = None
+                continue
             source_path = getattr(settings, f"sound_{slot}")
             if not source_path:
-                if slot in OPTIONAL_SOUND_SLOTS:
-                    sounds[slot] = None
                 continue
             source_name = Path(abspath(source_path)).name
             sounds[slot] = {
@@ -1964,7 +2555,6 @@ def build_manifest(settings):
             "turbo": {
                 "enabled": settings.turbo_enabled,
                 "boost": settings.turbo_boost,
-                "valve": settings.turbo_valve,
                 "load": 0.0,
             },
         },
@@ -2045,6 +2635,34 @@ class CAR_EXPORTER_OT_validate_car(Operator):
             return {"CANCELLED"}
         show_validation_popup(context, errors, warnings)
         self.report({"INFO"}, f"Car validation passed with {len(warnings)} warning(s)")
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_calculate_brake_force(Operator):
+    bl_idname = "car_exporter.calculate_brake_force"
+    bl_label = "Calculate Brake Force"
+    bl_description = "Estimate wheel-lock brake force at maximum speed on dry tarmac with ABS off"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        ensure_default_wheels(settings)
+        ensure_default_presets(settings)
+        preset = active_preset(settings)
+        if not preset:
+            self.report({"ERROR"}, "Add a car preset before calculating brake force")
+            return {"CANCELLED"}
+        try:
+            front_kg, rear_kg, deceleration_g = calculate_max_speed_brake_force_kg(settings, preset)
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        preset.front.max_brake_force_kg = front_kg
+        preset.rear.max_brake_force_kg = rear_kg
+        self.report(
+            {"INFO"},
+            f"Brake force set to {front_kg:.0f} kg front and {rear_kg:.0f} kg rear ({deceleration_g:.2f} g estimate)",
+        )
         return {"FINISHED"}
 
 
@@ -2788,7 +3406,11 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
     bl_options = {"REGISTER"}
     filename_ext = ".zip"
 
-    filepath: StringProperty(name="Export Zip", subtype="FILE_PATH")
+    filepath: StringProperty(
+        name="Export Zip",
+        description="Destination path for the exported vehicle ZIP package",
+        subtype="FILE_PATH",
+    )
     filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
     apply_scales_before_export: BoolProperty(
         name="Apply scales",
@@ -2860,6 +3482,8 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
             copied = set()
             if settings.use_custom_sounds:
                 for slot in SOUND_SLOTS:
+                    if not getattr(settings, f"sound_{slot}_enabled"):
+                        continue
                     source = getattr(settings, f"sound_{slot}")
                     if not source:
                         continue
@@ -2896,11 +3520,16 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
     bl_label = "Import Car Manifest"
     bl_options = {"REGISTER"}
 
-    filepath: StringProperty(name="Manifest JSON", subtype="FILE_PATH")
+    filepath: StringProperty(
+        name="Manifest JSON",
+        description="Vehicle manifest JSON file to import into the current scene",
+        subtype="FILE_PATH",
+    )
 
     def execute(self, context):
         settings = scene_settings(context)
-        data = json.loads(Path(abspath(self.filepath)).read_text(encoding="utf-8"))
+        manifest_path = Path(abspath(self.filepath))
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
@@ -2940,6 +3569,24 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         ):
             self.report({"ERROR"}, "Manifest sounds.pitchOffset must be between -2400 and 2400 cents")
             return {"CANCELLED"}
+        for slot in SOUND_SLOTS:
+            if slot not in sounds or sounds[slot] is None:
+                continue
+            sound = sounds[slot]
+            if not isinstance(sound, dict):
+                self.report({"ERROR"}, f"Manifest sounds.{slot} must be an object or null")
+                return {"CANCELLED"}
+            if not isinstance(sound.get("source"), str) or not sound["source"].strip():
+                self.report({"ERROR"}, f"Manifest sounds.{slot}.source must be a non-empty string")
+                return {"CANCELLED"}
+            for field, default in (("rpm", 1000), ("volume", 1)):
+                value = sound.get(field, default)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                    self.report({"ERROR"}, f"Manifest sounds.{slot}.{field} must be a finite non-negative number")
+                    return {"CANCELLED"}
+            if "loop" in sound and not isinstance(sound["loop"], bool):
+                self.report({"ERROR"}, f"Manifest sounds.{slot}.loop must be a boolean")
+                return {"CANCELLED"}
         body = data.get("body")
         if not isinstance(body, dict):
             self.report({"ERROR"}, "Manifest body must be an object")
@@ -3177,6 +3824,21 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
         settings.car_class = data.get("class", settings.car_class)
         settings.sound_pitch_offset = round(sound_pitch_offset)
+        settings.use_custom_sounds = any(slot in sounds for slot in SOUND_SLOTS)
+        for slot, meta in SOUND_SLOTS.items():
+            sound = sounds.get(slot)
+            setattr(settings, f"sound_{slot}_enabled", slot not in sounds or sound is not None)
+            setattr(settings, f"sound_{slot}", "")
+            if not isinstance(sound, dict):
+                continue
+            setattr(
+                settings,
+                f"sound_{slot}",
+                str(manifest_path.parent / "sounds" / sound["source"].strip()),
+            )
+            setattr(settings, f"sound_{slot}_volume", sound.get("volume", meta["volume"]))
+            if slot in SOUND_RPM_SLOTS:
+                setattr(settings, f"sound_{slot}_rpm", sound.get("rpm", meta["rpm"]))
         track_types = data.get("trackTypes")
         if isinstance(track_types, list):
             tags = set(track_types)
@@ -3301,7 +3963,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         turbo = engine.get("turbo", {})
         settings.turbo_enabled = turbo.get("enabled", settings.turbo_enabled)
         settings.turbo_boost = turbo.get("boost", settings.turbo_boost)
-        settings.turbo_valve = turbo.get("valve", settings.turbo_valve)
         set_object_pointer(settings, "steering_wheel_object", steering_wheel.get("obj", ""))
         settings.steering_wheel_spin_axis = GAME_AXIS_TO_BLENDER.get(
             tuple(steering_wheel.get("spinLocalAxis", [0, 0, -1])),
@@ -3479,6 +4140,7 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "esc_level")
     draw_split_prop(layout, preset, "traction_control_level")
     draw_split_prop(layout, preset, "brake_bias")
+    layout.operator("car_exporter.calculate_brake_force", icon="DRIVER_DISTANCE")
 
     gearing_box = layout.box()
     gearing_box.label(text="Gearing")
@@ -3501,7 +4163,7 @@ def draw_presets(layout, settings):
         draw_split_prop(axle_box, wheel, "suspension_stiffness")
         draw_split_prop(axle_box, wheel, "damping_relaxation")
         draw_split_prop(axle_box, wheel, "damping_compression")
-        draw_split_prop(axle_box, wheel, "max_brake_force")
+        draw_split_prop(axle_box, wheel, "max_brake_force_kg")
         draw_split_prop(axle_box, wheel, "grip_factor")
 
 
@@ -3544,7 +4206,7 @@ def draw_body_physics(layout, settings):
         remove.index = index
         draw_split_prop(point_box, point, "display_name")
         draw_split_prop(point_box, point, "object_ref", label="Helper")
-        draw_split_prop(point_box, point, "max_force")
+        draw_split_prop(point_box, point, "max_force_kg")
     layout.operator("car_exporter.add_downforce_point", icon="ADD")
     layout.separator(type="LINE")
     draw_split_prop(layout, settings, "air_drag")
@@ -3614,8 +4276,9 @@ class CAR_EXPORTER_PT_car_export(Panel):
         ):
             draw_split_prop(box, settings, prop)
         draw_split_prop(box, settings, "turbo_enabled")
-        draw_split_prop(box, settings, "turbo_boost")
-        draw_split_prop(box, settings, "turbo_valve")
+        turbo_boost = box.column()
+        turbo_boost.enabled = settings.turbo_enabled
+        draw_split_prop(turbo_boost, settings, "turbo_boost")
 
         box = layout.box()
         box.label(text="Torque Curve")
@@ -3659,15 +4322,23 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_split_prop(box, settings, "sound_pitch_offset")
         draw_split_prop(box, settings, "use_custom_sounds")
         if settings.use_custom_sounds:
+            box.separator(type="LINE")
             for index, (slot, meta) in enumerate(SOUND_SLOTS.items()):
                 if index:
                     box.separator(type="LINE")
                 sound_section = box.column()
-                sound_section.label(text=meta["label"])
-                draw_split_prop(sound_section, settings, f"sound_{slot}", label="File")
+                draw_split_prop(
+                    sound_section,
+                    settings,
+                    f"sound_{slot}_enabled",
+                    label=meta["label"],
+                )
+                controls = sound_section.column()
+                controls.enabled = getattr(settings, f"sound_{slot}_enabled")
+                draw_split_prop(controls, settings, f"sound_{slot}", label="File")
                 if slot in SOUND_RPM_SLOTS:
-                    draw_split_prop(sound_section, settings, f"sound_{slot}_rpm")
-                draw_split_prop(sound_section, settings, f"sound_{slot}_volume")
+                    draw_split_prop(controls, settings, f"sound_{slot}_rpm")
+                draw_split_prop(controls, settings, f"sound_{slot}_volume")
 
         box = layout.box()
         box.operator("car_exporter.remove_configuration", icon="TRASH")
@@ -3690,6 +4361,7 @@ classes = (
     CAR_EXPORTER_UL_body_colors,
     CAR_EXPORTER_UL_presets,
     CAR_EXPORTER_OT_validate_car,
+    CAR_EXPORTER_OT_calculate_brake_force,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
     CAR_EXPORTER_OT_add_center_of_mass,
