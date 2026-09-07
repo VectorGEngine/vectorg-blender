@@ -158,11 +158,11 @@ Each preset wheel's `gripFactor` multiplies its pressure-derived grip;
 **Max Brake Force (kg)** is the equivalent braking force available at each
 wheel. Vehicle manifest version 8 exports this value in newtons using
 `kg * 9.81`; the engine converts that force to a timestep-scaled impulse.
-**Calculate Brake Force** estimates front and rear values that exceed peak tire
-grip by 15 percent at maximum speed on dry tarmac with ABS off. The estimate
-uses collider mass, wheel and center-of-mass positions, maximum downforce, tire
-pressure and grip, and brake bias. Existing numeric brake values are not
-converted when opening older Blender files.
+Each axle's **Estimate Brake Force** button estimates a value that exceeds peak
+tire grip by 15 percent at maximum speed on dry tarmac with ABS off. The estimate
+uses a grip coefficient of 1 along with collider mass, wheel and center-of-mass
+positions, maximum downforce, and brake bias. Existing numeric brake values are
+not converted when opening older Blender files.
 
 Caster is expressed in degrees. Positive caster tilts the top of the steering
 and suspension axis toward the rear of the car; negative caster tilts it toward

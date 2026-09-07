@@ -75,7 +75,6 @@ GUIDE_PROP = "car_exporter_helper"
 DOWNFORCE_HELPER_PROP = "vectorg_downforce_helper"
 NEWTONS_PER_KILOGRAM = 9.81
 BRAKE_LOCK_MARGIN = 1.15
-TARMAC_TIRE_PEAK_FRICTION = {"soft": 1.3, "medium": 1.2, "hard": 1.1}
 CENTER_OF_MASS_HELPER_PROP = "vectorg_center_of_mass_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 DEFAULT_MAX_TEXTURE_SIZE = 4096
@@ -180,19 +179,6 @@ def next_downforce_point_display_name(settings):
     return f"Downforce {index}"
 
 
-def pressure_grip_multiplier(pressure):
-    progress = min(max((pressure - 1.3) / (2.7 - 1.3), 0.0), 1.0)
-    return 1.0 + (0.7 - 1.0) * progress
-
-
-def preset_tarmac_grip(wheel):
-    return (
-        TARMAC_TIRE_PEAK_FRICTION[wheel.tire_type]
-        * pressure_grip_multiplier(wheel.pressure)
-        * wheel.grip_factor
-    )
-
-
 def calculate_max_speed_brake_force_kg(settings, preset):
     total_mass = sum(collider.mass for collider in settings.colliders)
     if total_mass <= 0.0:
@@ -242,8 +228,8 @@ def calculate_max_speed_brake_force_kg(settings, preset):
         front_load += force_kg * front_fraction
         rear_load += force_kg * (1.0 - front_fraction)
 
-    front_grip = preset_tarmac_grip(preset.front)
-    rear_grip = preset_tarmac_grip(preset.rear)
+    front_grip = 1.0
+    rear_grip = 1.0
     denominator = total_mass - total_mass * center_of_mass_height / wheelbase * (front_grip - rear_grip)
     if denominator <= 1.0e-4:
         raise ValueError("Vehicle geometry and tire grip produce an invalid brake-force estimate")
@@ -2638,11 +2624,16 @@ class CAR_EXPORTER_OT_validate_car(Operator):
         return {"FINISHED"}
 
 
-class CAR_EXPORTER_OT_calculate_brake_force(Operator):
-    bl_idname = "car_exporter.calculate_brake_force"
-    bl_label = "Calculate Brake Force"
+class CAR_EXPORTER_OT_estimate_brake_force(Operator):
+    bl_idname = "car_exporter.estimate_brake_force"
+    bl_label = "Estimate Brake Force"
     bl_description = "Estimate wheel-lock brake force at maximum speed on dry tarmac with ABS off"
     bl_options = {"REGISTER", "UNDO"}
+
+    axle: EnumProperty(
+        items=(("front", "Front", ""), ("rear", "Rear", "")),
+        options={"HIDDEN"},
+    )
 
     def execute(self, context):
         settings = scene_settings(context)
@@ -2650,18 +2641,18 @@ class CAR_EXPORTER_OT_calculate_brake_force(Operator):
         ensure_default_presets(settings)
         preset = active_preset(settings)
         if not preset:
-            self.report({"ERROR"}, "Add a car preset before calculating brake force")
+            self.report({"ERROR"}, "Add a car preset before estimating brake force")
             return {"CANCELLED"}
         try:
             front_kg, rear_kg, deceleration_g = calculate_max_speed_brake_force_kg(settings, preset)
         except ValueError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        preset.front.max_brake_force_kg = front_kg
-        preset.rear.max_brake_force_kg = rear_kg
+        force_kg = front_kg if self.axle == "front" else rear_kg
+        getattr(preset, self.axle).max_brake_force_kg = force_kg
         self.report(
             {"INFO"},
-            f"Brake force set to {front_kg:.0f} kg front and {rear_kg:.0f} kg rear ({deceleration_g:.2f} g estimate)",
+            f"{self.axle.title()} brake force set to {force_kg:.0f} kg ({deceleration_g:.2f} g estimate)",
         )
         return {"FINISHED"}
 
@@ -4140,7 +4131,6 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "esc_level")
     draw_split_prop(layout, preset, "traction_control_level")
     draw_split_prop(layout, preset, "brake_bias")
-    layout.operator("car_exporter.calculate_brake_force", icon="DRIVER_DISTANCE")
 
     gearing_box = layout.box()
     gearing_box.label(text="Gearing")
@@ -4163,7 +4153,13 @@ def draw_presets(layout, settings):
         draw_split_prop(axle_box, wheel, "suspension_stiffness")
         draw_split_prop(axle_box, wheel, "damping_relaxation")
         draw_split_prop(axle_box, wheel, "damping_compression")
-        draw_split_prop(axle_box, wheel, "max_brake_force_kg")
+        brake_row = axle_box.row(align=True)
+        brake_split = brake_row.split(factor=0.4, align=True)
+        brake_split.label(text=wheel.bl_rna.properties["max_brake_force_kg"].name)
+        brake_value = brake_split.row(align=True)
+        brake_value.prop(wheel, "max_brake_force_kg", text="")
+        estimate = brake_value.operator("car_exporter.estimate_brake_force", text="", icon="FILE_REFRESH")
+        estimate.axle = group
         draw_split_prop(axle_box, wheel, "grip_factor")
 
 
@@ -4361,7 +4357,7 @@ classes = (
     CAR_EXPORTER_UL_body_colors,
     CAR_EXPORTER_UL_presets,
     CAR_EXPORTER_OT_validate_car,
-    CAR_EXPORTER_OT_calculate_brake_force,
+    CAR_EXPORTER_OT_estimate_brake_force,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
     CAR_EXPORTER_OT_add_center_of_mass,
