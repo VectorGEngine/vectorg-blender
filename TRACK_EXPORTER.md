@@ -8,6 +8,7 @@ manifest.json
 hdr/env.hdr or hdr/env.exr
 maps/<layout_id>.svg
 routes/<layout_id>.json
+ideal-lines/<layout_id>.json (when an Ideal Line is assigned)
 ```
 
 Install or enable `vectorg-blender/addons/vectorg_track_exporter` the same way as the
@@ -79,9 +80,9 @@ The route file also stores the projected distance of the start, finish, and
 checkpoint events. Circular routes are rebased so the start/finish event is
 distance zero. Point-to-point start and finish events must project within 10
 metres of their respective curve endpoints. Freeform routes keep the curve's
-natural first point as distance zero and require no race events. Every race
-event that is present must be within 30 metres of the route, and checkpoint
-distance must increase in checkpoint order.
+natural first point as distance zero and require no race events. Race events
+are projected onto the route without a distance cap. Checkpoint distance must
+increase in checkpoint order.
 
 SVG maps automatically rotate their principal axis horizontally unless the
 layout is nearly square. Draw the curve in driving direction. Circular layouts
@@ -185,3 +186,81 @@ in the GLB and must be hidden by the runtime after physics creation.
 
 Removing a layout from the addon only removes its configuration entry. It does
 not delete Blender objects.
+
+## Editable ideal line
+
+In a layout's **Ideal Line** section, set **Road Width (m)** (default 10) and
+**Edge Clearance (m)** (default 1.5), then click **Generate Ideal Line** in Object
+Mode. Clearance is measured from the line to each road edge: include half the
+reference vehicle width plus a safety margin. The defaults allow offsets of
+3.5 m either side of a centered Map Curve. Width is a constant authoring
+assumption; verify narrow sections and off-center map curves yourself.
+
+Generation minimizes a discrete integrated squared-curvature objective inside
+that corridor using internal points about 6 m apart. It then fits a simpler
+editable 3D Bezier curve, removing unnecessary controls on straights and keeping
+more around bends and elevation changes. The fitted curve stays within 0.1 m
+of the dense generated curve, preserving open endpoints and tangent continuity
+through joins and the closed seam. Export sampling remains independent of the
+number of editable controls. Generation preserves route elevation and banking
+and attempts to place controls on static collision surfaces. It is a suggested geometric line, not a
+vehicle-specific minimum-time solution. A warning identifies an unfinished
+optimization or points that could not be placed on a surface.
+
+The selected curve is assigned to **Ideal Line** and parented directly under
+the layout's existing MAP node:
+
+```text
+layout_gp
+  gp_MAP
+    gp_map_curve
+    gp_ideal_line
+```
+
+Use Edit Mode to adjust its control points and handles. You can also assign an
+existing Bezier or Poly curve in the Ideal Line picker; parenting preserves its
+world transform. A Map Curve cannot also be an Ideal Line, and an ideal-line
+object belongs to only one layout. Layout renaming includes the ideal line.
+
+**Circular** layouts require a closed spline; **Point to Point** layouts require
+an open spline. **Freeform** uses the Map Curve's open/closed state. Generation
+pins the endpoints of open lines. Curves must contain exactly one supported
+spline, follow the route's driving direction, and have modifiers applied.
+
+Changing width or clearance does not alter an existing curve. **Regenerate Ideal
+Line** explicitly replaces its shape and supports Blender Undo. Export never
+regenerates the line and never modifies your control points.
+
+At export, samples are projected along **world Z**, choosing the nearest static
+road collision surface above or below the curve within **Surface Search (m)**
+(default 2 m in each direction). Only surface-group meshes in Shared and the
+selected layout are considered; obstacle meshes and other layouts are excluded.
+This handles edits slightly above or below the road. Keep the search distance
+small around bridges: the nearest eligible surface is chosen, not a semantic
+guess about which road level you intended. Missing hits fail validation/export.
+Normals are oriented upwards, and near-vertical faces are rejected.
+
+Distances and orientation frames are calculated after projection, including any
+new start/finish seam sample. Circular lines start at their projected start/finish
+event; open lines retain both endpoints. The original map, route, and declared
+layout length continue to use the Map Curve. Samples outside the assumed lateral
+corridor produce warnings so hand corrections can accommodate local road widths.
+
+The layout manifest gains `idealLine: "ideal-lines/<layout_id>.json"`. The
+separate file has `version: 1`, `closed`, `length`, `maxSpacing`,
+`frame: "surface_normal"`, `roadWidth`, `edgeClearance`, `referenceRoute`,
+`samples`, and projected `events`. Samples contain `s`, `position`, `forward`,
+`up`, and `routeS` (distance on the original route, which can wrap at its seam).
+Coordinates use the existing Blender-to-game conversion and distances are in
+metres. `up` is the hit normal orthogonalized against the sampled line tangent.
+Generated curves also carry the last explicit generation settings in `generation`.
+Neither speed targets nor colors are baked into this file. The MAP hierarchy,
+including the preview curve, remains excluded from the GLB. Player ribbon
+rendering is a subsequent game change.
+
+Validation commands from the repository root:
+
+```text
+python -m unittest discover -s tests -v
+blender --background --factory-startup --python-exit-code 1 --python tests/test_surface_refresh.py -- --blender
+```

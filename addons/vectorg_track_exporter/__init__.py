@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 4, 2),
+    "version": (0, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -21,6 +21,8 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ExportHelper
 from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
+from mathutils.kdtree import KDTree
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -61,7 +63,6 @@ DYNAMIC_COLLIDER_DENSITY = 10.0
 ROUTE_MAX_SPACING = 5.0
 ROUTE_MAX_ANGLE_DEGREES = 5.0
 ROUTE_MAX_CURVE_ERROR = 0.05
-ROUTE_EVENT_MAX_DISTANCE = 30.0
 ROUTE_ENDPOINT_MAX_DISTANCE = 10.0
 ROUTE_EPSILON = 1e-6
 MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
@@ -114,6 +115,10 @@ def hdr_image_poll(_settings, image):
 
 def curve_object_poll(_settings, obj):
     return obj.type == "CURVE"
+
+
+def ideal_line_poll(layout, obj):
+    return obj.type == "CURVE" and obj != layout.map_curve
 
 
 def is_in_tree(root, obj):
@@ -341,6 +346,8 @@ def sync_layout_node_names(layout, validate_only=False):
         name_map[obj] = f"{layout_id}_dynamic_box_{index:02d}"
     if layout.map_curve:
         name_map[layout.map_curve] = f"{layout_id}_map_curve"
+    if layout.ideal_line:
+        name_map[layout.ideal_line] = f"{layout_id}_ideal_line"
 
     if not validate_only:
         for obj in [root, *descendants(root)]:
@@ -367,6 +374,8 @@ def update_map_curve(layout, context):
         return
     settings = scene_settings(context)
     for other_layout in settings.layouts:
+        if other_layout.ideal_line == curve:
+            other_layout.ideal_line = None
         if other_layout.as_pointer() != layout.as_pointer() and other_layout.map_curve == curve:
             other_layout.map_curve = None
     map_root = direct_child_with_role(layout.root_object, ROLE_MAP)
@@ -377,6 +386,28 @@ def update_map_curve(layout, context):
     curve.matrix_world = world_matrix
     sync_layout_node_names(layout)
     update_layout_length(layout)
+    select_only(context, curve)
+
+
+def update_ideal_line(layout, context):
+    curve = layout.ideal_line
+    if not curve or not layout.root_object:
+        return
+    settings = scene_settings(context)
+    # A reference route must never be repurposed or modified by generation.
+    if any(other.map_curve == curve for other in settings.layouts):
+        layout.ideal_line = None
+        return
+    for other in settings.layouts:
+        if other.as_pointer() != layout.as_pointer() and other.ideal_line == curve:
+            other.ideal_line = None
+    map_root = direct_child_with_role(layout.root_object, ROLE_MAP)
+    if not map_root:
+        map_root = create_empty(context, f"{layout.layout_id}_MAP", layout.root_object, ROLE_MAP)
+    world_matrix = curve.matrix_world.copy()
+    curve.parent = map_root
+    curve.matrix_world = world_matrix
+    sync_layout_node_names(layout)
     select_only(context, curve)
 
 
@@ -1255,6 +1286,8 @@ def rebase_closed_route(samples, position):
         "position": projection["point"],
         "tilt": start["tilt"] + (end["tilt"] - start["tilt"]) * amount,
     }
+    if "normal" in start and "normal" in end:
+        seam["normal"] = start["normal"].lerp(end["normal"], amount).normalized()
     return [seam] + samples[next_index:] + samples[:next_index]
 
 
@@ -1361,12 +1394,6 @@ def route_event_data(layout, samples, closed, cumulative, total):
         projection = closest_route_position(samples, closed, obj.matrix_world.translation)
         if not projection:
             raise ValueError(f"cannot project event {obj.name} onto the route")
-        distance = math.sqrt(projection["distanceSquared"])
-        if distance > ROUTE_EVENT_MAX_DISTANCE:
-            raise ValueError(
-                f"event {obj.name} is {distance:.2f} m from the route; "
-                f"maximum is {ROUTE_EVENT_MAX_DISTANCE:.0f} m"
-            )
         segment = projection["segment"]
         next_index = (segment + 1) % len(samples)
         segment_length = (
@@ -1416,8 +1443,9 @@ def validate_route_events(layout, events, total):
             )
 
 
-def layout_route_data(layout):
-    samples, closed = adaptive_route_samples(layout.map_curve)
+def layout_route_data(layout, curve=None, sampled=None, surface_projector=None):
+    curve = curve if curve is not None else layout.map_curve
+    samples, closed = sampled if sampled is not None else adaptive_route_samples(curve)
     if len(samples) < 2:
         raise ValueError("must contain at least two route samples")
 
@@ -1433,21 +1461,30 @@ def layout_route_data(layout):
             raise ValueError("needs a start/finish event to define route distance zero")
         samples = rebase_closed_route(samples, start_finish.matrix_world.translation)
 
+    if surface_projector is not None:
+        # The start/finish rebase can insert a new interpolated point; it too
+        # must be on the collision surface before computing lengths or frames.
+        samples = surface_projector(samples)
     cumulative, total = route_distances(samples, closed)
-    reference_up = layout.map_curve.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
+    reference_up = curve.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
     if reference_up.length_squared <= ROUTE_EPSILON:
         raise ValueError("map curve has an invalid world up axis")
     frames = route_frames(samples, closed, cumulative, total, reference_up.normalized())
+    surface_frames = all("normal" in sample for sample in samples)
+    if surface_frames:
+        for sample, frame in zip(samples, frames):
+            frame["up"] = projected_up(sample["normal"], frame["forward"])
     events = route_event_data(layout, samples, closed, cumulative, total)
     validate_route_events(layout, events, total)
-    layout.length = total / 1000.0
+    if curve == layout.map_curve:
+        layout.length = total / 1000.0
 
     return {
         "version": 2,
         "closed": closed,
         "length": round(total, 6),
         "maxSpacing": ROUTE_MAX_SPACING,
-        "frame": "parallel_transport",
+        "frame": "surface_normal" if surface_frames else "parallel_transport",
         "samples": [
             {
                 "s": round(cumulative[index], 6),
@@ -1459,6 +1496,503 @@ def layout_route_data(layout):
         ],
         "events": events,
     }
+
+
+def ideal_sub(a, b):
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def ideal_dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def ideal_length(a):
+    return math.sqrt(ideal_dot(a, a))
+
+
+def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000):
+    if len(points) < (3 if closed else 2) or len(points) != len(tilts):
+        raise ValueError("Route needs at least three closed or two open points")
+    if not all(math.isfinite(v) for p in points for v in p) or not all(map(math.isfinite, tilts)):
+        raise ValueError("Route contains non-finite coordinates or tilt")
+    spans = [ideal_length(ideal_sub(points[(i + 1) % len(points)], p))
+             for i, p in enumerate(points[:len(points) if closed else -1])]
+    if any(span <= 1e-6 for span in spans):
+        raise ValueError("Route contains duplicate consecutive points")
+    total = sum(spans)
+    segments = max(3 if closed else 1, math.ceil(total / spacing))
+    count = segments if closed else segments + 1
+    if count > max_points:
+        raise ValueError(f"Route needs more than {max_points} planning points")
+    result, result_tilts = [], []
+    segment, start = 0, 0.0
+    for i in range(count):
+        distance = total * i / segments
+        while segment < len(spans) - 1 and start + spans[segment] < distance:
+            start += spans[segment]
+            segment += 1
+        t = min(1.0, (distance - start) / spans[segment])
+        end = (segment + 1) % len(points)
+        result.append(tuple(a + (b - a) * t for a, b in zip(points[segment], points[end])))
+        result_tilts.append(tilts[segment] + (tilts[end] - tilts[segment]) * t)
+    return result, result_tilts
+
+
+def ideal_curvature_energy_gradient(points, rights, closed):
+    """Squared change of unit tangent / local arc length, with analytic gradient."""
+    count = len(points)
+    gradient = [0.0] * count
+    energy = 0.0
+    for i in range(count) if closed else range(1, count - 1):
+        prev, following = (i - 1) % count, (i + 1) % count
+        a, b = ideal_sub(points[i], points[prev]), ideal_sub(points[following], points[i])
+        la, lb = ideal_length(a), ideal_length(b)
+        if min(la, lb) <= 1e-6:
+            return math.inf, gradient
+        u, v = tuple(x / la for x in a), tuple(x / lb for x in b)
+        h = la + lb
+        uv = ideal_dot(u, v)
+        q = ideal_dot(ideal_sub(v, u), ideal_sub(v, u))
+        energy += 2.0 * q / h
+        ga = tuple(-4.0 * (y - x * uv) / (h * la) - 2.0 * q * x / (h * h)
+                   for x, y in zip(u, v))
+        gb = tuple(-4.0 * (x - y * uv) / (h * lb) - 2.0 * q * y / (h * h)
+                   for x, y in zip(u, v))
+        gradient[prev] -= ideal_dot(ga, rights[prev])
+        gradient[i] += ideal_dot(ideal_sub(ga, gb), rights[i])
+        gradient[following] += ideal_dot(gb, rights[following])
+    return energy, gradient
+
+
+def ideal_optimize_offsets(centers, rights, closed, limit, max_iterations=400):
+    """Projected L-BFGS with bounded line search and pinned open endpoints.
+
+    Returns (positions, offsets, converged). A bounded, improved result may be
+    returned with converged=False, which callers must report to the artist.
+    """
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("Edge clearance must leave space inside the road width")
+    if len(centers) != len(rights) or len(centers) < (3 if closed else 2):
+        raise ValueError("Invalid planning frames")
+    if not all(math.isfinite(v) for p in [*centers, *rights] for v in p):
+        raise ValueError("Planning frames contain non-finite coordinates")
+    count = len(centers)
+    bounds = [limit] * count
+    if not closed:
+        bounds[0] = bounds[-1] = 0.0
+
+    def positions(offsets):
+        return [tuple(c + r * offset for c, r in zip(center, right))
+                for center, right, offset in zip(centers, rights, offsets)]
+
+    x = [0.0] * count
+    cost, gradient = ideal_curvature_energy_gradient(centers, rights, closed)
+    history = []
+    spacing = sum(ideal_length(ideal_sub(centers[i], centers[i - 1])) for i in range(1, count)) / (count - 1)
+    initial_scale = max(1.0, spacing ** 3 / 16.0)
+    for _iteration in range(max_iterations):
+        projected = [g if (g > 0 and value > -bound + 1e-8)
+                     or (g < 0 and value < bound - 1e-8) else 0.0
+                     for value, g, bound in zip(x, gradient, bounds)]
+        if max(map(abs, projected)) < 1e-7:
+            return positions(x), x, True
+        q = list(projected)
+        alphas = []
+        for s, y, rho in reversed(history):
+            alpha = rho * ideal_dot(s, q)
+            alphas.append(alpha)
+            q = [a - alpha * b for a, b in zip(q, y)]
+        scale = initial_scale
+        if history:
+            s, y, _rho = history[-1]
+            scale = ideal_dot(s, y) / max(ideal_dot(y, y), 1e-20)
+        direction = [scale * value for value in q]
+        for (s, y, rho), alpha in zip(history, reversed(alphas)):
+            beta = rho * ideal_dot(y, direction)
+            direction = [a + b * (alpha - beta) for a, b in zip(direction, s)]
+        direction = [-d if p != 0.0 else 0.0 for d, p in zip(direction, projected)]
+        if ideal_dot(direction, gradient) >= 0:
+            direction = [-initial_scale * g for g in projected]
+            history.clear()
+        step = 1.0
+        for _attempt in range(24):
+            candidate = [max(-bound, min(bound, value + step * delta))
+                         for value, delta, bound in zip(x, direction, bounds)]
+            change = ideal_sub(candidate, x)
+            next_cost, next_gradient = ideal_curvature_energy_gradient(positions(candidate), rights, closed)
+            if ideal_dot(gradient, change) < 0 and next_cost <= cost + 1e-4 * ideal_dot(gradient, change):
+                break
+            step *= 0.5
+        else:
+            return positions(x), x, False
+        y = ideal_sub(next_gradient, gradient)
+        sy = ideal_dot(change, y)
+        if sy > 1e-12:
+            history.append((change, y, 1.0 / sy))
+            history = history[-8:]
+        x, cost, gradient = candidate, next_cost, next_gradient
+    return positions(x), x, False
+
+
+def ideal_bezier_handles(points, closed):
+    """Editable cubic interpolation; callers validate the curve after fitting."""
+    result = []
+    count = len(points)
+    for i, point in enumerate(points):
+        before = points[(i - 1) % count] if closed or i else point
+        after = points[(i + 1) % count] if closed or i < count - 1 else point
+        tangent = ideal_sub(after, before)
+        magnitude = ideal_length(tangent)
+        tangent = tuple(x / magnitude for x in tangent) if magnitude > 1e-9 else (0, 0, 0)
+        left_span = ideal_length(ideal_sub(point, before)) / 3.0
+        right_span = ideal_length(ideal_sub(after, point)) / 3.0
+        result.append((tuple(x - t * left_span for x, t in zip(point, tangent)),
+                       tuple(x + t * right_span for x, t in zip(point, tangent))))
+    return result
+
+
+def ideal_bezier_value(curve, t):
+    weights = ((1 - t) ** 3, 3 * t * (1 - t) ** 2, 3 * t * t * (1 - t), t ** 3)
+    return tuple(sum(weight * point[axis] for weight, point in zip(weights, curve)) for axis in range(3))
+
+
+def ideal_bezier_split(curve, t):
+    levels = [curve]
+    for _ in range(3):
+        levels.append([tuple(a + (b - a) * t for a, b in zip(start, end))
+                       for start, end in zip(levels[-1], levels[-1][1:])])
+    return [level[0] for level in levels], [level[-1] for level in reversed(levels)]
+
+
+def ideal_fit_editable_curve(points, closed, tolerance=0.1):
+    """Fit fewer controls to the dense cubic line with a 3D error bound.
+
+    Endpoint tangent directions stay fixed, including across the closed seam.
+    Comparing corresponding Bezier control polygons bounds the error over the
+    entire span, not just at sampled points. Failed fits split until the original
+    dense segment is reached, which is retained exactly.
+    """
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Curve fitting tolerance must be positive")
+    count = len(points)
+    if count < (3 if closed else 2):
+        raise ValueError("Too few points to fit an editable curve")
+    points = [tuple(point) for point in points]
+    handles = ideal_bezier_handles(points, closed)
+    segment_count = count if closed else count - 1
+    dense = [(points[i], handles[i][1], handles[(i + 1) % count][0], points[(i + 1) % count])
+             for i in range(segment_count)]
+    cumulative = [0.0]
+    for curve in dense:
+        span = ideal_length(ideal_sub(curve[-1], curve[0]))
+        if span <= 1e-6:
+            raise ValueError("Cannot fit duplicate consecutive points")
+        cumulative.append(cumulative[-1] + span)
+
+    def fit(start, end):
+        p0, p3 = points[start], points[end % count]
+        forward = ideal_sub(handles[start][1], p0)
+        backward = ideal_sub(handles[end % count][0], p3)
+        forward = tuple(v / max(ideal_length(forward), 1e-12) for v in forward)
+        backward = tuple(v / max(ideal_length(backward), 1e-12) for v in backward)
+        span = cumulative[end] - cumulative[start]
+        c00 = c01 = c11 = x0 = x1 = 0.0
+        for index in range(start, end):
+            for amount in (0.0, 0.5):
+                t = (cumulative[index] - cumulative[start]
+                     + amount * (cumulative[index + 1] - cumulative[index])) / span
+                b1, b2 = 3 * t * (1 - t) ** 2, 3 * t * t * (1 - t)
+                a = tuple(v * b1 for v in forward)
+                b = tuple(v * b2 for v in backward)
+                base = tuple(u * ((1 - t) ** 3 + b1) + v * (t ** 3 + b2) for u, v in zip(p0, p3))
+                residual = ideal_sub(ideal_bezier_value(dense[index], amount), base)
+                c00 += ideal_dot(a, a)
+                c01 += ideal_dot(a, b)
+                c11 += ideal_dot(b, b)
+                x0 += ideal_dot(a, residual)
+                x1 += ideal_dot(b, residual)
+        determinant = c00 * c11 - c01 * c01
+        alpha = (x0 * c11 - x1 * c01) / determinant if determinant > 1e-12 else span / 3
+        beta = (c00 * x1 - c01 * x0) / determinant if determinant > 1e-12 else span / 3
+        if min(alpha, beta) <= 1e-6 or max(alpha, beta) > span:
+            alpha = beta = span / 3
+        return (p0, tuple(v + alpha * t for v, t in zip(p0, forward)),
+                tuple(v + beta * t for v, t in zip(p3, backward)), p3)
+
+    def within_tolerance(curve, start, end):
+        span = cumulative[end] - cumulative[start]
+        for index in range(start, end):
+            t0 = (cumulative[index] - cumulative[start]) / span
+            t1 = (cumulative[index + 1] - cumulative[start]) / span
+            left, _right = ideal_bezier_split(curve, t1)
+            _left, restricted = ideal_bezier_split(left, t0 / t1)
+            if any(ideal_length(ideal_sub(a, b)) > tolerance for a, b in zip(restricted, dense[index])):
+                return False
+        return True
+
+    # Closed curves need several anchors before fitting to avoid coincident
+    # endpoints and preserve a valid cyclic spline even on very small loops.
+    seeds = sorted({i * count // 4 for i in range(4)} | {count}) if closed else [0, count - 1]
+    pending = list(zip(seeds, seeds[1:]))
+    fitted = []
+    while pending:
+        start, end = pending.pop()
+        curve = dense[start] if end == start + 1 else fit(start, end)
+        if end == start + 1 or within_tolerance(curve, start, end):
+            fitted.append((start, end, curve))
+        else:
+            middle = (start + end) // 2
+            pending.extend(((start, middle), (middle, end)))
+    fitted.sort(key=lambda item: item[0])
+    indices = [start for start, _end, _curve in fitted]
+    if not closed:
+        indices.append(count - 1)
+    result = {index: list(handles[index]) for index in indices}
+    for start, end, curve in fitted:
+        result[start][1] = curve[1]
+        result[end % count][0] = curve[2]
+    return indices, [tuple(result[index]) for index in indices]
+
+
+def checked_curve_samples(curve, route_type):
+    if not curve or curve.type != "CURVE" or len(curve.data.splines) != 1:
+        raise ValueError("needs exactly one curve spline")
+    spline = curve.data.splines[0]
+    if spline.type not in {"BEZIER", "POLY"}:
+        raise ValueError("only supports Bezier or Poly splines")
+    if route_type == "circular" and not spline.use_cyclic_u:
+        raise ValueError("must be cyclic for a circular layout")
+    if route_type == "point_to_point" and spline.use_cyclic_u:
+        raise ValueError("must be open for a point-to-point layout")
+    if curve.modifiers:
+        raise ValueError("must have modifiers applied before sampling")
+    samples, closed = adaptive_route_samples(curve)
+    if len(samples) < (3 if closed else 2):
+        raise ValueError("has too few distinct points")
+    if not all(math.isfinite(v) for sample in samples for v in (*sample["position"], sample["tilt"])):
+        raise ValueError("contains non-finite coordinates or tilt")
+    route_distances(samples, closed)
+    return samples, closed
+
+
+def ideal_line_limit(layout):
+    width, clearance = layout.ideal_line_road_width, layout.ideal_line_edge_clearance
+    if not math.isfinite(width) or not math.isfinite(clearance) or width <= 0 or clearance < 0:
+        raise ValueError("Road width must be positive and edge clearance non-negative")
+    limit = width * 0.5 - clearance
+    if limit <= 0:
+        raise ValueError("Edge clearance must be smaller than half the road width")
+    return limit
+
+
+def route_projection_index(route_data):
+    points = [Vector(sample["position"]) for sample in route_data["samples"]]
+    tree = KDTree(len(points))
+    for index, point in enumerate(points):
+        tree.insert(point, index)
+    tree.balance()
+    return points, tree
+
+
+def project_ideal_samples(route_data, samples):
+    """Project in game coordinates, retaining local continuity at crossings."""
+    points, tree = route_projection_index(route_data)
+    count = len(points)
+    segments = count if route_data["closed"] else count - 1
+    previous_segment = None
+    previous_position = None
+    projections = []
+    for sample in samples:
+        position = Vector(sample["position"])
+        if previous_segment is None:
+            candidates = set()
+            for _point, index, _distance in tree.find_n(position, min(8, count)):
+                for candidate in (index - 1, index):
+                    if route_data["closed"]:
+                        candidate %= segments
+                    if 0 <= candidate < segments:
+                        candidates.add(candidate)
+        else:
+            # Adaptive sampling can put hundreds of route vertices into one
+            # bend. Search by physical distance rather than a vertex count.
+            step = (position - previous_position).length
+            candidates = {previous_segment}
+            for direction, reach in ((-1, max(10.0, step * 3)), (1, max(30.0, step * 3))):
+                travelled = 0.0
+                index = previous_segment
+                for _ in range(segments - 1):
+                    index += direction
+                    if route_data["closed"]:
+                        index %= segments
+                    elif not 0 <= index < segments:
+                        break
+                    candidates.add(index)
+                    travelled += (points[(index + 1) % count] - points[index]).length
+                    if travelled >= reach:
+                        break
+        best = None
+        for index in sorted(candidates):
+            end = (index + 1) % count
+            delta = points[end] - points[index]
+            if delta.length_squared < 1e-12:
+                continue
+            amount = max(0.0, min(1.0, (position - points[index]).dot(delta) / delta.length_squared))
+            point = points[index] + delta * amount
+            distance = (position - point).length_squared
+            if best is None or distance < best[0]:
+                start_s = route_data["samples"][index]["s"]
+                end_s = route_data["length"] if end == 0 else route_data["samples"][end]["s"]
+                best = distance, index, start_s + (end_s - start_s) * amount, point, delta.normalized()
+        if best is None:
+            raise ValueError("reference route has no distinct segment near the ideal line")
+        _distance, previous_segment, route_s, point, forward = best
+        previous_position = position
+        up = Vector(route_data["samples"][previous_segment]["up"])
+        right = up.cross(forward).normalized()
+        offset = position - point
+        projections.append((route_s % route_data["length"] if route_data["closed"] else route_s,
+                            offset.dot(right), offset.dot(up), forward))
+    return projections
+
+
+def layout_ideal_line_data(layout, context):
+    if not layout.map_curve:
+        raise ValueError("requires a map curve")
+    if layout.ideal_line == layout.map_curve:
+        raise ValueError("must be a separate object from the map curve")
+    samples, closed = checked_curve_samples(layout.ideal_line, layout.route_type)
+    checked_curve_samples(layout.map_curve, layout.route_type)
+    limit = ideal_line_limit(layout)
+    tree = ideal_line_surface_tree(context, layout)
+    if tree is None:
+        raise ValueError("has no static road collision meshes to project onto")
+    samples = project_ideal_line_to_surface(samples, tree, layout.ideal_line_snap_distance)
+    reference = layout_route_data(layout)
+    data = layout_route_data(layout, layout.ideal_line, (samples, closed),
+                            lambda values: project_ideal_line_to_surface(values, tree, layout.ideal_line_snap_distance))
+    if data["closed"] != reference["closed"]:
+        raise ValueError("must have the same open/closed state as the map curve")
+    projections = project_ideal_samples(reference, data["samples"])
+    outside, displaced = 0, 0
+    for sample, (route_s, lateral, vertical, forward) in zip(data["samples"], projections):
+        if Vector(sample["forward"]).dot(forward) <= 0:
+            raise ValueError("must follow the map curve's driving direction without reversing")
+        sample["routeS"] = round(route_s, 6)
+        outside += abs(lateral) > limit + 0.05
+        displaced += abs(vertical) > 1.0
+    warnings = []
+    if outside:
+        warnings.append(f"{outside} ideal-line samples exceed the assumed width/clearance; review the edited line")
+    if displaced:
+        warnings.append(f"{displaced} ideal-line samples are over 1 m from the route surface frame; check road placement")
+    data["version"] = 1
+    data["roadWidth"] = layout.ideal_line_road_width
+    data["edgeClearance"] = layout.ideal_line_edge_clearance
+    data["referenceRoute"] = f"routes/{layout.layout_id}.json"
+    # Generation settings on the object describe its last explicit generation,
+    # while roadWidth/edgeClearance describe the artist's current corridor.
+    generated = layout.ideal_line.get("vectorg_ideal_line_generation")
+    if generated:
+        data["generation"] = json.loads(generated)
+    return data, warnings
+
+
+def project_ideal_line_to_surface(samples, tree, distance):
+    """World-Z projection affects exported samples only, never Blender objects."""
+    if not math.isfinite(distance) or distance <= 0:
+        raise ValueError("Surface search distance must be positive")
+    result = []
+    for index, sample in enumerate(samples):
+        hits = []
+        for direction in (Vector((0, 0, 1)), Vector((0, 0, -1))):
+            hit, normal, _face, hit_distance = tree.ray_cast(sample["position"], direction, distance)
+            # Reject near-vertical faces. Collision face winding may be reversed,
+            # so orient normals upwards. Only designated surface meshes are used.
+            if hit is not None and abs(normal.z) >= 0.1:
+                if normal.z < 0:
+                    normal = -normal
+                hits.append((hit_distance, hit, normal))
+        if not hits:
+            raise ValueError(f"sample {index} has no road collision surface within {distance:g} m above or below it")
+        _distance, point, normal = min(hits, key=lambda hit: hit[0])
+        result.append({**sample, "position": point, "normal": normal.normalized()})
+    return result
+
+
+def ideal_line_surface_tree(context, layout):
+    """Static surface meshes only; never snap to props, cars or other layouts."""
+    settings = scene_settings(context)
+    depsgraph = context.evaluated_depsgraph_get()
+    vertices, polygons = [], []
+    for root in (settings.shared_root_object, layout.root_object):
+        collisions = object_with_role(root, ROLE_COLLISIONS)
+        for group in descendants_with_role(collisions, ROLE_SURFACE):
+            for obj in descendants(group):
+                if obj.type != "MESH" or obj.get("vectorg_body") == "dynamic":
+                    continue
+                evaluated = obj.evaluated_get(depsgraph)
+                mesh = evaluated.to_mesh()
+                try:
+                    offset = len(vertices)
+                    vertices.extend(evaluated.matrix_world @ vertex.co for vertex in mesh.vertices)
+                    polygons.extend(tuple(offset + index for index in polygon.vertices) for polygon in mesh.polygons)
+                finally:
+                    evaluated.to_mesh_clear()
+    return BVHTree.FromPolygons(vertices, polygons) if polygons else None
+
+
+def snap_ideal_point(tree, point, up):
+    if tree:
+        hit, normal, _index, _distance = tree.ray_cast(point + up * 2.0, -up, 4.0)
+        if hit is not None and abs(normal.dot(up)) >= 0.5:
+            if normal.dot(up) < 0:
+                normal.negate()
+            return hit, normal, True
+    return point, up, False
+
+
+def generate_ideal_line(context, layout):
+    limit = ideal_line_limit(layout)
+    samples, closed = checked_curve_samples(layout.map_curve, layout.route_type)
+    centers, tilts = ideal_resample([tuple(s["position"]) for s in samples], [s["tilt"] for s in samples], closed)
+    planning = [{"position": Vector(p), "tilt": tilt} for p, tilt in zip(centers, tilts)]
+    cumulative, total = route_distances(planning, closed)
+    reference_up = layout.map_curve.matrix_world.to_3x3() @ Vector((0, 0, 1))
+    frames = route_frames(planning, closed, cumulative, total, reference_up)
+    rights = [tuple(frame["up"].cross(frame["forward"]).normalized()) for frame in frames]
+    # Leave a little room for cubic interpolation between control points.
+    points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, max(0.0, limit - 0.15))
+    tree = ideal_line_surface_tree(context, layout)
+    surface_points, normals, missed = [], [], 0
+    for point, frame in zip(points, frames):
+        point, normal, hit = snap_ideal_point(tree, Vector(point), frame["up"])
+        surface_points.append(point)
+        normals.append(normal)
+        missed += not hit
+    unbanked = [{"position": point, "tilt": 0.0} for point in surface_points]
+    cumulative, total = route_distances(unbanked, closed)
+    frames = route_frames(unbanked, closed, cumulative, total, Vector((0, 0, 1)))
+    indices, handles = ideal_fit_editable_curve(surface_points, closed)
+    data = bpy.data.curves.new(f"{layout.layout_id}_ideal_line", "CURVE")
+    data.dimensions = "3D"
+    data.resolution_u = 12
+    data.bevel_depth = 0.06
+    data.bevel_resolution = 0
+    spline = data.splines.new("BEZIER")
+    spline.bezier_points.add(len(indices) - 1)
+    spline.use_cyclic_u = closed
+    for bp, index, (left, right) in zip(spline.bezier_points, indices, handles):
+        point, frame, normal = surface_points[index], frames[index], normals[index]
+        bp.co = point
+        bp.handle_left_type = bp.handle_right_type = "FREE"
+        bp.handle_left, bp.handle_right = left, right
+        bp.tilt = signed_angle_around_axis(frame["up"], projected_up(normal, frame["forward"]), frame["forward"])
+    warnings = []
+    if not converged:
+        warnings.append("Optimization reached its stopping limit; inspect the suggested line")
+    if missed:
+        warnings.append(f"{missed} points could not be snapped to a road surface; inspect height before export")
+    return data, warnings, converged
 
 
 def build_manifest(settings):
@@ -1496,6 +2030,8 @@ def build_manifest(settings):
         if layout.map_curve:
             layout_config["map"] = f"maps/{layout.layout_id}.svg"
             layout_config["route"] = f"routes/{layout.layout_id}.json"
+        if layout.ideal_line:
+            layout_config["idealLine"] = f"ideal-lines/{layout.layout_id}.json"
         layouts.append(layout_config)
 
     config = {
@@ -1864,7 +2400,7 @@ def validate_box_parent_transform(errors, obj, label):
         current = current.parent
 
 
-def validate_scene(settings):
+def validate_scene(settings, context):
     errors = []
     warnings = []
     track_root = settings.track_root_object
@@ -1924,6 +2460,7 @@ def validate_scene(settings):
     layout_ids = set()
     layout_roots = set()
     layout_map_curves = set()
+    layout_ideal_lines = set()
     for index, layout in enumerate(settings.layouts, start=1):
         layout_name = layout.display_name.strip() or layout.layout_id or f"Layout {index}"
         label = f"{layout_name} layout"
@@ -2031,6 +2568,19 @@ def validate_scene(settings):
                 layout_route_data(layout)
             except ValueError as error:
                 errors.append(f"{label} route {error}")
+        if layout.ideal_line:
+            if layout.ideal_line in layout_ideal_lines:
+                errors.append(f"{label} shares its ideal line with another layout")
+            layout_ideal_lines.add(layout.ideal_line)
+            if any(other.map_curve == layout.ideal_line for other in settings.layouts):
+                errors.append(f"{label} ideal line is also used as a map curve")
+            if map_root and layout.ideal_line.parent != map_root:
+                errors.append(f"{label} ideal line must be directly under its MAP node")
+            try:
+                _data, line_warnings = layout_ideal_line_data(layout, context)
+                warnings.extend(f"{label}: {warning}" for warning in line_warnings)
+            except (ValueError, RuntimeError) as error:
+                errors.append(f"{label} ideal line {error}")
 
     if settings.shared_root_object:
         shared_visuals = object_with_role(settings.shared_root_object, ROLE_VISUALS)
@@ -2140,6 +2690,23 @@ class TrackLayoutSettings(PropertyGroup):
         type=bpy.types.Object,
         poll=curve_object_poll,
         update=update_map_curve,
+    )
+    ideal_line_road_width: FloatProperty(
+        name="Road Width (m)", description="Full usable width, centered on the Map Curve; used on generation",
+        default=10.0, min=0.1, max=200.0,
+    )
+    ideal_line_edge_clearance: FloatProperty(
+        name="Edge Clearance (m)",
+        description="Distance from the line to each road edge, including half the reference car width and safety margin",
+        default=1.5, min=0.0, max=100.0,
+    )
+    ideal_line_snap_distance: FloatProperty(
+        name="Surface Search (m)", description="Maximum world-Z distance above or below each exported ideal-line sample",
+        default=2.0, min=0.01, max=20.0,
+    )
+    ideal_line: PointerProperty(
+        name="Ideal Line", description="Editable suggested line, moved under MAP and exported separately as JSON",
+        type=bpy.types.Object, poll=ideal_line_poll, update=update_ideal_line,
     )
 
 
@@ -2312,6 +2879,64 @@ class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
         self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
+    bl_idname = "track_exporter.generate_ideal_line"
+    bl_label = "Generate Ideal Line"
+    bl_description = "Generate an editable Bezier line using road width and clearance; replaces the assigned line's shape (Undo supported)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        layout = active_layout(scene_settings(context))
+        return context.mode == "OBJECT" and layout is not None and layout.root_object is not None and layout.map_curve is not None
+
+    def execute(self, context):
+        layout = active_layout(scene_settings(context))
+        if not self.poll(context):
+            self.report({"ERROR"}, "Select a layout with a Map Curve in Object Mode")
+            return {"CANCELLED"}
+        if not valid_id(layout.layout_id):
+            self.report({"ERROR"}, "Layout ID is invalid")
+            return {"CANCELLED"}
+        name = f"{layout.layout_id}_ideal_line"
+        existing = layout.ideal_line
+        if bpy.data.objects.get(name) not in (None, existing):
+            self.report({"ERROR"}, f"Object name {name} is already in use")
+            return {"CANCELLED"}
+        if existing and (existing.library or existing.modifiers or any(
+            other.map_curve == existing for other in scene_settings(context).layouts
+        )):
+            self.report({"ERROR"}, "Ideal Line must be a local, separate curve with no modifiers")
+            return {"CANCELLED"}
+        try:
+            data, warnings, converged = generate_ideal_line(context, layout)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        # Build all geometry before replacing an artist's previous curve. Swap
+        # the datablock so linked curve data on another object is never edited.
+        if existing:
+            existing.data = data
+            curve = existing
+        else:
+            curve = bpy.data.objects.new(name, data)
+            context.scene.collection.objects.link(curve)
+        curve.matrix_world = Matrix.Identity(4)
+        curve.show_in_front = True
+        curve["vectorg_ideal_line_generation"] = json.dumps({
+            "version": 1, "method": "minimum_curvature", "roadWidth": layout.ideal_line_road_width,
+            "edgeClearance": layout.ideal_line_edge_clearance, "converged": converged,
+        })
+        layout.ideal_line = curve
+        update_ideal_line(layout, context)
+        update_layout_visibility(layout, context)
+        select_only(context, curve)
+        for warning in warnings:
+            self.report({"WARNING"}, warning)
+        self.report({"INFO"}, "Ideal line generated; edit its control points in Edit Mode. Export preserves edits.")
         return {"FINISHED"}
 
 
@@ -2540,7 +3165,7 @@ class TRACK_EXPORTER_OT_validate_track(Operator):
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        errors, warnings = validate_scene(settings)
+        errors, warnings = validate_scene(settings, context)
         if applied_count:
             self.report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
         show_validation_popup(context, errors, warnings)
@@ -2627,7 +3252,7 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        errors, warnings = validate_scene(settings)
+        errors, warnings = validate_scene(settings, context)
         if applied_count:
             self.report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
         for message in warnings:
@@ -2682,6 +3307,15 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
                             json.dumps(route_data, separators=(",", ":")),
                             encoding="utf-8",
                         )
+
+            for layout in settings.layouts:
+                if layout.ideal_line:
+                    ideal_path = temp_path / "ideal-lines"
+                    ideal_path.mkdir(exist_ok=True)
+                    line_data, _warnings = layout_ideal_line_data(layout, context)
+                    (ideal_path / f"{layout.layout_id}.json").write_text(
+                        json.dumps(line_data, separators=(",", ":"), allow_nan=False), encoding="utf-8",
+                    )
 
             if settings.hdr_image:
                 source = image_source_path(settings.hdr_image)
@@ -2795,6 +3429,17 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             draw_split_prop(length_row, current, "length")
             draw_split_prop(box, current, "root_object")
             draw_split_prop(box, current, "map_curve")
+            box.separator()
+            box.label(text="Ideal Line")
+            draw_split_prop(box, current, "ideal_line_road_width")
+            draw_split_prop(box, current, "ideal_line_edge_clearance")
+            draw_split_prop(box, current, "ideal_line_snap_distance")
+            draw_split_prop(box, current, "ideal_line")
+            box.operator("track_exporter.generate_ideal_line", icon="CURVE_BEZCURVE",
+                         text="Regenerate Ideal Line" if current.ideal_line else "Generate Ideal Line")
+            if current.ideal_line:
+                box.label(text="Regenerate replaces edits (Undo available)", icon="INFO")
+            box.separator()
             tags = box.row(align=True)
             tags.label(text="Track Types")
             tags.prop(current, "track_type_tarmac", text="Tarmac", toggle=True)
@@ -2848,6 +3493,7 @@ classes = (
     TRACK_EXPORTER_OT_remove_layout,
     TRACK_EXPORTER_OT_move_layout,
     TRACK_EXPORTER_OT_refresh_layout_names,
+    TRACK_EXPORTER_OT_generate_ideal_line,
     TRACK_EXPORTER_OT_add_static_box_collider,
     TRACK_EXPORTER_OT_add_dynamic_box_collider,
     TRACK_EXPORTER_OT_add_spawn_point,
