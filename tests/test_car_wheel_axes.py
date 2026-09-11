@@ -25,7 +25,7 @@ class WheelAxisTests(unittest.TestCase):
         return SimpleNamespace(
             steering=True, suspension_ref=SimpleNamespace(name="mount"), hub_ref=SimpleNamespace(name="joint"),
             wheel_ref=SimpleNamespace(name="spin"), up_local_axis="z", spin_local_axis="x",
-            radius=.3, suspension_stiffness=80, damping_relaxation=2.6, damping_compression=2,
+            radius=.3, width=.24, suspension_stiffness=80, damping_relaxation=2.6, damping_compression=2,
             max_brake_force=1000, pressure=2, camber=0, toe=0, grip_factor=1,
         )
 
@@ -49,6 +49,19 @@ class WheelAxisTests(unittest.TestCase):
         self.api["add_wheel_from_config"](settings, "front", "l", exported)
         self.assertEqual(restored.up_local_axis, "-y")
         self.assertEqual(self.api["wheel_config"](restored), exported)
+
+    def test_manual_width_round_trip_and_unset_import(self):
+        wheel = self.wheel()
+        wheel.width = .315
+        exported = self.api["wheel_config"](wheel)
+        self.assertEqual(exported["spin"]["width"], .315)
+        restored = self.wheel()
+        settings = SimpleNamespace(wheels=SimpleNamespace(add=lambda: restored))
+        self.api["add_wheel_from_config"](settings, "front", "l", exported)
+        self.assertEqual(restored.width, .315)
+        del exported["spin"]["width"]
+        self.api["add_wheel_from_config"](settings, "front", "l", exported)
+        self.assertEqual(restored.width, 0.0, "missing width must remain unset for authoring validation")
 
 
 if __name__ == "__main__":

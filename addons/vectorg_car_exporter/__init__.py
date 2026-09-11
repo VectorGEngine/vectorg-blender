@@ -1559,6 +1559,8 @@ def validate_scene(settings):
     wheel_positions = {}
     wheel_rest_lengths = {}
     for index, wheel in enumerate(settings.wheels, start=1):
+        if not math.isfinite(wheel.width) or wheel.width <= 0:
+            errors.append(f"Wheel {index} width must be set to a positive number in metres")
         mount_obj = wheel.suspension_ref
         joint_obj = wheel.hub_ref
         wheel_obj = wheel.wheel_ref
@@ -1928,6 +1930,12 @@ class CarWheelSettings(PropertyGroup):
         description="Wheel radius in metres, measured from the wheel centre to the tire contact surface",
         default=0.3,
         min=0.01,
+    )
+    width: FloatProperty(
+        name="Width (m)",
+        description="Full tire width along the rolling axle, centered on Spin; set manually before export",
+        default=0.0,
+        min=0.0,
     )
     # Retained as hidden migration sources for blend files saved with preset schema 3.
     suspension_stiffness: FloatProperty(default=80.0, options={"HIDDEN"})
@@ -2882,6 +2890,7 @@ def wheel_config(wheel):
             "upLocalAxis": BLENDER_AXIS_TO_GAME[wheel.up_local_axis],
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[wheel.spin_local_axis],
             "radius": wheel.radius,
+            "width": wheel.width,
         },
     }
 
@@ -3681,6 +3690,7 @@ def add_wheel_from_config(settings, group, key, data=None):
     wheel.damping_relaxation = mount.get("dampingRelaxation", wheel.damping_relaxation)
     wheel.damping_compression = mount.get("dampingCompression", wheel.damping_compression)
     wheel.radius = spin_data.get("radius", wheel.radius)
+    wheel.width = spin_data.get("width", 0.0)
     wheel.max_brake_force = spin_data.get("maxBrakeForce", wheel.max_brake_force)
     wheel.pressure = spin_data.get("pressure", wheel.pressure)
     wheel.camber = spin_data.get("camber", wheel.camber)
@@ -3707,6 +3717,7 @@ def ensure_default_wheels(settings):
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
             "radius": wheel.radius,
+            "width": wheel.width,
             "max_brake_force": wheel.max_brake_force,
             "pressure": wheel.pressure,
             "camber": wheel.camber,
@@ -3732,6 +3743,7 @@ def ensure_default_wheels(settings):
             wheel.damping_relaxation = imported["damping_relaxation"]
             wheel.damping_compression = imported["damping_compression"]
             wheel.radius = imported["radius"]
+            wheel.width = imported["width"]
             wheel.max_brake_force = imported["max_brake_force"]
             wheel.pressure = imported["pressure"]
             wheel.camber = imported["camber"]
@@ -3752,6 +3764,7 @@ def ensure_default_wheels(settings):
                 "upLocalAxis": [0, 1, 0],
                 "spinLocalAxis": [1, 0, 0],
                 "radius": 0.3,
+                "width": 0.0,
                 "maxBrakeForce": 1000,
                 "pressure": 2.0,
                 "camber": -4.0 if front_wheel else -3.0,
@@ -4869,6 +4882,7 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "up_local_axis")
         draw_split_prop(layout, wheel, "spin_local_axis")
         draw_split_prop(layout, wheel, "radius")
+        draw_split_prop(layout, wheel, "width")
 
 
 def draw_armature(layout, settings):

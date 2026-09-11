@@ -157,7 +157,15 @@ Higher aero settings increase both tire loading and drag through the same speed
 curve. This improves high-speed grip but reduces high-speed acceleration and
 drag-limited top speed. Bundled F2021 uses `0.1`; the other bundled cars use `0.2`.
 
-Wheel object selections, axes, radius, and steering behavior are shared by
+Set each shared wheel's **Width (m)** manually before export. This is the full tire
+width along its rolling axle, centered on the Spin origin. The exporter writes
+`spin.width`; the game requires a finite positive value and does not measure or
+guess missing widths. Existing configurations show zero until a width is entered.
+The engine sweeps a cylinder with this width and the authored radius through
+suspension travel. This detects front and side tire contact; it is not a sweep
+along the car's movement between simulation ticks.
+
+Wheel object selections, axes, radius, width, and steering behavior are shared by
 every preset. Car presets contain steering limits, steering-wheel rotation,
 anti-roll, driver-assist levels, brake bias, and per-axle tire, suspension,
 braking and grip configuration. Each assist level is an
