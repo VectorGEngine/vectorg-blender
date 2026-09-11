@@ -1296,6 +1296,8 @@ def validate_scene(settings):
             validate_object_in_car_tree(errors, car_obj, label, obj)
 
     downforce_objects = set()
+    if not math.isfinite(settings.drag_per_downforce) or settings.drag_per_downforce < 0:
+        errors.append("Drag per Downforce must be a finite non-negative number")
     downforce_names = set()
     for index, point in enumerate(settings.down_force_points, start=1):
         display_name = downforce_point_display_name(point, index - 1)
@@ -2095,6 +2097,13 @@ class CarExporterSettings(PropertyGroup):
     )
     # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
+    drag_per_downforce: FloatProperty(
+        name="Drag per Downforce",
+        description="Extra drag per unit of generated downforce, shared by all points; 0.2 adds 200 N of drag per 1000 N of downforce",
+        default=0.2,
+        min=0.0,
+        precision=3,
+    )
     air_drag: FloatProperty(
         name="Air Drag",
         description="Aerodynamic drag coefficient; higher values create more resistance as speed increases",
@@ -2524,6 +2533,7 @@ def clear_configuration_settings(settings):
     settings.active_preset_index = 0
     settings.preset_schema_version = 0
     settings.down_force = 0.0
+    settings.drag_per_downforce = 0.2
     settings.air_drag = 0.0
     settings.abs = 0.0
     settings.esc = 0.0
@@ -2583,6 +2593,7 @@ def initialize_configuration_settings(settings):
     settings.esc_max_level = 5
     settings.traction_control_max_level = 5
     settings.down_force = 3000.0
+    settings.drag_per_downforce = 0.2
     settings.air_drag = 0.5
     settings.abs = 1.0
     settings.esc = 0.0
@@ -2901,6 +2912,7 @@ def build_manifest(settings):
             for index, point in enumerate(settings.down_force_points)
         ],
         "airDrag": settings.air_drag,
+        "dragPerDownforce": settings.drag_per_downforce,
     }
     if settings.body_colors:
         body["colors"] = [
@@ -4042,6 +4054,13 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Manifest body must be an object")
             return {"CANCELLED"}
         downforce_points_data = body.get("downForcePoints", [])
+        drag_per_downforce = body.get("dragPerDownforce")
+        if (isinstance(drag_per_downforce, bool)
+                or not isinstance(drag_per_downforce, (int, float))
+                or not math.isfinite(drag_per_downforce)
+                or not 0 <= drag_per_downforce <= 3.4028234663852886e38):
+            self.report({"ERROR"}, "Manifest body.dragPerDownforce must be a finite non-negative physics scalar")
+            return {"CANCELLED"}
         if manifest_version == 8:
             if not isinstance(downforce_points_data, list):
                 self.report({"ERROR"}, "Manifest body.downForcePoints must be an array")
@@ -4325,6 +4344,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             return {"CANCELLED"}
         set_object_pointer(settings, "center_of_mass_object", body.get("centerOfMass", ""))
         settings.air_drag = body.get("airDrag", settings.air_drag)
+        settings.drag_per_downforce = drag_per_downforce
         for point in settings.down_force_points:
             helper = point.object_ref
             if helper and helper.get(DOWNFORCE_HELPER_PROP):
@@ -4733,6 +4753,7 @@ def draw_body_physics(layout, settings):
     layout.operator("car_exporter.add_downforce_point", icon="ADD")
     layout.separator(type="LINE")
     draw_split_prop(layout, settings, "air_drag")
+    draw_split_prop(layout, settings, "drag_per_downforce")
 
 
 class CAR_EXPORTER_PT_car_export(Panel):
