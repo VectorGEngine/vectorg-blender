@@ -42,6 +42,8 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
     "redlineRPM": 7000,
     "revLimit": 7900,
     "maxRPM": 8000,
+    "inertia": 0.2,
+    "engineBraking": 0.2,
     "autoBlip": true
   },
   "steeringWheel": {
@@ -58,6 +60,7 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
       "id": "default",
       "name": "Default",
       "maxSteeringAngle": 50.0,
+      "roadWheelCurve": 0.5,
       "maxDegreesOfRotation": 540.0,
       "antiRollBars": {
         "front": 15.0,
@@ -101,6 +104,10 @@ Increment **Package Version** intentionally whenever exported package contents
 change. Importing an existing car manifest preserves its `packageVersion`.
 Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
+Engine Braking Factor follows Engine Inertia and exports the required, finite,
+nonnegative `engine.engineBraking` value (default `0.2`). It is unitless: `0.2`
+applies 20% of peak engine torque at maximum RPM with zero throttle, decreasing
+toward idle or as throttle increases.
 Each preset exports its final drive and individual ratios under `gearing`.
 The Torque Curve section exports `engine.torqueFactor`, which scales drive and
 engine-braking torque before tire-force limits are applied.
@@ -163,13 +170,35 @@ wheel. Vehicle manifest version 8 exports this value in newtons using
 Each axle's **Estimate Brake Force** button estimates a value that exceeds peak
 tire grip by 15 percent at maximum speed on dry tarmac with ABS off. The estimate
 uses a grip coefficient of 1 along with collider mass, wheel and center-of-mass
-positions, maximum downforce, and brake bias. Existing numeric brake values are
+positions in Blender world space (Z up, -Y forward), maximum downforce, and brake
+bias. Parent rotation and scale are included in those positions. Existing numeric brake values are
 not converted when opening older Blender files.
 
 Caster is expressed in degrees. Positive caster tilts the top of the steering
 and suspension axis toward the rear of the car; negative caster tilts it toward
 the front. The game creates this pivot at runtime at the wheel spin center, so
 the exported model does not need an additional caster object.
+
+Suspension travel, kingpin inclination, and tire camber can be authored independently.
+The game uses the **Mount → Joint positions** to calculate travel direction and the
+full distance between them as the rest length. The existing **Up Local Axis**
+selection is shared: Joint's orientation makes it the kingpin axis, and Spin's
+orientation makes it the tire's up axis. **Spin** defines the tire's
+orientation, center, and rolling axle. Rotating Spin to make the tire upright
+does not straighten the kingpin or suspension travel.
+
+For example, Mount tilted inward 10°, Joint counter-rotated 5°, and Spin
+counter-rotated another 5° produce 10° suspension travel (when Mount → Joint
+follows Mount's axis), a 5° kingpin, and an upright tire. Zero preset alignment
+offsets preserve that authored pose. Caster rotates the entire wheel assembly
+around the tire center. Toe applies a neutral steering rotation about Joint,
+moving an offset tire center with it. Camber adjusts Spin at the tire center.
+The game measures the resulting neutral wheel toe/camber relative to the authored
+alignment; steering can subsequently change camber around the inclined kingpin.
+
+The shared selection stays in the existing `spin.upLocalAxis` manifest field.
+For example, F2021 uses local -Z (`[0, 0, -1]` in GLB, Blender -Y) for both
+Joint and Spin. Different object rotations still give them independent inclinations.
 
 Preset adjustments are edited once for the front axle and once for the rear
 axle. Exported manifests still contain separate `l` and `r` wheel entries, with
@@ -237,7 +266,8 @@ roof_cam
 `dashboard_screen` is optional. Assign it in the Dashboard section when the car
 has an in-cockpit racing display.
 
-Wheel objects should be direct children of their suspension objects.
+Use the hierarchy **Mount → Joint → Spin**. Additional parent nodes are supported.
+Use separate Joint and Spin objects to author the kingpin and wheel orientation independently.
 
 ## Direction Rules
 
@@ -308,6 +338,149 @@ Body colors are optional. When configured, their order is exported as:
 
 The game can use the exported names for color selection. Runtime color
 selection is not configured by the Blender addon.
+
+## Armature
+
+Under **Wheel Setup**, enable **Armature** and select the suspension armature.
+For each wheel, select a **Follow Joint** bone from that armature. The source
+is the wheel's existing **Joint** object; do not duplicate the object assignment.
+Leave a bone field empty to skip that wheel. At least one mapping is required
+when enabled, and each mapped bone must be different.
+
+Keep the rig and normal wheel objects in independent branches below Car Root:
+
+```text
+CarRoot
+|-- Body
+|-- Mount_FL
+|   `-- Joint_FL
+|       `-- Spin_FL
+|           `-- Wheel_FL
+|-- Other wheel hierarchies
+`-- SuspensionRig (Armature)
+    `-- SuspensionGeometry (Mesh with Armature modifier)
+```
+
+Inside the armature, parent the hub bones to a fixed chassis bone, with
+**Connected** disabled on the hub bones so they can translate. Weight the
+chassis-side suspension vertices to the chassis bone and the wheel-side
+vertices to the corresponding hub bone. The chassis bone needs no mapping.
+The selected rig must be outside the Custom Ghost subtree.
+
+The enabled section adds this optional field to manifest version 8:
+
+```json
+{
+  "armature": {
+    "obj": "SuspensionRig",
+    "wheels": {
+      "front": {
+        "l": { "bone": "hub_fl" },
+        "r": { "bone": "hub_fr" }
+      },
+      "rear": {
+        "l": { "bone": "hub_rl" },
+        "r": { "bone": "hub_rr" }
+      }
+    }
+  }
+}
+```
+
+Unmapped wheels and empty axles are omitted. Unchecking **Armature** omits the
+entire field while preserving the Blender selections and exported geometry.
+Importing an enabled manifest replaces all mappings, including clearing fields
+for omitted wheels. Importing a manifest without `armature` disables following
+and preserves the previous selections.
+
+With Armature enabled, GLB export explicitly preserves skins, all bones, the
+armature object and hierarchy, and uses the armature rest pose. Animation clips
+are not exported in this mode: the intended game behavior is to drive the bones
+from the wheel Joints while preserving their authored relative offsets. Blender
+constraints and drivers do not become live game constraints.
+
+This addon exports the mapping; game-side following is a separate implementation
+step. Until that game update is installed, exporting a mapping alone does not
+animate the suspension. This export setup targets Blender 4.5.
+
+## Custom Ghost
+
+Open **Custom Ghost**, check **Enable Custom Ghost**, and select **Ghost Root**.
+This must be a direct child of the configured Car Root. Put all ghost body,
+trim, glass, light meshes, and four wheel hierarchies inside it:
+
+```text
+Car Root
+|-- Normal car geometry and wheel nodes
+`-- Ghost Root
+    |-- Ghost body, trim, glass, and light geometry
+    |-- Ghost front-left mount
+    |   `-- Ghost front-left joint
+    |       `-- Ghost front-left spin and wheel geometry
+    `-- Other three ghost wheel hierarchies
+```
+
+Assign **Mount**, **Joint**, and **Spin** for each ghost wheel. These inputs use
+the same conventions as the normal Wheels section. Match the corresponding
+normal wheel's rest placement and local axes: ghost wheels inherit its steering,
+radius, up/spin axes, and preset parameters. The inherited Up Local Axis is used
+in the ghost Joint's own orientation for steering. Each wheel needs its own hierarchy;
+do not reference normal wheel nodes or nest one wheel under another. A wheel
+may use the same object for its joint and spin, as normal wheels can.
+
+Ghost geometry keeps its authored materials. Assign the existing default
+**Body Colors** material to paintable ghost surfaces. Assign the existing
+Headlights, Brake Lights, and Reverse Lights materials to the corresponding
+ghost light meshes. No white material or additional ghost light material inputs
+are required. Missing ghost light assignments produce warnings.
+
+The exporter writes either `"ghost": null` when unchecked, or this structure
+in manifest version 8 when checked (all four wheel entries are required):
+
+```json
+"ghost": {
+  "obj": "ghost_root",
+  "wheels": {
+    "front": {
+      "l": {
+        "mount": { "obj": "ghost_mount_fl" },
+        "joint": { "obj": "ghost_joint_fl" },
+        "spin": { "obj": "ghost_spin_fl" }
+      },
+      "r": {
+        "mount": { "obj": "ghost_mount_fr" },
+        "joint": { "obj": "ghost_joint_fr" },
+        "spin": { "obj": "ghost_spin_fr" }
+      }
+    },
+    "rear": {
+      "l": {
+        "mount": { "obj": "ghost_mount_rl" },
+        "joint": { "obj": "ghost_joint_rl" },
+        "spin": { "obj": "ghost_spin_rl" }
+      },
+      "r": {
+        "mount": { "obj": "ghost_mount_rr" },
+        "joint": { "obj": "ghost_joint_rr" },
+        "spin": { "obj": "ghost_spin_rr" }
+      }
+    }
+  }
+}
+```
+
+The enabled hierarchy is embedded in the same `<car_id>.glb`. Unchecking keeps
+the selections and source objects in the `.blend`, but excludes the configured
+ghost subtree from GLB export. Importing a null or missing `ghost` disables the
+feature while preserving existing authoring selections; importing a structure
+restores its object selections. Run **Validate Car** after import to check them
+against the scene. Increment **Package Version** when package contents change.
+
+Game integration is pending. The runtime contract is to retain only Ghost Root
+and the car-root transform for custom ghosts, remove Ghost Root for normal cars
+and ordinary replays, and use existing ghost behavior for null/missing `ghost`.
+Body paint, wheel animation, fading, and emission-based lights will be applied
+by that integration.
 
 ## Lights
 

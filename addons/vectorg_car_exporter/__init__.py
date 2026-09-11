@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Car Exporter",
     "author": "VectorG",
-    "version": (0, 8, 0),
+    "version": (0, 8, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Export VectorG vehicle packages as <car_id>.glb + manifest.json + audio zip",
@@ -189,6 +189,8 @@ def calculate_max_speed_brake_force_kg(settings, preset):
     if not settings.car_root_object or not settings.center_of_mass_object:
         raise ValueError("Car Root and Center of Mass are required")
 
+    # Use Blender world axes (Z up, -Y forward), including parent transforms.
+    # Root-local axes can differ when the car root has unapplied rotation/scale.
     shared_wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
     wheel_positions = {}
     contact_heights = []
@@ -197,10 +199,10 @@ def calculate_max_speed_brake_force_kg(settings, preset):
         if not wheel or not wheel.suspension_ref or not wheel.wheel_ref:
             raise ValueError("All wheel mounts and spin objects are required")
         mount_position = blender_position_to_game(
-            relative_to_car(settings.car_root_object, wheel.suspension_ref)
+            wheel.suspension_ref.matrix_world.translation
         )
         spin_position = blender_position_to_game(
-            relative_to_car(settings.car_root_object, wheel.wheel_ref)
+            wheel.wheel_ref.matrix_world.translation
         )
         wheel_positions[(group, key)] = mount_position
         contact_heights.append(spin_position[1] - wheel.radius)
@@ -213,7 +215,7 @@ def calculate_max_speed_brake_force_kg(settings, preset):
         raise ValueError("Front and rear wheel mounts must define a wheelbase")
 
     center_of_mass = blender_position_to_game(
-        relative_to_car(settings.car_root_object, settings.center_of_mass_object)
+        settings.center_of_mass_object.matrix_world.translation
     )
     front_static_fraction = min(max((center_of_mass[2] - rear_z) / axle_span, 0.0), 1.0)
     center_of_mass_height = max(center_of_mass[1] - sum(contact_heights) / len(contact_heights), 0.0)
@@ -224,7 +226,7 @@ def calculate_max_speed_brake_force_kg(settings, preset):
         if not point.object_ref:
             raise ValueError("Every downforce point must have a helper object")
         position = blender_position_to_game(
-            relative_to_car(settings.car_root_object, point.object_ref)
+            point.object_ref.matrix_world.translation
         )
         front_fraction = (position[2] - rear_z) / axle_span
         force_kg = point.max_force / NEWTONS_PER_KILOGRAM
@@ -331,6 +333,261 @@ def hierarchy_objects(root_obj):
         objects.append(obj)
         pending.extend(reversed(obj.children))
     return objects
+
+
+GHOST_WHEEL_ROLES = (("mount", "suspension_ref"), ("joint", "hub_ref"), ("spin", "wheel_ref"))
+
+
+def ghost_wheel_settings(settings, group, key):
+    return getattr(settings, f"ghost_{group}_{key}")
+
+
+def excluded_ghost_objects(settings):
+    return hierarchy_objects(settings.ghost_root_object) if not settings.ghost_enabled else []
+
+
+def car_export_objects(settings):
+    excluded = set(guide_objects() + downforce_helper_objects() + excluded_ghost_objects(settings))
+    return [obj for obj in bpy.context.scene.objects if obj not in excluded]
+
+
+def armature_object_poll(_settings, obj):
+    return obj.type == "ARMATURE"
+
+
+def armature_bone_property(group, key):
+    return f"armature_{group}_{key}_bone"
+
+
+def parse_armature_config(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"obj", "wheels"}:
+        raise ValueError("Manifest armature must contain only obj and wheels")
+    name = value.get("obj")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Manifest armature.obj must be a non-empty string")
+    wheels = value.get("wheels")
+    if not isinstance(wheels, dict) or set(wheels) - {"front", "rear"}:
+        raise ValueError("Manifest armature.wheels must contain only front and rear mappings")
+    result = {"obj": name, "wheels": {}}
+    used_bones = set()
+    for group in ("front", "rear"):
+        if group not in wheels:
+            continue
+        axle = wheels[group]
+        if not isinstance(axle, dict) or set(axle) - {"l", "r"}:
+            raise ValueError(f"Manifest armature.wheels.{group} must contain only l and r mappings")
+        for key in ("l", "r"):
+            if key not in axle:
+                continue
+            mapping = axle[key]
+            path = f"armature.wheels.{group}.{key}"
+            if not isinstance(mapping, dict) or set(mapping) != {"bone"}:
+                raise ValueError(f"Manifest {path} must contain only bone")
+            bone = mapping["bone"]
+            if not isinstance(bone, str) or not bone.strip():
+                raise ValueError(f"Manifest {path}.bone must be a non-empty string")
+            if bone in used_bones:
+                raise ValueError(f"Armature bone is assigned to multiple wheels: {bone}")
+            used_bones.add(bone)
+            result["wheels"].setdefault(group, {})[key] = {"bone": bone}
+    if not used_bones:
+        raise ValueError("Armature requires at least one Follow Joint bone")
+    return result
+
+
+def build_armature_config(settings):
+    if not settings.armature_enabled:
+        return None
+    wheels = {}
+    for group, key, _steering in WHEEL_KEYS:
+        bone = getattr(settings, armature_bone_property(group, key))
+        if bone:
+            wheels.setdefault(group, {})[key] = {"bone": bone}
+    return parse_armature_config({"obj": object_config_name(settings.armature_object), "wheels": wheels})
+
+
+def import_armature_config(settings, config):
+    settings.armature_enabled = config is not None
+    # Disabling retains authoring selections; importing an enabled mapping replaces them.
+    if config is None:
+        return
+    set_object_pointer(settings, "armature_object", config["obj"])
+    for group, key, _steering in WHEEL_KEYS:
+        mapping = config["wheels"].get(group, {}).get(key)
+        setattr(settings, armature_bone_property(group, key), mapping["bone"] if mapping else "")
+
+
+def validate_armature_scene(settings, errors, warnings):
+    if not settings.armature_enabled:
+        return
+    rig = settings.armature_object
+    if not rig or rig.type != "ARMATURE":
+        errors.append("Armature object is required and must be an Armature")
+        return
+    exported_objects = set(car_export_objects(settings))
+    if rig not in exported_objects or rig == settings.car_root_object or not is_object_in_tree(settings.car_root_object, rig):
+        errors.append("Armature must be inside the exported car hierarchy below Car Root")
+    if is_object_in_tree(settings.ghost_root_object, rig):
+        errors.append("Armature must be outside the custom ghost hierarchy")
+    # Sources and rig must not drive each other through object/bone parenting.
+    for wheel in settings.wheels:
+        for _role, prop in GHOST_WHEEL_ROLES:
+            obj = getattr(wheel, prop)
+            if obj and (is_object_in_tree(obj, rig) or is_object_in_tree(rig, obj)):
+                errors.append("Armature and normal wheel objects must use independent hierarchies")
+                break
+    try:
+        config = build_armature_config(settings)
+    except ValueError as error:
+        errors.append(str(error))
+        return
+    wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
+    for group, axle in config["wheels"].items():
+        for key, mapping in axle.items():
+            label = WHEEL_LABELS[(group, key)]
+            bone = rig.data.bones.get(mapping["bone"])
+            if bone is None:
+                errors.append(f"{label} Follow Joint bone is missing from {rig.name}: {mapping['bone']}")
+            elif bone.use_connect:
+                errors.append(f"{label} Follow Joint bone must have Connected disabled so it can translate")
+            wheel = wheels.get((group, key))
+            if not wheel or not wheel.hub_ref or wheel.hub_ref not in exported_objects:
+                errors.append(f"{label} Follow Joint requires an exported wheel Joint object")
+
+
+def gltf_armature_export_options(settings):
+    if not settings.armature_enabled:
+        return {}
+    return {
+        "export_skins": True,
+        "export_rest_position_armature": True,
+        "export_def_bones": False,
+        "export_armature_object_remove": False,
+        "export_hierarchy_flatten_bones": False,
+        "export_hierarchy_flatten_objs": False,
+        # Runtime wheel poses drive this rig; do not export Blender actions/drivers.
+        "export_animations": False,
+    }
+
+
+def build_ghost_config(settings):
+    if not settings.ghost_enabled:
+        return None
+    wheels = {"front": {}, "rear": {}}
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = ghost_wheel_settings(settings, group, key)
+        wheels[group][key] = {
+            role: {"obj": object_config_name(getattr(wheel, prop))}
+            for role, prop in GHOST_WHEEL_ROLES
+        }
+    return {"obj": object_config_name(settings.ghost_root_object), "wheels": wheels}
+
+
+def parse_ghost_config(value):
+    if value is None:
+        return None
+
+    def node_name(record, path):
+        name = record.get("obj") if isinstance(record, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Manifest {path}.obj must be a non-empty string")
+        return name
+
+    root_name = node_name(value, "ghost")
+    wheels = value.get("wheels")
+    if not isinstance(wheels, dict):
+        raise ValueError("Manifest ghost.wheels must be an object")
+    result = {"obj": root_name, "wheels": {"front": {}, "rear": {}}}
+    used_names = {root_name}
+    for group, key, _steering in WHEEL_KEYS:
+        axle = wheels.get(group)
+        wheel = axle.get(key) if isinstance(axle, dict) else None
+        if not isinstance(wheel, dict):
+            raise ValueError(f"Manifest ghost.wheels.{group}.{key} must be an object")
+        nodes = {}
+        for role, _prop in GHOST_WHEEL_ROLES:
+            name = node_name(wheel.get(role), f"ghost.wheels.{group}.{key}.{role}")
+            nodes[role] = {"obj": name}
+        # A wheel may share its own joint/spin node, as normal wheels can.
+        names = {node["obj"] for node in nodes.values()}
+        if names & used_names:
+            raise ValueError("Manifest ghost wheel nodes must not overlap the root or another wheel")
+        used_names.update(names)
+        result["wheels"][group][key] = nodes
+    return result
+
+
+def import_ghost_config(settings, config):
+    settings.ghost_enabled = config is not None
+    # Preserve disabled authoring selections so the subtree can still be excluded.
+    if config is None:
+        return
+    set_object_pointer(settings, "ghost_root_object", config["obj"])
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = ghost_wheel_settings(settings, group, key)
+        for role, prop in GHOST_WHEEL_ROLES:
+            set_object_pointer(wheel, prop, config["wheels"][group][key][role]["obj"])
+
+
+def validate_ghost_scene(settings, errors, warnings):
+    root = settings.ghost_root_object
+    if not root:
+        if settings.ghost_enabled:
+            errors.append("Custom ghost root object is required")
+        return
+    if not settings.car_root_object or root.parent != settings.car_root_object:
+        errors.append("Ghost root must be a direct child of the car root")
+    ghost_objects = set(hierarchy_objects(root))
+    scene_objects = set(bpy.context.scene.objects)
+    if root not in scene_objects:
+        errors.append("Ghost root must belong to the current scene")
+    normal_refs = [settings.center_of_mass_object, settings.steering_wheel_object,
+                   settings.dashboard_screen_object]
+    normal_refs.extend(getattr(settings, f"{prefix}_camera_object") for prefix in CAMERA_PREFIXES)
+    normal_refs.extend(collider.object_ref for collider in settings.colliders)
+    normal_refs.extend(point.object_ref for point in settings.down_force_points)
+    normal_refs.extend(getattr(wheel, prop) for wheel in settings.wheels for _role, prop in GHOST_WHEEL_ROLES)
+    if any(obj in ghost_objects for obj in normal_refs if obj):
+        errors.append("Ghost hierarchy must not contain normal car wheel, camera, dashboard or physics references")
+    if not settings.ghost_enabled:
+        return
+    if not any(obj.type == "MESH" and obj.data.polygons for obj in ghost_objects):
+        errors.append("Ghost hierarchy must contain mesh geometry")
+    used_nodes = {root}
+    mounts = []
+    for group, key, _steering in WHEEL_KEYS:
+        label = f"Ghost {WHEEL_LABELS[(group, key)]}"
+        wheel = ghost_wheel_settings(settings, group, key)
+        nodes = [getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES]
+        for (role, _prop), obj in zip(GHOST_WHEEL_ROLES, nodes):
+            if not obj or obj not in ghost_objects or obj not in scene_objects:
+                errors.append(f"{label} {role} must be inside the exported ghost hierarchy")
+        unique_nodes = {obj for obj in nodes if obj}
+        if unique_nodes & used_nodes:
+            errors.append(f"{label} nodes must not overlap the ghost root or another wheel")
+        used_nodes.update(unique_nodes)
+        mount, joint, spin = nodes
+        if mount and joint and not is_object_in_tree(mount, joint):
+            errors.append(f"{label} joint must be inside mount hierarchy")
+        if joint and spin and not is_object_in_tree(joint, spin):
+            errors.append(f"{label} spin must be inside joint hierarchy")
+        if mount:
+            if any(is_object_in_tree(other, mount) or is_object_in_tree(mount, other) for other in mounts):
+                errors.append("Ghost wheel mount hierarchies must not overlap")
+            mounts.append(mount)
+        if spin and not any(obj.type == "MESH" and obj.data.polygons for obj in hierarchy_objects(spin)):
+            errors.append(f"{label} spin hierarchy must contain mesh geometry")
+    if settings.body_colors:
+        material = settings.body_colors[0].material
+        if material and not material_is_assigned_to_geometry(material, ghost_objects):
+            errors.append("Default body color material must be assigned to ghost geometry")
+    for label, prop in (("Headlights", "headlights_material"), ("Brake lights", "brake_lights_material"),
+                        ("Reverse lights", "reverse_lights_material")):
+        material = getattr(settings, prop)
+        if material and not material_is_assigned_to_geometry(material, ghost_objects):
+            warnings.append(f"{label} material is not assigned to ghost geometry; custom ghost will not display this light")
 
 
 def objects_with_unapplied_scale(root_obj):
@@ -610,8 +867,8 @@ def create_size_guide(settings):
     )
 
 
-def with_helpers_unlinked(callback):
-    helpers = guide_objects() + downforce_helper_objects()
+def with_helpers_unlinked(callback, excluded_objects=()):
+    helpers = list(dict.fromkeys(guide_objects() + downforce_helper_objects() + list(excluded_objects)))
     states = [(obj, list(obj.users_collection)) for obj in helpers]
     try:
         for obj, collections in states:
@@ -1044,6 +1301,8 @@ def validate_scene(settings):
 
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
+    validate_ghost_scene(settings, errors, warnings)
+    validate_armature_scene(settings, errors, warnings)
 
     wheel_positions = {}
     wheel_rest_lengths = {}
@@ -1075,7 +1334,13 @@ def validate_scene(settings):
                 warnings.append(f"{object_config_name(wheel_obj)} configured spin axis should align with world X left/right")
             if mount_obj and joint_obj:
                 mount_to_joint = joint_obj.matrix_world.translation - mount_obj.matrix_world.translation
-                wheel_rest_lengths[(wheel.group, wheel.key)] = abs(mount_to_joint.dot(up_axis_world))
+                wheel_rest_lengths[(wheel.group, wheel.key)] = mount_to_joint.length
+                if mount_to_joint.length <= 1e-6:
+                    errors.append(f"Wheel {index} Mount and Joint must be at different positions")
+            if joint_obj:
+                steering_axis = object_axis(joint_obj, BLENDER_AXIS_LOCAL[wheel.up_local_axis]).normalized()
+                if steering_axis.dot(Vector((0, 0, 1))) <= 0.1:
+                    errors.append(f"Wheel {index} selected Up Local Axis on Joint must point upward along the kingpin")
 
     for group in ("front", "rear"):
         left_pos = wheel_positions.get((group, "l"))
@@ -1110,6 +1375,8 @@ def validate_scene(settings):
             errors.append(f"{label} preset name is required")
         if not math.isfinite(preset.max_steering_angle) or not 1.0 <= preset.max_steering_angle <= 90.0:
             errors.append(f"{label} max steering angle must be between 1 and 90 degrees")
+        if not math.isfinite(preset.road_wheel_curve) or not 0.0 <= preset.road_wheel_curve <= 1.0:
+            errors.append(f"{label} steering response curve must be between 0 and 1")
         if not math.isfinite(preset.max_degrees_of_rotation) or not 90.0 <= preset.max_degrees_of_rotation <= 2160.0:
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
         if not math.isfinite(preset.brake_bias) or not 0.0 <= preset.brake_bias <= 1.0:
@@ -1222,10 +1489,11 @@ def validate_scene(settings):
     exported_material_names = {
         material.name
         for material in export_materials(
-            [obj for obj in bpy.context.scene.objects if obj not in guide_objects()]
+            car_export_objects(settings)
         )
     }
-    car_objects = hierarchy_objects(car_obj)
+    ghost_objects = set(hierarchy_objects(settings.ghost_root_object))
+    car_objects = [obj for obj in hierarchy_objects(car_obj) if obj not in ghost_objects]
     body_color_names = set()
     body_color_material_names = set()
     for index, body_color in enumerate(settings.body_colors):
@@ -1277,11 +1545,13 @@ def validate_scene(settings):
         <= settings.max_rpm
     ):
         errors.append("Engine RPM values must satisfy idleRPM < redlineRPM <= revLimit <= maxRPM")
+    if not math.isfinite(settings.engine_braking) or settings.engine_braking < 0:
+        errors.append("Engine Braking Factor must be a finite nonnegative number")
 
     if car_obj:
         body_color_materials = [body_color.material for body_color in settings.body_colors if body_color.material]
         texture_errors, texture_warnings = texture_validation(
-            [obj for obj in bpy.context.scene.objects if obj not in guide_objects()],
+            car_export_objects(settings),
             int(settings.max_texture_size),
             body_color_materials,
         )
@@ -1367,7 +1637,7 @@ class CarWheelSettings(PropertyGroup):
     )
     hub_ref: PointerProperty(
         name="Joint",
-        description="Object that receives steering and wheel-alignment rotation",
+        description="Steering pivot and kingpin orientation; also receives the neutral toe rotation",
         type=bpy.types.Object,
     )
     wheel_ref: PointerProperty(
@@ -1377,7 +1647,7 @@ class CarWheelSettings(PropertyGroup):
     )
     up_local_axis: EnumProperty(
         name="Up Local Axis",
-        description="Wheel object's local axis that points upward",
+        description="Shared local up axis: Joint defines the kingpin orientation and Spin defines the tire orientation",
         items=AXIS_ITEMS,
         default="z",
     )
@@ -1405,6 +1675,18 @@ class CarWheelSettings(PropertyGroup):
         default=1.0,
         min=0.01,
         options={"HIDDEN"},
+    )
+
+
+class CarGhostWheelSettings(PropertyGroup):
+    suspension_ref: PointerProperty(
+        name="Mount", description="Ghost suspension attachment inside Ghost Root", type=bpy.types.Object,
+    )
+    hub_ref: PointerProperty(
+        name="Joint", description="Ghost steering and alignment node inside the mount", type=bpy.types.Object,
+    )
+    wheel_ref: PointerProperty(
+        name="Spin", description="Ghost wheel geometry or parent that rotates inside the joint", type=bpy.types.Object,
     )
 
 
@@ -1506,6 +1788,15 @@ class CarPresetSettings(PropertyGroup):
         default=50.0,
         min=1.0,
         max=90.0,
+    )
+    road_wheel_curve: FloatProperty(
+        name="Steering Response Curve",
+        description="Blend between linear (0) and cubic (1) road-wheel response",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
     )
     max_degrees_of_rotation: FloatProperty(
         name="Steering Wheel Rotation (°)",
@@ -1672,6 +1963,35 @@ class CarExporterSettings(PropertyGroup):
         description="Root object containing the complete vehicle hierarchy",
         type=bpy.types.Object,
     )
+    ghost_enabled: BoolProperty(
+        name="Enable Custom Ghost",
+        description="Export a dedicated ghost subtree in the car GLB; otherwise export ghost as null",
+        default=False,
+    )
+    ghost_root_object: PointerProperty(
+        name="Ghost Root",
+        description="Direct child of Car Root containing all custom ghost geometry and wheel nodes",
+        type=bpy.types.Object,
+    )
+    ghost_front_l: PointerProperty(type=CarGhostWheelSettings)
+    ghost_front_r: PointerProperty(type=CarGhostWheelSettings)
+    ghost_rear_l: PointerProperty(type=CarGhostWheelSettings)
+    ghost_rear_r: PointerProperty(type=CarGhostWheelSettings)
+    armature_enabled: BoolProperty(
+        name="Enable Armature",
+        description="Export bone mappings that follow the existing wheel Joint objects in the game",
+        default=False,
+    )
+    armature_object: PointerProperty(
+        name="Object",
+        description="Independent suspension armature inside Car Root",
+        type=bpy.types.Object,
+        poll=armature_object_poll,
+    )
+    armature_front_l_bone: StringProperty(name="Front Left", description="Bone following the front-left Joint; leave empty to skip")
+    armature_front_r_bone: StringProperty(name="Front Right", description="Bone following the front-right Joint; leave empty to skip")
+    armature_rear_l_bone: StringProperty(name="Rear Left", description="Bone following the rear-left Joint; leave empty to skip")
+    armature_rear_r_bone: StringProperty(name="Rear Right", description="Bone following the rear-right Joint; leave empty to skip")
     center_of_mass_object: PointerProperty(
         name="Center of Mass",
         description="Helper object defining the vehicle's center of mass",
@@ -1790,6 +2110,12 @@ class CarExporterSettings(PropertyGroup):
         description="Resistance to RPM changes; higher values make the engine rev more slowly",
         default=0.2,
         min=0.01,
+    )
+    engine_braking: FloatProperty(
+        name="Engine Braking Factor",
+        description="Unitless fraction of peak engine torque used for engine braking; 0.2 gives 20% at maximum RPM with zero throttle, decreasing toward idle or as throttle increases",
+        default=0.2,
+        min=0.0,
     )
     engine_friction_torque: FloatProperty(
         name="Friction Torque (N·m)",
@@ -2109,6 +2435,16 @@ def clear_configuration_settings(settings):
     settings.esc_max_level = 5
     settings.traction_control_max_level = 5
     settings.car_root_object = None
+    settings.ghost_enabled = False
+    settings.ghost_root_object = None
+    settings.armature_enabled = False
+    settings.armature_object = None
+    for group, key, _steering in WHEEL_KEYS:
+        setattr(settings, armature_bone_property(group, key), "")
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = ghost_wheel_settings(settings, group, key)
+        for _role, prop in GHOST_WHEEL_ROLES:
+            setattr(wheel, prop, None)
     settings.center_of_mass_object = None
     settings.steering_wheel_object = None
     settings.steering_wheel_spin_axis = "y"
@@ -2140,6 +2476,7 @@ def clear_configuration_settings(settings):
     settings.redline_rpm = 1
     settings.rev_limit = 1
     settings.engine_inertia = 0.01
+    settings.engine_braking = 0.2
     settings.engine_friction_torque = 0.0
     settings.clutch_response = 0.0
     settings.shift_cooldown = 0.0
@@ -2197,6 +2534,7 @@ def initialize_configuration_settings(settings):
     settings.redline_rpm = 7000
     settings.rev_limit = 7900
     settings.engine_inertia = 0.2
+    settings.engine_braking = 0.2
     settings.engine_friction_torque = 70.0
     settings.clutch_response = 12.0
     settings.shift_cooldown = 0.0
@@ -2285,6 +2623,7 @@ def build_presets_config(settings):
             "id": preset.preset_id,
             "name": preset.display_name,
             "maxSteeringAngle": preset.max_steering_angle,
+            "roadWheelCurve": preset.road_wheel_curve,
             "maxDegreesOfRotation": preset.max_degrees_of_rotation,
             "antiRollBars": {
                 "front": preset.front_anti_roll_bar_stiffness,
@@ -2515,6 +2854,7 @@ def build_manifest(settings):
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
+        "ghost": build_ghost_config(settings),
         "displayName": settings.display_name,
         "class": settings.car_class,
         "trackTypes": [
@@ -2534,6 +2874,7 @@ def build_manifest(settings):
             "redlineRPM": settings.redline_rpm,
             "revLimit": settings.rev_limit,
             "inertia": settings.engine_inertia,
+            "engineBraking": settings.engine_braking,
             "frictionTorque": settings.engine_friction_torque,
             "clutchResponse": settings.clutch_response,
             "shiftCooldown": settings.shift_cooldown,
@@ -2582,6 +2923,9 @@ def build_manifest(settings):
     }
     if dashboard:
         manifest["dashboard"] = dashboard
+    armature = build_armature_config(settings)
+    if armature is not None:
+        manifest["armature"] = armature
     return manifest
 
 
@@ -3049,6 +3393,7 @@ def default_wheel_preset_values(group):
 def default_preset_values(settings):
     return {
         "max_steering_angle": 50.0,
+        "road_wheel_curve": 0.5,
         "max_degrees_of_rotation": 540.0,
         "front_anti_roll_bar_stiffness": 15.0,
         "rear_anti_roll_bar_stiffness": 15.0,
@@ -3254,6 +3599,7 @@ def next_preset_id(settings):
 def apply_preset_values(values, target):
     for field in (
         "max_steering_angle",
+        "road_wheel_curve",
         "max_degrees_of_rotation",
         "front_anti_roll_bar_stiffness",
         "rear_anti_roll_bar_stiffness",
@@ -3320,7 +3666,8 @@ class CAR_EXPORTER_OT_remove_configuration(Operator):
 
 def create_body_material_export_carrier(context):
     settings = scene_settings(context)
-    car_objects = hierarchy_objects(settings.car_root_object)
+    excluded = set(excluded_ghost_objects(settings))
+    car_objects = [obj for obj in hierarchy_objects(settings.car_root_object) if obj not in excluded]
     carrier_materials = [
         body_color.material
         for body_color in settings.body_colors
@@ -3386,6 +3733,7 @@ def export_car_glb(context, filepath, max_texture_size, optimize_color_textures,
             export_apply=True,
             export_cameras=True,
             **gltf_image_export_options(jpeg_quality),
+            **gltf_armature_export_options(scene_settings(context)),
         )
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")
@@ -3468,7 +3816,7 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
                 int(settings.max_texture_size),
                 settings.optimize_color_textures,
                 settings.jpeg_quality,
-            ))
+            ), excluded_objects=excluded_ghost_objects(settings))
 
             manifest = build_manifest(settings)
             (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
@@ -3527,6 +3875,12 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if not isinstance(data, dict):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
+        try:
+            ghost_config = parse_ghost_config(data.get("ghost"))
+            armature_config = parse_armature_config(data.get("armature"))
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
         removed_wheel_fields = {"sideFrictionStiffness", "brakeFactor", "sideFactor", "forwardFactor", "contactDamping"}
         pending_values = [data]
         while pending_values:
@@ -3546,6 +3900,15 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
+            return {"CANCELLED"}
+        engine_braking = engine.get("engineBraking")
+        if (
+            isinstance(engine_braking, bool)
+            or not isinstance(engine_braking, (int, float))
+            or not math.isfinite(engine_braking)
+            or engine_braking < 0
+        ):
+            self.report({"ERROR"}, "Manifest engine.engineBraking must be a finite nonnegative number")
             return {"CANCELLED"}
         if "finalDriveRatio" in engine or "gearRatios" in engine:
             self.report({"ERROR"}, "Manifest version 8 gearing must be configured by presets")
@@ -3728,6 +4091,15 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             if not isinstance(steering_angle, (int, float)) or not math.isfinite(steering_angle) or not 1 <= steering_angle <= 90:
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.maxSteeringAngle is invalid")
                 return {"CANCELLED"}
+            road_wheel_curve = preset_data.get("roadWheelCurve", 0.5)
+            if (
+                isinstance(road_wheel_curve, bool)
+                or not isinstance(road_wheel_curve, (int, float))
+                or not math.isfinite(road_wheel_curve)
+                or not 0 <= road_wheel_curve <= 1
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.roadWheelCurve must be between 0 and 1")
+                return {"CANCELLED"}
             rotation = preset_data.get("maxDegreesOfRotation")
             if not isinstance(rotation, (int, float)) or not math.isfinite(rotation) or not 90 <= rotation <= 2160:
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.maxDegreesOfRotation is invalid")
@@ -3813,6 +4185,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     return {"CANCELLED"}
 
         settings.is_configured = True
+        import_ghost_config(settings, ghost_config)
+        import_armature_config(settings, armature_config)
         settings.car_id = data.get("id", data.get("name", settings.car_id))
         settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
@@ -3845,6 +4219,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.redline_rpm = engine["redlineRPM"]
         settings.rev_limit = engine.get("revLimit", settings.rev_limit)
         settings.engine_inertia = engine.get("inertia", settings.engine_inertia)
+        settings.engine_braking = engine["engineBraking"]
         settings.engine_friction_torque = engine.get("frictionTorque", settings.engine_friction_torque)
         settings.clutch_response = engine.get("clutchResponse", settings.clutch_response)
         settings.shift_cooldown = engine.get("shiftCooldown", settings.shift_cooldown)
@@ -3913,6 +4288,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.preset_id = str(preset_data.get("id", next_preset_id(settings)))
             preset.display_name = str(preset_data.get("name", preset.preset_id))
             preset.max_steering_angle = preset_data["maxSteeringAngle"]
+            preset.road_wheel_curve = preset_data.get("roadWheelCurve", 0.5)
             preset.max_degrees_of_rotation = preset_data["maxDegreesOfRotation"]
             preset.front_anti_roll_bar_stiffness = preset_data["antiRollBars"]["front"]
             preset.rear_anti_roll_bar_stiffness = preset_data["antiRollBars"]["rear"]
@@ -4102,6 +4478,53 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "radius")
 
 
+def draw_armature(layout, settings):
+    header = layout.row(align=True)
+    header.alignment = "LEFT"
+    header.use_property_split = False
+    header.use_property_decorate = False
+    header.label(text="Armature")
+    header.separator(factor=0.5)
+    header.prop(settings, "armature_enabled", text="")
+    if not settings.armature_enabled:
+        return
+    layout.separator()
+    draw_split_prop(layout, settings, "armature_object")
+    rig = settings.armature_object
+    inputs = layout.column()
+    inputs.enabled = rig is not None and rig.type == "ARMATURE"
+    inputs.label(text="Follow Joint")
+    for group, key, _steering in WHEEL_KEYS:
+        prop = armature_bone_property(group, key)
+        if rig and rig.type == "ARMATURE":
+            inputs.prop_search(settings, prop, rig.data, "bones")
+        else:
+            inputs.prop(settings, prop)
+    layout.label(text="Leave a bone empty to skip that wheel", icon="INFO")
+
+
+def draw_custom_ghost(layout, settings):
+    header = layout.row(align=True)
+    header.alignment = "LEFT"
+    header.use_property_split = False
+    header.use_property_decorate = False
+    header.label(text="Custom Ghost")
+    header.separator(factor=0.5)
+    header.prop(settings, "ghost_enabled", text="")
+    if not settings.ghost_enabled:
+        return
+    layout.separator()
+    inputs = layout.column()
+    draw_split_prop(inputs, settings, "ghost_root_object")
+    for group, key, _steering in WHEEL_KEYS:
+        box = inputs.box()
+        box.label(text=WHEEL_LABELS[(group, key)])
+        wheel = ghost_wheel_settings(settings, group, key)
+        for _role, prop in GHOST_WHEEL_ROLES:
+            draw_split_prop(box, wheel, prop)
+    layout.label(text="Uses existing wheel axes, body colors and light materials", icon="INFO")
+
+
 def draw_presets(layout, settings):
     header = layout.row(align=True)
     header.label(text="Car Presets")
@@ -4127,6 +4550,7 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "preset_id")
     draw_split_prop(layout, preset, "display_name")
     draw_split_prop(layout, preset, "max_steering_angle")
+    draw_split_prop(layout, preset, "road_wheel_curve")
     draw_split_prop(layout, preset, "max_degrees_of_rotation")
     draw_split_prop(layout, preset, "front_anti_roll_bar_stiffness")
     draw_split_prop(layout, preset, "rear_anti_roll_bar_stiffness")
@@ -4245,6 +4669,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.separator(type="LINE")
         draw_body_colors(box, settings)
 
+        draw_custom_ghost(layout.box(), settings)
+
         box = layout.box()
         box.label(text="Steering Wheel")
         draw_split_prop(box, settings, "steering_wheel_object")
@@ -4270,6 +4696,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
             "rev_limit",
             "max_rpm",
             "engine_inertia",
+            "engine_braking",
             "engine_friction_torque",
             "clutch_response",
         ):
@@ -4302,6 +4729,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Wheel Setup")
         draw_wheels(box, settings)
+
+        draw_armature(layout.box(), settings)
 
         box = layout.box()
         box.label(text="Driver Assists")
@@ -4354,6 +4783,7 @@ classes = (
     CarColliderSettings,
     CarDownForcePointSettings,
     CarWheelSettings,
+    CarGhostWheelSettings,
     CarWheelPresetSettings,
     CarPresetSettings,
     CarExporterSettings,
