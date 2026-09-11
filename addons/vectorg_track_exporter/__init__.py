@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VectorG Track Exporter",
     "author": "VectorG",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > VectorG",
     "description": "Create and export VectorG track packages as <track_id>.glb + manifest.json zip",
@@ -63,6 +63,7 @@ DYNAMIC_COLLIDER_DENSITY = 10.0
 ROUTE_MAX_SPACING = 5.0
 ROUTE_MAX_ANGLE_DEGREES = 5.0
 ROUTE_MAX_CURVE_ERROR = 0.05
+ROUTE_MAX_WIDTH_ERROR = 0.01
 ROUTE_ENDPOINT_MAX_DISTANCE = 10.0
 ROUTE_EPSILON = 1e-6
 MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
@@ -1128,13 +1129,20 @@ def bezier_needs_subdivision(points):
     )
 
 
-def sample_bezier_segment(points, start_parameter=0.0, end_parameter=1.0, depth=0):
-    if depth >= 18 or not bezier_needs_subdivision(points):
+def sample_bezier_segment(points, start_parameter=0.0, end_parameter=1.0, depth=0, width_at=None):
+    width_needs_subdivision = False
+    if width_at is not None:
+        start_width, end_width = width_at(start_parameter), width_at(end_parameter)
+        for amount in (0.25, 0.5, 0.75):
+            width = width_at(start_parameter + (end_parameter - start_parameter) * amount)
+            expected = start_width + (end_width - start_width) * amount
+            width_needs_subdivision |= abs(width - expected) > ROUTE_MAX_WIDTH_ERROR
+    if depth >= 18 or (not bezier_needs_subdivision(points) and not width_needs_subdivision):
         return [(points[0], start_parameter), (points[3], end_parameter)]
     left, right = split_bezier(points)
     midpoint = (start_parameter + end_parameter) * 0.5
-    left_points = sample_bezier_segment(left, start_parameter, midpoint, depth + 1)
-    right_points = sample_bezier_segment(right, midpoint, end_parameter, depth + 1)
+    left_points = sample_bezier_segment(left, start_parameter, midpoint, depth + 1, width_at)
+    right_points = sample_bezier_segment(right, midpoint, end_parameter, depth + 1, width_at)
     return left_points[:-1] + right_points
 
 
@@ -1147,12 +1155,64 @@ def subdivide_line(start, end):
     ]
 
 
-def adaptive_route_samples(curve_object):
+def curve_point_radius(points, index, parameter, closed, interpolation):
+    """Match Blender's legacy curve radius interpolation at a segment parameter."""
+    def radius(offset):
+        at = index + offset
+        at = at % len(points) if closed else max(0, min(len(points) - 1, at))
+        return points[at].radius
+
+    a, b = radius(0), radius(1)
+    t = parameter
+    if interpolation == "LINEAR":
+        return a + (b - a) * t
+    if interpolation == "EASE":
+        return a + (b - a) * t * t * (3 - 2 * t)
+    before, after = radius(-1), radius(2)
+    if interpolation == "CARDINAL":
+        # Blender's cardinal interpolation uses tension 0.71.
+        return ((2 * t ** 3 - 3 * t ** 2 + 1) * a
+                + (t ** 3 - 2 * t ** 2 + t) * 0.71 * (b - before)
+                + (-2 * t ** 3 + 3 * t ** 2) * b
+                + (t ** 3 - t ** 2) * 0.71 * (after - a))
+    if interpolation == "BSPLINE":
+        return (before * (1 - t) ** 3 + a * (3 * t ** 3 - 6 * t ** 2 + 4)
+                + b * (-3 * t ** 3 + 3 * t ** 2 + 3 * t + 1) + after * t ** 3) / 6
+    raise ValueError(f"unsupported curve radius interpolation {interpolation}")
+
+
+def road_curve_depth(curve):
+    data = curve.data
+    if data.dimensions != "3D" or data.bevel_mode != "ROUND" or data.taper_object:
+        raise ValueError("road width requires a 3D curve with Round bevel and no taper object")
+    if data.extrude != 0 or data.offset != 0 or data.bevel_factor_start != 0 or data.bevel_factor_end != 1:
+        raise ValueError("road width requires no extrusion/offset and a full-length bevel")
+    basis = curve.matrix_world.to_3x3()
+    if any(abs(basis.col[i].dot(basis.col[j]) - (1 if i == j else 0)) > 1e-5
+           for i in range(3) for j in range(3)) or basis.determinant() < 0:
+        raise ValueError("road curve and its parents must have scale 1 with no shear or reflection")
+    if not math.isfinite(data.bevel_depth) or data.bevel_depth <= 0:
+        raise ValueError("road curve needs a positive Bevel Depth (half the base road width)")
+    return data.bevel_depth
+
+
+def adaptive_route_samples(curve_object, with_width=False):
     if not curve_object or len(curve_object.data.splines) != 1:
         return [], False
     spline = curve_object.data.splines[0]
     matrix = curve_object.matrix_world
     route = []
+    depth = road_curve_depth(curve_object) if with_width else 0
+
+    def width_function(points, index, interpolation):
+        def width_at(parameter):
+            radius = (curve_point_radius(points, index, parameter, spline.use_cyclic_u, interpolation)
+                      if curve_object.data.use_radius else 1.0)
+            width = 2 * depth * radius
+            if not math.isfinite(width) or round(width, 6) <= 0:
+                raise ValueError("road curve radius must produce a positive finite width everywhere")
+            return width
+        return width_at if with_width else None
 
     if spline.type == "BEZIER":
         points = list(spline.bezier_points)
@@ -1165,12 +1225,14 @@ def adaptive_route_samples(curve_object):
                 points[next_index].handle_left,
                 points[next_index].co,
             ))
-            sampled = sample_bezier_segment(segment)
+            width_at = width_function(points, index, spline.radius_interpolation)
+            sampled = sample_bezier_segment(segment, width_at=width_at)
             samples = [
                 {
                     "position": position,
                     "tilt": points[index].tilt
                     + (points[next_index].tilt - points[index].tilt) * parameter,
+                    **({"width": width_at(parameter)} if width_at is not None else {}),
                 }
                 for position, parameter in sampled
             ]
@@ -1182,11 +1244,13 @@ def adaptive_route_samples(curve_object):
         for index in range(max(0, segment_count)):
             next_index = (index + 1) % len(points)
             sampled = subdivide_line(points[index], points[next_index])
+            width_at = width_function(control_points, index, "LINEAR")
             samples = [
                 {
                     "position": position,
                     "tilt": control_points[index].tilt
                     + (control_points[next_index].tilt - control_points[index].tilt) * parameter,
+                    **({"width": width_at(parameter)} if width_at is not None else {}),
                 }
                 for position, parameter in sampled
             ]
@@ -1286,6 +1350,8 @@ def rebase_closed_route(samples, position):
         "position": projection["point"],
         "tilt": start["tilt"] + (end["tilt"] - start["tilt"]) * amount,
     }
+    if "width" in start:
+        seam["width"] = start["width"] + (end["width"] - start["width"]) * amount
     if "normal" in start and "normal" in end:
         seam["normal"] = start["normal"].lerp(end["normal"], amount).normalized()
     return [seam] + samples[next_index:] + samples[:next_index]
@@ -1445,7 +1511,8 @@ def validate_route_events(layout, events, total):
 
 def layout_route_data(layout, curve=None, sampled=None, surface_projector=None):
     curve = curve if curve is not None else layout.map_curve
-    samples, closed = sampled if sampled is not None else adaptive_route_samples(curve)
+    samples, closed = sampled if sampled is not None else checked_curve_samples(
+        curve, layout.route_type, with_width=curve == layout.map_curve)
     if len(samples) < 2:
         raise ValueError("must contain at least two route samples")
 
@@ -1480,7 +1547,7 @@ def layout_route_data(layout, curve=None, sampled=None, surface_projector=None):
         layout.length = total / 1000.0
 
     return {
-        "version": 2,
+        "version": 3,
         "closed": closed,
         "length": round(total, 6),
         "maxSpacing": ROUTE_MAX_SPACING,
@@ -1491,6 +1558,7 @@ def layout_route_data(layout, curve=None, sampled=None, surface_projector=None):
                 "position": game_vector(sample["position"]),
                 "forward": game_vector(frames[index]["forward"]),
                 "up": game_vector(frames[index]["up"]),
+                **({"width": round(sample["width"], 6)} if "width" in sample else {}),
             }
             for index, sample in enumerate(samples)
         ],
@@ -1510,7 +1578,7 @@ def ideal_length(a):
     return math.sqrt(ideal_dot(a, a))
 
 
-def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000):
+def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000, widths=None):
     if len(points) < (3 if closed else 2) or len(points) != len(tilts):
         raise ValueError("Route needs at least three closed or two open points")
     if not all(math.isfinite(v) for p in points for v in p) or not all(map(math.isfinite, tilts)):
@@ -1522,12 +1590,27 @@ def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000):
     total = sum(spans)
     segments = max(3 if closed else 1, math.ceil(total / spacing))
     count = segments if closed else segments + 1
-    if count > max_points:
+    if widths is not None and (len(widths) != len(points) or any(not math.isfinite(w) or w <= 0 for w in widths)):
+        raise ValueError("Route widths must be positive and match the route points")
+    distances = [total * i / segments for i in range(count)]
+    if widths is not None:
+        # Retain width breakpoints so a short narrowing cannot disappear between
+        # the regular planning points. Constant-width stretches stay sparse.
+        distance = 0.0
+        for i in range(1, len(points) if closed else len(points) - 1):
+            distance += spans[i - 1]
+            before = (widths[i] - widths[i - 1]) / spans[i - 1]
+            after = (widths[(i + 1) % len(points)] - widths[i]) / spans[i]
+            if abs(before - after) > 1e-7:
+                distances.append(distance)
+        distances.sort()
+        distances = [distance for i, distance in enumerate(distances)
+                     if i == 0 or distance - distances[i - 1] > 1e-6]
+    if len(distances) > max_points:
         raise ValueError(f"Route needs more than {max_points} planning points")
-    result, result_tilts = [], []
+    result, result_tilts, result_widths = [], [], []
     segment, start = 0, 0.0
-    for i in range(count):
-        distance = total * i / segments
+    for distance in distances:
         while segment < len(spans) - 1 and start + spans[segment] < distance:
             start += spans[segment]
             segment += 1
@@ -1535,7 +1618,9 @@ def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000):
         end = (segment + 1) % len(points)
         result.append(tuple(a + (b - a) * t for a, b in zip(points[segment], points[end])))
         result_tilts.append(tilts[segment] + (tilts[end] - tilts[segment]) * t)
-    return result, result_tilts
+        if widths is not None:
+            result_widths.append(widths[segment] + (widths[end] - widths[segment]) * t)
+    return (result, result_tilts, result_widths) if widths is not None else (result, result_tilts)
 
 
 def ideal_curvature_energy_gradient(points, rights, closed):
@@ -1564,20 +1649,20 @@ def ideal_curvature_energy_gradient(points, rights, closed):
     return energy, gradient
 
 
-def ideal_optimize_offsets(centers, rights, closed, limit, max_iterations=400):
+def ideal_optimize_offsets(centers, rights, closed, limits, max_iterations=400):
     """Projected L-BFGS with bounded line search and pinned open endpoints.
 
     Returns (positions, offsets, converged). A bounded, improved result may be
     returned with converged=False, which callers must report to the artist.
     """
-    if not math.isfinite(limit) or limit < 0:
+    if len(limits) != len(centers) or any(not math.isfinite(limit) or limit < 0 for limit in limits):
         raise ValueError("Edge clearance must leave space inside the road width")
     if len(centers) != len(rights) or len(centers) < (3 if closed else 2):
         raise ValueError("Invalid planning frames")
     if not all(math.isfinite(v) for p in [*centers, *rights] for v in p):
         raise ValueError("Planning frames contain non-finite coordinates")
     count = len(centers)
-    bounds = [limit] * count
+    bounds = list(limits)
     if not closed:
         bounds[0] = bounds[-1] = 0.0
 
@@ -1754,7 +1839,7 @@ def ideal_fit_editable_curve(points, closed, tolerance=0.1):
     return indices, [tuple(result[index]) for index in indices]
 
 
-def checked_curve_samples(curve, route_type):
+def checked_curve_samples(curve, route_type, with_width=False):
     if not curve or curve.type != "CURVE" or len(curve.data.splines) != 1:
         raise ValueError("needs exactly one curve spline")
     spline = curve.data.splines[0]
@@ -1766,7 +1851,7 @@ def checked_curve_samples(curve, route_type):
         raise ValueError("must be open for a point-to-point layout")
     if curve.modifiers:
         raise ValueError("must have modifiers applied before sampling")
-    samples, closed = adaptive_route_samples(curve)
+    samples, closed = adaptive_route_samples(curve, with_width)
     if len(samples) < (3 if closed else 2):
         raise ValueError("has too few distinct points")
     if not all(math.isfinite(v) for sample in samples for v in (*sample["position"], sample["tilt"])):
@@ -1775,14 +1860,26 @@ def checked_curve_samples(curve, route_type):
     return samples, closed
 
 
-def ideal_line_limit(layout):
-    width, clearance = layout.ideal_line_road_width, layout.ideal_line_edge_clearance
+def ideal_line_limit(width, clearance):
     if not math.isfinite(width) or not math.isfinite(clearance) or width <= 0 or clearance < 0:
         raise ValueError("Road width must be positive and edge clearance non-negative")
     limit = width * 0.5 - clearance
     if limit <= 0:
         raise ValueError("Edge clearance must be smaller than half the road width")
     return limit
+
+
+def route_width_at(route, distance):
+    from bisect import bisect_right
+    samples = route["samples"]
+    distance = distance % route["length"] if route["closed"] else max(0, min(route["length"], distance))
+    index = max(0, bisect_right(samples, distance, key=lambda sample: sample["s"]) - 1)
+    end = (index + 1) % len(samples)
+    if not route["closed"] and index == len(samples) - 1:
+        return samples[index]["width"]
+    end_s = route["length"] if end == 0 else samples[end]["s"]
+    amount = (distance - samples[index]["s"]) / (end_s - samples[index]["s"])
+    return samples[index]["width"] + (samples[end]["width"] - samples[index]["width"]) * amount
 
 
 def route_projection_index(route_data):
@@ -1861,13 +1958,13 @@ def layout_ideal_line_data(layout, context):
     if layout.ideal_line == layout.map_curve:
         raise ValueError("must be a separate object from the map curve")
     samples, closed = checked_curve_samples(layout.ideal_line, layout.route_type)
-    checked_curve_samples(layout.map_curve, layout.route_type)
-    limit = ideal_line_limit(layout)
     tree = ideal_line_surface_tree(context, layout)
     if tree is None:
         raise ValueError("has no static road collision meshes to project onto")
     samples = project_ideal_line_to_surface(samples, tree, layout.ideal_line_snap_distance)
     reference = layout_route_data(layout)
+    for sample in reference["samples"]:
+        ideal_line_limit(sample["width"], layout.ideal_line_edge_clearance)
     data = layout_route_data(layout, layout.ideal_line, (samples, closed),
                             lambda values: project_ideal_line_to_surface(values, tree, layout.ideal_line_snap_distance))
     if data["closed"] != reference["closed"]:
@@ -1875,6 +1972,7 @@ def layout_ideal_line_data(layout, context):
     projections = project_ideal_samples(reference, data["samples"])
     outside, displaced = 0, 0
     for sample, (route_s, lateral, vertical, forward) in zip(data["samples"], projections):
+        limit = ideal_line_limit(route_width_at(reference, route_s), layout.ideal_line_edge_clearance)
         if Vector(sample["forward"]).dot(forward) <= 0:
             raise ValueError("must follow the map curve's driving direction without reversing")
         sample["routeS"] = round(route_s, 6)
@@ -1882,18 +1980,17 @@ def layout_ideal_line_data(layout, context):
         displaced += abs(vertical) > 1.0
     warnings = []
     if outside:
-        warnings.append(f"{outside} ideal-line samples exceed the assumed width/clearance; review the edited line")
+        warnings.append(f"{outside} ideal-line samples exceed the road curve width/clearance; review the edited line")
     if displaced:
         warnings.append(f"{displaced} ideal-line samples are over 1 m from the route surface frame; check road placement")
     data["version"] = 1
-    data["roadWidth"] = layout.ideal_line_road_width
     data["edgeClearance"] = layout.ideal_line_edge_clearance
     data["referenceRoute"] = f"routes/{layout.layout_id}.json"
     # Generation settings on the object describe its last explicit generation,
-    # while roadWidth/edgeClearance describe the artist's current corridor.
+    # while the reference route widths and edgeClearance describe the current corridor.
     generated = layout.ideal_line.get("vectorg_ideal_line_generation")
     if generated:
-        data["generation"] = json.loads(generated)
+        data["generation"] = {key: value for key, value in json.loads(generated).items() if key != "roadWidth"}
     return data, warnings
 
 
@@ -1952,16 +2049,20 @@ def snap_ideal_point(tree, point, up):
 
 
 def generate_ideal_line(context, layout):
-    limit = ideal_line_limit(layout)
-    samples, closed = checked_curve_samples(layout.map_curve, layout.route_type)
-    centers, tilts = ideal_resample([tuple(s["position"]) for s in samples], [s["tilt"] for s in samples], closed)
+    samples, closed = checked_curve_samples(layout.map_curve, layout.route_type, with_width=True)
+    for sample in samples:
+        ideal_line_limit(sample["width"], layout.ideal_line_edge_clearance)
+    centers, tilts, widths = ideal_resample([tuple(s["position"]) for s in samples],
+                                         [s["tilt"] for s in samples], closed,
+                                         widths=[s["width"] for s in samples])
+    limits = [ideal_line_limit(width, layout.ideal_line_edge_clearance) for width in widths]
     planning = [{"position": Vector(p), "tilt": tilt} for p, tilt in zip(centers, tilts)]
     cumulative, total = route_distances(planning, closed)
     reference_up = layout.map_curve.matrix_world.to_3x3() @ Vector((0, 0, 1))
     frames = route_frames(planning, closed, cumulative, total, reference_up)
     rights = [tuple(frame["up"].cross(frame["forward"]).normalized()) for frame in frames]
     # Leave a little room for cubic interpolation between control points.
-    points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, max(0.0, limit - 0.15))
+    points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, [max(0.0, limit - 0.15) for limit in limits])
     tree = ideal_line_surface_tree(context, layout)
     surface_points, normals, missed = [], [], 0
     for point, frame in zip(points, frames):
@@ -2691,10 +2792,6 @@ class TrackLayoutSettings(PropertyGroup):
         poll=curve_object_poll,
         update=update_map_curve,
     )
-    ideal_line_road_width: FloatProperty(
-        name="Road Width (m)", description="Full usable width, centered on the Map Curve; used on generation",
-        default=10.0, min=0.1, max=200.0,
-    )
     ideal_line_edge_clearance: FloatProperty(
         name="Edge Clearance (m)",
         description="Distance from the line to each road edge, including half the reference car width and safety margin",
@@ -2885,7 +2982,7 @@ class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
 class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
     bl_idname = "track_exporter.generate_ideal_line"
     bl_label = "Generate Ideal Line"
-    bl_description = "Generate an editable Bezier line using road width and clearance; replaces the assigned line's shape (Undo supported)"
+    bl_description = "Generate an editable Bezier line using Map Curve thickness and clearance; replaces the assigned line's shape (Undo supported)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -2927,7 +3024,7 @@ class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
         curve.matrix_world = Matrix.Identity(4)
         curve.show_in_front = True
         curve["vectorg_ideal_line_generation"] = json.dumps({
-            "version": 1, "method": "minimum_curvature", "roadWidth": layout.ideal_line_road_width,
+            "version": 2, "method": "minimum_curvature",
             "edgeClearance": layout.ideal_line_edge_clearance, "converged": converged,
         })
         layout.ideal_line = curve
@@ -3431,7 +3528,7 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             draw_split_prop(box, current, "map_curve")
             box.separator()
             box.label(text="Ideal Line")
-            draw_split_prop(box, current, "ideal_line_road_width")
+            box.label(text="Road width comes from Map Curve thickness")
             draw_split_prop(box, current, "ideal_line_edge_clearance")
             draw_split_prop(box, current, "ideal_line_snap_distance")
             draw_split_prop(box, current, "ideal_line")

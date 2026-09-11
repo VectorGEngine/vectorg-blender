@@ -70,11 +70,31 @@ while preserving its world transform. The exporter calculates layout length from
 that curve, projects it onto world XY for `maps/<layout_id>.svg`, and adaptively
 samples its full 3D shape for `routes/<layout_id>.json`. Route samples have a
 maximum spacing of 5 metres and become denser around corners and elevation
-changes. Route format version 2 stores cumulative distance in metres, world
-position, forward direction, and up direction at every sample. The frame uses
+changes. Route format version 3 stores cumulative distance in metres, world
+position, forward direction, up direction, and full road `width` in metres at
+every sample. The frame uses
 parallel transport for stable orientation and applies the map curve control
 points' tilt as road banking. Set the curve tilt to match the road on banked
 sections.
+
+The Map Curve's visible thickness defines the legal road width. In Curve Data
+Properties, use **3D** and **Geometry > Bevel > Round**, then set **Depth** to
+half the base road width. For a 10 m road, use Depth `5 m` and point Radius `1`.
+In Edit Mode, select points and use **Alt+S** or the Sidebar's **Radius** field
+to vary the width. The exporter calculates `width = 2 * bevel_depth * radius`
+in the existing route sampling pass. If curve radius scaling is disabled,
+width is the constant bevel diameter. Bezier radius interpolation follows the
+curve's Linear, Ease, Cardinal, or B-Spline setting; Poly radii interpolate
+linearly. Nonlinear width changes add route samples as needed to keep linear
+width interpolation within 1 cm of the authored curve.
+
+Keep the curve and its parents at scale `(1, 1, 1)`, without shear or reflection.
+Road curves require positive width, full-length Round bevel, no taper object,
+and zero Geometry Offset/Extrude. Validation reports unsupported settings.
+The Map Curve must follow the middle of the legal road; thickness expands both
+sides equally. Its bevel is for authoring only and remains excluded from the
+GLB with the MAP hierarchy. Increment **Package Version** when exporting new
+widths. Route version 3 requires the matching game loader.
 
 The route file also stores the projected distance of the start, finish, and
 checkpoint events. Circular routes are rebased so the start/finish event is
@@ -94,7 +114,7 @@ The generated route data has this shape:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "closed": true,
   "length": 1234.5,
   "maxSpacing": 5.0,
@@ -104,7 +124,8 @@ The generated route data has this shape:
       "s": 0.0,
       "position": [0.0, 0.0, 0.0],
       "forward": [0.0, 0.0, 1.0],
-      "up": [0.0, 1.0, 0.0]
+      "up": [0.0, 1.0, 0.0],
+      "width": 10.0
     }
   ],
   "events": [
@@ -189,12 +210,14 @@ not delete Blender objects.
 
 ## Editable ideal line
 
-In a layout's **Ideal Line** section, set **Road Width (m)** (default 10) and
-**Edge Clearance (m)** (default 1.5), then click **Generate Ideal Line** in Object
+In a layout's **Ideal Line** section, set **Edge Clearance (m)** (default 1.5),
+then click **Generate Ideal Line** in Object
 Mode. Clearance is measured from the line to each road edge: include half the
-reference vehicle width plus a safety margin. The defaults allow offsets of
-3.5 m either side of a centered Map Curve. Width is a constant authoring
-assumption; verify narrow sections and off-center map curves yourself.
+reference vehicle width plus a safety margin. Road width comes from the Map
+Curve's sampled thickness; there is no separate Road Width parameter. A 10 m
+wide section with 1.5 m clearance allows offsets of 3.5 m either side of the
+Map Curve. Each planning point uses its local width, and any section too narrow
+for the requested clearance fails validation/generation.
 
 Generation minimizes a discrete integrated squared-curvature objective inside
 that corridor using internal points about 6 m apart. It then fits a simpler
@@ -227,7 +250,7 @@ an open spline. **Freeform** uses the Map Curve's open/closed state. Generation
 pins the endpoints of open lines. Curves must contain exactly one supported
 spline, follow the route's driving direction, and have modifiers applied.
 
-Changing width or clearance does not alter an existing curve. **Regenerate Ideal
+Changing Map Curve thickness or clearance does not alter an existing ideal line. **Regenerate Ideal
 Line** explicitly replaces its shape and supports Blender Undo. Export never
 regenerates the line and never modifies your control points.
 
@@ -243,12 +266,12 @@ Normals are oriented upwards, and near-vertical faces are rejected.
 Distances and orientation frames are calculated after projection, including any
 new start/finish seam sample. Circular lines start at their projected start/finish
 event; open lines retain both endpoints. The original map, route, and declared
-layout length continue to use the Map Curve. Samples outside the assumed lateral
-corridor produce warnings so hand corrections can accommodate local road widths.
+layout length continue to use the Map Curve. Samples outside its local
+width/clearance corridor produce warnings for review of hand-edited lines.
 
 The layout manifest gains `idealLine: "ideal-lines/<layout_id>.json"`. The
 separate file has `version: 1`, `closed`, `length`, `maxSpacing`,
-`frame: "surface_normal"`, `roadWidth`, `edgeClearance`, `referenceRoute`,
+`frame: "surface_normal"`, `edgeClearance`, `referenceRoute`,
 `samples`, and projected `events`. Samples contain `s`, `position`, `forward`,
 `up`, and `routeS` (distance on the original route, which can wrap at its seam).
 Coordinates use the existing Blender-to-game conversion and distances are in

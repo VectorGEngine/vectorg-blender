@@ -47,6 +47,17 @@ WHEEL_LABELS = {
     ("rear", "r"): "Rear Right Wheel",
 }
 
+ARMATURE_ATTACHMENT_ROLES = {
+    "root": None,
+    **{f"{role}_{group[0]}{key}": (group, key, prop)
+       for role, prop in (("mount", "suspension_ref"), ("joint", "hub_ref"), ("spin", "wheel_ref"))
+       for group, key, _steering in WHEEL_KEYS},
+}
+ARMATURE_ATTACHMENT_ITEMS = tuple(
+    (role, role, "Use the existing car object assignment") for role in ARMATURE_ATTACHMENT_ROLES
+)
+ARMATURE_TIP_ITEMS = (("none", "None", "Follow Base Attachment without aiming"),) + ARMATURE_ATTACHMENT_ITEMS
+
 TIRE_TYPE_ITEMS = (
     ("soft", "Soft", "Highest configured dry-road tire grip"),
     ("medium", "Medium", "Balanced configured tire grip"),
@@ -355,57 +366,104 @@ def armature_object_poll(_settings, obj):
     return obj.type == "ARMATURE"
 
 
-def armature_bone_property(group, key):
-    return f"armature_{group}_{key}_bone"
+def armature_attachment_object(settings, role):
+    if role not in ARMATURE_ATTACHMENT_ROLES:
+        raise ValueError(f"Unknown armature attachment: {role}")
+    assignment = ARMATURE_ATTACHMENT_ROLES[role]
+    if assignment is None:
+        obj = settings.car_root_object
+    else:
+        group, key, prop = assignment
+        wheel = next((wheel for wheel in settings.wheels if (wheel.group, wheel.key) == (group, key)), None)
+        obj = getattr(wheel, prop) if wheel else None
+    if not obj or obj not in car_export_objects(settings) or not is_object_in_tree(settings.car_root_object, obj):
+        raise ValueError(f"Armature attachment {role} requires an exported car object assignment")
+    if is_object_in_tree(settings.ghost_root_object, obj):
+        raise ValueError(f"Armature attachment {role} must be outside the custom ghost hierarchy")
+    return obj
+
+
+def armature_attachment_offset(obj, world_position):
+    try:
+        position = obj.matrix_world.inverted() @ world_position
+    except ValueError as error:
+        raise ValueError(f"Armature attachment {obj.name} has a singular transform") from error
+    # Position conversion matches GLB's coordinate basis, not the axis-selector labels.
+    return blender_position_to_game(position)
 
 
 def parse_armature_config(value):
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) - {"obj", "wheels"}:
-        raise ValueError("Manifest armature must contain only obj and wheels")
+    if not isinstance(value, dict) or set(value) != {"obj", "joints"}:
+        raise ValueError("Manifest armature must contain obj and joints; recreate old wheel mappings with Add Joint")
     name = value.get("obj")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Manifest armature.obj must be a non-empty string")
-    wheels = value.get("wheels")
-    if not isinstance(wheels, dict) or set(wheels) - {"front", "rear"}:
-        raise ValueError("Manifest armature.wheels must contain only front and rear mappings")
-    result = {"obj": name, "wheels": {}}
+    joints = value["joints"]
+    if not isinstance(joints, list) or not joints:
+        raise ValueError("Armature requires at least one joint mapping")
+    result = {"obj": name, "joints": []}
     used_bones = set()
-    for group in ("front", "rear"):
-        if group not in wheels:
-            continue
-        axle = wheels[group]
-        if not isinstance(axle, dict) or set(axle) - {"l", "r"}:
-            raise ValueError(f"Manifest armature.wheels.{group} must contain only l and r mappings")
-        for key in ("l", "r"):
-            if key not in axle:
+    for index, mapping in enumerate(joints):
+        path = f"armature.joints[{index}]"
+        if not isinstance(mapping, dict) or set(mapping) != {"bone", "base", "tip", "stretch", "tipOffset"}:
+            raise ValueError(f"Manifest {path} must contain bone, base, tip, stretch and tipOffset")
+        bone = mapping["bone"]
+        if not isinstance(bone, str) or not bone.strip():
+            raise ValueError(f"Manifest {path}.bone must be a non-empty string")
+        if bone in used_bones:
+            raise ValueError(f"Armature bone is assigned more than once: {bone}")
+        used_bones.add(bone)
+        for field in ("base", "tip"):
+            role = mapping[field]
+            if field == "tip" and role is None:
                 continue
-            mapping = axle[key]
-            path = f"armature.wheels.{group}.{key}"
-            if not isinstance(mapping, dict) or set(mapping) != {"bone"}:
-                raise ValueError(f"Manifest {path} must contain only bone")
-            bone = mapping["bone"]
-            if not isinstance(bone, str) or not bone.strip():
-                raise ValueError(f"Manifest {path}.bone must be a non-empty string")
-            if bone in used_bones:
-                raise ValueError(f"Armature bone is assigned to multiple wheels: {bone}")
-            used_bones.add(bone)
-            result["wheels"].setdefault(group, {})[key] = {"bone": bone}
-    if not used_bones:
-        raise ValueError("Armature requires at least one Follow Joint bone")
+            if not isinstance(role, str) or role not in ARMATURE_ATTACHMENT_ROLES:
+                raise ValueError(f"Manifest {path}.{field} must select an attachment role")
+        if not isinstance(mapping["stretch"], bool):
+            raise ValueError(f"Manifest {path}.stretch must be a boolean")
+        if mapping["tip"] is None and (mapping["stretch"] or mapping["tipOffset"] is not None):
+            raise ValueError(f"Manifest {path} without a tip must have stretch false and tipOffset null")
+        if mapping["tip"] is not None:
+            vector = mapping["tipOffset"]
+            if (not isinstance(vector, list) or len(vector) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in vector)):
+                raise ValueError(f"Manifest {path}.tipOffset must be a finite three-component position")
+        result["joints"].append({**mapping, "tipOffset": list(mapping["tipOffset"]) if mapping["tip"] is not None else None})
     return result
 
 
 def build_armature_config(settings):
     if not settings.armature_enabled:
         return None
-    wheels = {}
-    for group, key, _steering in WHEEL_KEYS:
-        bone = getattr(settings, armature_bone_property(group, key))
-        if bone:
-            wheels.setdefault(group, {})[key] = {"bone": bone}
-    return parse_armature_config({"obj": object_config_name(settings.armature_object), "wheels": wheels})
+    rig = settings.armature_object
+    if not rig or rig.type != "ARMATURE":
+        raise ValueError("Armature object is required and must be an Armature")
+    joints = []
+    for mapping in settings.armature_joints:
+        bone = rig.data.bones.get(mapping.bone)
+        if bone is None:
+            raise ValueError(f"Joint bone is missing from {rig.name}: {mapping.bone or '(unassigned)'}")
+        if bone.use_connect:
+            raise ValueError(f"Joint bone {bone.name} must have Connected disabled so it can translate")
+        # Bone rest coordinates are independent of pose-mode animation and constraints.
+        head = rig.matrix_world @ bone.head_local
+        tail = rig.matrix_world @ bone.tail_local
+        length = (tail - head).length
+        if not math.isfinite(length) or length <= 1e-6:
+            raise ValueError(f"Joint bone {bone.name} must have a non-zero finite rest length")
+        base = armature_attachment_object(settings, mapping.base_attachment)
+        # Validate the base transform; its bone-relative offset is derived from GLB rest transforms at runtime.
+        armature_attachment_offset(base, head)
+        tip_role = mapping.tip_attachment if mapping.tip_attachment != "none" else None
+        tip = armature_attachment_object(settings, tip_role) if tip_role else None
+        joints.append({
+            "bone": bone.name, "base": mapping.base_attachment, "tip": tip_role,
+            "stretch": bool(mapping.stretch) if tip else False,
+            "tipOffset": armature_attachment_offset(tip, tail) if tip else None,
+        })
+    return parse_armature_config({"obj": object_config_name(rig), "joints": joints})
 
 
 def import_armature_config(settings, config):
@@ -414,9 +472,13 @@ def import_armature_config(settings, config):
     if config is None:
         return
     set_object_pointer(settings, "armature_object", config["obj"])
-    for group, key, _steering in WHEEL_KEYS:
-        mapping = config["wheels"].get(group, {}).get(key)
-        setattr(settings, armature_bone_property(group, key), mapping["bone"] if mapping else "")
+    settings.armature_joints.clear()
+    for mapping in config["joints"]:
+        joint = settings.armature_joints.add()
+        joint.bone = mapping["bone"]
+        joint.base_attachment = mapping["base"]
+        joint.tip_attachment = mapping["tip"] or "none"
+        joint.stretch = mapping["stretch"]
 
 
 def validate_armature_scene(settings, errors, warnings):
@@ -439,22 +501,10 @@ def validate_armature_scene(settings, errors, warnings):
                 errors.append("Armature and normal wheel objects must use independent hierarchies")
                 break
     try:
-        config = build_armature_config(settings)
+        build_armature_config(settings)
     except ValueError as error:
         errors.append(str(error))
         return
-    wheels = {(wheel.group, wheel.key): wheel for wheel in settings.wheels}
-    for group, axle in config["wheels"].items():
-        for key, mapping in axle.items():
-            label = WHEEL_LABELS[(group, key)]
-            bone = rig.data.bones.get(mapping["bone"])
-            if bone is None:
-                errors.append(f"{label} Follow Joint bone is missing from {rig.name}: {mapping['bone']}")
-            elif bone.use_connect:
-                errors.append(f"{label} Follow Joint bone must have Connected disabled so it can translate")
-            wheel = wheels.get((group, key))
-            if not wheel or not wheel.hub_ref or wheel.hub_ref not in exported_objects:
-                errors.append(f"{label} Follow Joint requires an exported wheel Joint object")
 
 
 def gltf_armature_export_options(settings):
@@ -1678,6 +1728,22 @@ class CarWheelSettings(PropertyGroup):
     )
 
 
+class CarArmatureJointSettings(PropertyGroup):
+    bone: StringProperty(name="Bone", description="Existing bone driven by the selected attachments")
+    base_attachment: EnumProperty(
+        name="Base Attachment", items=ARMATURE_ATTACHMENT_ITEMS, default="root",
+        description="Existing car role followed by the bone head, preserving its authored offset",
+    )
+    tip_attachment: EnumProperty(
+        name="Tip Attachment", items=ARMATURE_TIP_ITEMS, default="none",
+        description="Existing car role followed by the bone tail; None follows only the base",
+    )
+    stretch: BoolProperty(
+        name="Stretch", default=False,
+        description="Scale the bone along its length to reach the tip, preserving thickness",
+    )
+
+
 class CarGhostWheelSettings(PropertyGroup):
     suspension_ref: PointerProperty(
         name="Mount", description="Ghost suspension attachment inside Ghost Root", type=bpy.types.Object,
@@ -1979,7 +2045,7 @@ class CarExporterSettings(PropertyGroup):
     ghost_rear_r: PointerProperty(type=CarGhostWheelSettings)
     armature_enabled: BoolProperty(
         name="Enable Armature",
-        description="Export bone mappings that follow the existing wheel Joint objects in the game",
+        description="Export bone mappings that follow, aim and stretch between existing car attachments",
         default=False,
     )
     armature_object: PointerProperty(
@@ -1988,10 +2054,7 @@ class CarExporterSettings(PropertyGroup):
         type=bpy.types.Object,
         poll=armature_object_poll,
     )
-    armature_front_l_bone: StringProperty(name="Front Left", description="Bone following the front-left Joint; leave empty to skip")
-    armature_front_r_bone: StringProperty(name="Front Right", description="Bone following the front-right Joint; leave empty to skip")
-    armature_rear_l_bone: StringProperty(name="Rear Left", description="Bone following the rear-left Joint; leave empty to skip")
-    armature_rear_r_bone: StringProperty(name="Rear Right", description="Bone following the rear-right Joint; leave empty to skip")
+    armature_joints: CollectionProperty(type=CarArmatureJointSettings)
     center_of_mass_object: PointerProperty(
         name="Center of Mass",
         description="Helper object defining the vehicle's center of mass",
@@ -2439,8 +2502,7 @@ def clear_configuration_settings(settings):
     settings.ghost_root_object = None
     settings.armature_enabled = False
     settings.armature_object = None
-    for group, key, _steering in WHEEL_KEYS:
-        setattr(settings, armature_bone_property(group, key), "")
+    settings.armature_joints.clear()
     for group, key, _steering in WHEEL_KEYS:
         wheel = ghost_wheel_settings(settings, group, key)
         for _role, prop in GHOST_WHEEL_ROLES:
@@ -3001,6 +3063,37 @@ class CAR_EXPORTER_OT_estimate_brake_force(Operator):
             {"INFO"},
             f"{self.axle.title()} brake force set to {force_kg:.0f} kg ({deceleration_g:.2f} g estimate)",
         )
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_add_armature_joint(Operator):
+    bl_idname = "car_exporter.add_armature_joint"
+    bl_label = "Add Joint"
+    bl_description = "Add a mapping for an existing armature bone"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        rig = settings.armature_object
+        if not settings.armature_enabled or not rig or rig.type != "ARMATURE":
+            self.report({"ERROR"}, "Enable Armature and select an armature first")
+            return {"CANCELLED"}
+        settings.armature_joints.add()
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_armature_joint(Operator):
+    bl_idname = "car_exporter.remove_armature_joint"
+    bl_label = "Remove Joint"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty()
+
+    def execute(self, context):
+        joints = scene_settings(context).armature_joints
+        if not 0 <= self.index < len(joints):
+            return {"CANCELLED"}
+        joints.remove(self.index)
         return {"FINISHED"}
 
 
@@ -4493,14 +4586,21 @@ def draw_armature(layout, settings):
     rig = settings.armature_object
     inputs = layout.column()
     inputs.enabled = rig is not None and rig.type == "ARMATURE"
-    inputs.label(text="Follow Joint")
-    for group, key, _steering in WHEEL_KEYS:
-        prop = armature_bone_property(group, key)
+    inputs.operator("car_exporter.add_armature_joint", icon="ADD")
+    for index, joint in enumerate(settings.armature_joints):
+        box = inputs.box()
+        row = box.row(align=True)
+        row.label(text=joint.bone or f"Joint {index + 1}")
+        row.operator("car_exporter.remove_armature_joint", text="", icon="REMOVE").index = index
         if rig and rig.type == "ARMATURE":
-            inputs.prop_search(settings, prop, rig.data, "bones")
+            box.prop_search(joint, "bone", rig.data, "bones")
         else:
-            inputs.prop(settings, prop)
-    layout.label(text="Leave a bone empty to skip that wheel", icon="INFO")
+            box.prop(joint, "bone")
+        draw_split_prop(box, joint, "base_attachment")
+        draw_split_prop(box, joint, "tip_attachment")
+        if joint.tip_attachment != "none":
+            draw_split_prop(box, joint, "stretch")
+    layout.label(text="Bone head and tail define the attachment offsets", icon="INFO")
 
 
 def draw_custom_ghost(layout, settings):
@@ -4783,6 +4883,7 @@ classes = (
     CarColliderSettings,
     CarDownForcePointSettings,
     CarWheelSettings,
+    CarArmatureJointSettings,
     CarGhostWheelSettings,
     CarWheelPresetSettings,
     CarPresetSettings,
@@ -4791,6 +4892,8 @@ classes = (
     CAR_EXPORTER_UL_presets,
     CAR_EXPORTER_OT_validate_car,
     CAR_EXPORTER_OT_estimate_brake_force,
+    CAR_EXPORTER_OT_add_armature_joint,
+    CAR_EXPORTER_OT_remove_armature_joint,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
     CAR_EXPORTER_OT_add_center_of_mass,

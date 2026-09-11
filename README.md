@@ -341,11 +341,35 @@ selection is not configured by the Blender addon.
 
 ## Armature
 
-Under **Wheel Setup**, enable **Armature** and select the suspension armature.
-For each wheel, select a **Follow Joint** bone from that armature. The source
-is the wheel's existing **Joint** object; do not duplicate the object assignment.
-Leave a bone field empty to skip that wheel. At least one mapping is required
-when enabled, and each mapped bone must be different.
+Enable **Armature**, select the armature object, and press **Add Joint**.
+Each entry maps an existing bone; the button does not create or reparent bones.
+
+- **Bone:** searchable list of bones in the selected armature.
+- **Base Attachment:** required dropdown using the existing car assignments.
+- **Tip Attachment:** the same dropdown, plus **None** for follow-only mode.
+- **Stretch:** shown when Tip is selected; disabled by default.
+
+Attachment identifiers are `root`, `mount_fl`, `mount_fr`, `mount_rl`, `mount_rr`,
+`joint_fl`, `joint_fr`, `joint_rl`, `joint_rr`, `spin_fl`, `spin_fr`, `spin_rl`,
+and `spin_rr`. They resolve through the normal car's configured root and wheel
+objects, so no duplicate assignments are needed. Joint follows suspension and
+steering; Spin additionally inherits wheel rolling.
+
+Author the bone in **Edit Mode**: its head is the base mounting point and its
+tail is the tip mounting point. These points can be offset from the attachment
+object origins. The game derives the base relationship from the bone's GLB rest
+transform. Export saves the tail offset, including parent transforms, because
+GLB bone nodes do not store Blender bone tails. It does not sample posed bone
+positions or Blender constraints.
+
+| Setup | Intended game behaviour |
+| --- | --- |
+| Base only | Follow base position and rotation, preserving the authored bone offset and orientation. |
+| Base and Tip, Stretch off | Position the head at Base and aim toward Tip; preserve rest length. |
+| Base and Tip, Stretch on | Also scale lengthwise to reach Tip; preserve thickness. |
+
+With Stretch off, the tail need not reach the moving tip attachment. Removing
+Tip exports follow-only mode even if Stretch was previously checked.
 
 Keep the rig and normal wheel objects in independent branches below Car Root:
 
@@ -361,11 +385,15 @@ CarRoot
     `-- SuspensionGeometry (Mesh with Armature modifier)
 ```
 
-Inside the armature, parent the hub bones to a fixed chassis bone, with
-**Connected** disabled on the hub bones so they can translate. Weight the
-chassis-side suspension vertices to the chassis bone and the wheel-side
-vertices to the corresponding hub bone. The chassis bone needs no mapping.
-The selected rig must be outside the Custom Ghost subtree.
+For example, map `hub_fl` to Base `joint_fl` with no Tip. Map `rod_fl` to Base
+`root`, Tip `joint_fl`, and enable Stretch. Place its head at the chassis mounting
+point and its tail at the wheel-side mounting point. Weight the entire rod to
+`rod_fl` for a rigid cross-section with lengthwise stretching.
+
+Each driven bone must be unique, have non-zero rest length, and have
+**Connected** disabled so it can translate. Authored bone parenting is preserved.
+The rig must be outside the Custom Ghost subtree, and the attachment objects
+must exist in the exported car. Wheel/armature parenting must not create feedback.
 
 The enabled section adds this optional field to manifest version 8:
 
@@ -373,35 +401,55 @@ The enabled section adds this optional field to manifest version 8:
 {
   "armature": {
     "obj": "SuspensionRig",
-    "wheels": {
-      "front": {
-        "l": { "bone": "hub_fl" },
-        "r": { "bone": "hub_fr" }
+    "joints": [
+      {
+        "bone": "hub_fl",
+        "base": "joint_fl",
+        "tip": null,
+        "stretch": false,
+        "tipOffset": null
       },
-      "rear": {
-        "l": { "bone": "hub_rl" },
-        "r": { "bone": "hub_rr" }
+      {
+        "bone": "rod_fl",
+        "base": "root",
+        "tip": "joint_fl",
+        "stretch": true,
+        "tipOffset": [0.05, 0.02, 0]
       }
-    }
+    ]
   }
 }
 ```
 
-Unmapped wheels and empty axles are omitted. Unchecking **Armature** omits the
-entire field while preserving the Blender selections and exported geometry.
-Importing an enabled manifest replaces all mappings, including clearing fields
-for omitted wheels. Importing a manifest without `armature` disables following
-and preserves the previous selections.
+The example offsets are illustrative; export computes them from the scene.
+`tipOffset` is the bone tail in Tip's local GLB coordinates. The base offset is
+not exported: the game caches `inverse(baseRestWorld) * boneRestWorld` before
+wheel alignment, then follows `baseCurrentWorld * cachedOffset`. Position conversion is
+`[Blender X, Blender Z, -Blender Y]`, matching existing position exports.
+
+For game integration, cache bone and attachment rest transforms from the GLB
+before applying wheel animation or alignment. Use the bone origin and transformed
+tip offset to recover the rest segment, its length, and its direction in the
+bone's local frame. No additional axis selector or manifest axis field is needed.
+Preserve authored roll, convert driven poses into their bone parent's local
+space, and process driven parents before driven children.
+
+Unchecking **Armature** omits the field while preserving selections and exported
+geometry. Importing an enabled section replaces the mapping list. Importing no
+section disables following and preserves selections. Import restores mapping
+selections only; re-export derives offsets from the current Blender rest geometry.
+The old `armature.wheels` contract is replaced by `armature.joints`; recreate old
+mappings with **Add Joint**. No automatic migration or version bump is performed.
 
 With Armature enabled, GLB export explicitly preserves skins, all bones, the
 armature object and hierarchy, and uses the armature rest pose. Animation clips
 are not exported in this mode: the intended game behavior is to drive the bones
-from the wheel Joints while preserving their authored relative offsets. Blender
+from the attachment roles while preserving their authored relative offsets. Blender
 constraints and drivers do not become live game constraints.
 
-This addon exports the mapping; game-side following is a separate implementation
-step. Until that game update is installed, exporting a mapping alone does not
-animate the suspension. This export setup targets Blender 4.5.
+The game applies following, aiming and stretching after updating wheel objects,
+including during replay and ordinary ghosts. A separate custom ghost subtree
+does not use the normal car's armature. The export setup targets Blender 4.5.
 
 ## Custom Ghost
 

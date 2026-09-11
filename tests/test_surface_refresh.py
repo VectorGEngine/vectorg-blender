@@ -172,7 +172,7 @@ class IdealLineGeometryTests(unittest.TestCase):
 
     def test_straight_is_unchanged_and_open_endpoints_are_pinned(self):
         centers = [(i * 6.0, 0.0, 0.0) for i in range(20)]
-        points, offsets, converged = self.api.ideal_optimize_offsets(centers, [(0, 1, 0)] * 20, False, 3.5)
+        points, offsets, converged = self.api.ideal_optimize_offsets(centers, [(0, 1, 0)] * 20, False, [3.5] * 20)
         self.assertEqual(points, centers)
         self.assertEqual(offsets, [0.0] * 20)
         self.assertTrue(converged)
@@ -180,7 +180,7 @@ class IdealLineGeometryTests(unittest.TestCase):
     def test_circle_uses_wider_radius_instead_of_shorter_tighter_path(self):
         rights = [(math.cos(i * math.tau / 60), math.sin(i * math.tau / 60), 0) for i in range(60)]
         centers = [tuple(v * 50 for v in right) for right in rights]
-        points, offsets, converged = self.api.ideal_optimize_offsets(centers, rights, True, 3.5)
+        points, offsets, converged = self.api.ideal_optimize_offsets(centers, rights, True, [3.5] * len(centers))
         self.assertTrue(converged)
         self.assertTrue(all(abs(offset - 3.5) < 0.001 for offset in offsets))
         self.assertLess(self.api.ideal_curvature_energy_gradient(points, rights, True)[0],
@@ -205,8 +205,8 @@ class IdealLineGeometryTests(unittest.TestCase):
             slope = (10 * math.pi / 90) * math.cos(i * math.pi / 15)
             norm = math.hypot(1, slope)
             rights.append((-slope / norm, 1 / norm, 0))
-        result = self.api.ideal_optimize_offsets(points, rights, False, 3.5)
-        self.assertEqual(result, self.api.ideal_optimize_offsets(points, rights, False, 3.5))
+        result = self.api.ideal_optimize_offsets(points, rights, False, [3.5] * len(points))
+        self.assertEqual(result, self.api.ideal_optimize_offsets(points, rights, False, [3.5] * len(points)))
         optimized, offsets, _converged = result
         self.assertEqual(offsets[0], 0)
         self.assertEqual(offsets[-1], 0)
@@ -225,7 +225,7 @@ class IdealLineGeometryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.api.ideal_resample([(0, 0, 0)] * 2, [0, 0], False)
         with self.assertRaises(ValueError):
-            self.api.ideal_line_limit(SimpleNamespace(ideal_line_road_width=10, ideal_line_edge_clearance=5))
+            self.api.ideal_line_limit(10, 5)
         with self.assertRaises(ValueError):
             self.api.ideal_resample([(0, 0, 0), (math.nan, 0, 0)], [0, 0], False)
 
@@ -235,6 +235,32 @@ class IdealLineGeometryTests(unittest.TestCase):
         left, right = handles[0]
         a, b = self.api.ideal_sub(points[0], left), self.api.ideal_sub(right, points[0])
         self.assertAlmostEqual(self.api.ideal_dot(a, b) / (math.dist(a, (0, 0, 0)) * math.dist(b, (0, 0, 0))), 1)
+
+    def test_variable_width_optimizer_respects_each_local_bound(self):
+        count = 40
+        centers = [(20 * math.cos(i * math.tau / count), 20 * math.sin(i * math.tau / count), 0)
+                   for i in range(count)]
+        rights = [(x / 20, y / 20, 0) for x, y, _z in centers]
+        limits = [0.1 if 10 <= i <= 20 else 3.5 for i in range(count)]
+        _points, offsets, _converged = self.api.ideal_optimize_offsets(centers, rights, True, limits)
+        self.assertTrue(all(abs(offset) <= limit + 1e-9 for offset, limit in zip(offsets, limits)))
+        self.assertGreater(max(offsets[:10]), 0.5)
+
+    def test_planning_resamples_widths_at_the_same_positions(self):
+        points, tilts, widths = self.api.ideal_resample(
+            [(0, 0, 0), (10, 0, 0), (20, 0, 0)], [0, 1, 0], False, 5, widths=[10, 4, 8])
+        self.assertEqual([p[0] for p in points], [0, 5, 10, 15, 20])
+        self.assertEqual(widths, [10, 7, 4, 6, 8])
+        self.assertEqual(tilts, [0, 0.5, 1, 0.5, 0])
+
+    def test_short_narrowing_is_retained_between_regular_planning_points(self):
+        points, _tilts, widths = self.api.ideal_resample(
+            [(0, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0), (12, 0, 0)],
+            [0] * 5, False, 6, widths=[10, 10, 4, 10, 10])
+        by_position = {point[0]: width for point, width in zip(points, widths)}
+        self.assertEqual(by_position[3], 4)
+        self.assertEqual(by_position[2], 10)
+        self.assertEqual(by_position[4], 10)
 
     def assert_fitted_shape(self, points, closed, indices, handles):
         dense_handles = self.api.ideal_bezier_handles(points, closed)
@@ -324,6 +350,8 @@ def blender_tests():
         def make_route(self, closed):
             data = bpy.data.curves.new("route", "CURVE")
             data.dimensions = "3D"
+            data.bevel_depth = 5
+            data.use_radius = True
             spline = data.splines.new("BEZIER")
             points = [(50 * math.cos(i * math.tau / 8), 50 * math.sin(i * math.tau / 8), 0.4)
                       for i in range(8)] if closed else [(-40, 0, 0.4), (-10, 8, 0.4), (10, -8, 0.4), (40, 0, 0.4)]
@@ -478,10 +506,42 @@ def blender_tests():
             bp = line.data.splines[0].bezier_points[3]
             bp.co.y += 0.5
             before = bp.co.copy()
-            self.layout.ideal_line_road_width = 12
+            self.layout.map_curve.data.bevel_depth = 6
             bpy.context.view_layer.update()
             addon.layout_ideal_line_data(self.layout, bpy.context)
             self.assertEqual(bp.co, before)
+
+        def test_route_exports_variable_width_and_ideal_line_uses_it(self):
+            spline = self.layout.map_curve.data.splines[0]
+            spline.radius_interpolation = "LINEAR"
+            for point, radius in zip(spline.bezier_points, (1, 0.5, 0.75, 1.2)):
+                point.radius = radius
+            bpy.context.view_layer.update()
+            route = addon.layout_route_data(self.layout)
+            self.assertEqual(route["version"], 3)
+            self.assertEqual(route["samples"][0]["width"], 10)
+            self.assertAlmostEqual(route["samples"][-1]["width"], 12, places=5)
+            self.assertAlmostEqual(min(s["width"] for s in route["samples"]), 5, places=5)
+            self.generate()
+            data, warnings = addon.layout_ideal_line_data(self.layout, bpy.context)
+            self.assertNotIn("roadWidth", data)
+            self.assertNotIn("roadWidth", data["generation"])
+            self.assertFalse(any("width/clearance" in warning for warning in warnings), warnings)
+
+        def test_narrow_road_rejects_clearance_even_without_a_planning_point_there(self):
+            spline = self.layout.map_curve.data.splines[0]
+            spline.bezier_points[1].radius = 0.1
+            bpy.context.view_layer.update()
+            with self.assertRaisesRegex(ValueError, "Edge clearance"):
+                addon.generate_ideal_line(bpy.context, self.layout)
+
+        def test_legacy_generation_metadata_does_not_export_removed_road_width(self):
+            line = self.generate()
+            metadata = json.loads(line["vectorg_ideal_line_generation"])
+            metadata["roadWidth"] = 999
+            line["vectorg_ideal_line_generation"] = json.dumps(metadata)
+            data, _warnings = addon.layout_ideal_line_data(self.layout, bpy.context)
+            self.assertNotIn("roadWidth", data["generation"])
 
         def test_route_projection_handles_dense_reference_samples(self):
             route = {
@@ -527,7 +587,11 @@ def blender_tests():
                     manifest = json.loads(archive.read("manifest.json"))
                     layout_manifest = manifest["layouts"][0]
                     self.assertEqual(json.loads(archive.read(layout_manifest["idealLine"])), expected)
-                    self.assertEqual(json.loads(archive.read(layout_manifest["route"]))["version"], 2)
+                    route = json.loads(archive.read(layout_manifest["route"]))
+                    self.assertEqual(route["version"], 3)
+                    self.assertTrue(all(sample["width"] == 10 for sample in route["samples"]))
+                    self.assertNotIn("roadWidth", expected)
+                    self.assertNotIn("roadWidth", expected["generation"])
                     glb = archive.read(manifest["model"])
                     chunk_length = struct.unpack_from("<I", glb, 12)[0]
                     model = json.loads(glb[20:20 + chunk_length])
