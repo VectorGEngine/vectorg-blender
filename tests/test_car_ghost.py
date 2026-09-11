@@ -54,6 +54,7 @@ class GhostTests(unittest.TestCase):
             ),
             "guide_objects": lambda: [],
             "downforce_helper_objects": lambda: [],
+            "light_helper_objects": lambda: [],
         }
         selected = []
         for node in ast.parse(ADDON.read_text(encoding="utf-8")).body:

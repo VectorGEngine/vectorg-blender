@@ -100,8 +100,9 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
 }
 ```
 
-Increment **Package Version** intentionally whenever exported package contents
-change. Importing an existing car manifest preserves its `packageVersion`.
+Change **Package Version** only when explicitly requested by the user; changes
+to exported contents do not authorize a version bump. Importing an existing
+car manifest preserves its `packageVersion`.
 Engine RPM values are required and must satisfy
 `idleRPM < redlineRPM <= revLimit <= maxRPM`.
 Engine Braking Factor follows Engine Inertia and exports the required, finite,
@@ -531,7 +532,8 @@ the selections and source objects in the `.blend`, but excludes the configured
 ghost subtree from GLB export. Importing a null or missing `ghost` disables the
 feature while preserving existing authoring selections; importing a structure
 restores its object selections. Run **Validate Car** after import to check them
-against the scene. Increment **Package Version** when package contents change.
+against the scene. Preserve **Package Version** unless the user explicitly
+requests a change.
 
 Game integration is pending. The runtime contract is to retain only Ghost Root
 and the car-root transform for custom ghosts, remove Ghost Root for normal cars
@@ -541,23 +543,94 @@ by that integration.
 
 ## Lights
 
-Assign the Headlights, Brake Lights, and Reverse Lights materials in the
-exporter. Each material must be used by an exported mesh and have its emission
-color or texture configured in Blender. The game keeps emission intensity at
-`0` while inactive and sets it to `10` while active. Headlights toggle with `E`
-on keyboard or `R1` on a gamepad.
+Lights are optional. The Lights panel has **Headlights**, **Tail / Brake Lights**,
+and **Reverse Lights** sections. Leave all materials and source lists empty to
+export `"lights": null`. When only some roles are configured, unused roles are
+`null`. A role can contain a material, actual light sources, or both; an absent
+material or source list is also `null`.
 
-The selected material names are exported as:
+For each role:
+
+1. Optionally assign an emissive material used by an exported mesh. Set its
+   emission color/texture in Blender. **Full Emission** controls the game's
+   full-strength emission multiplier, independently of the actual light output;
+   its default is `10`.
+2. Click **Add Spot** to create a spotlight at the 3D cursor beneath Car Root,
+   or select an existing spotlight beneath Car Root and click **Use Selected**.
+   Multiple sources can share a role, for example left and right headlights.
+3. Move and rotate the spotlight in the viewport. The light emits along its
+   local **-Z** axis. New headlights aim toward car-local Blender -Y (game +Z),
+   tilted 2 degrees downward;
+   new tail/brake and reverse lights aim backward. Aim the source outward from
+   the lamp surface. Use Blender's **Spot Size** and **Blend** controls for the
+   beam cone and softness. Default full cone angles are 40 degrees for headlights
+   and 140 degrees for rear lights, with Blend set to 0.5.
+4. Set the source color, **Full Game Intensity (cd)** and **Game Range (m)**.
+   Blender's native Power value is not exported or converted to game intensity.
+   Tail/brake sources default to red; headlights and reverse sources to white.
+   Initial intensity/range defaults are 100 cd / 40 m for headlights, 5 cd / 5 m
+   for tail/brake lights, and 10 cd / 5 m for reverse lights. Tune these in game.
+
+Sources must be childless Spot light objects in the active scene, beneath Car
+Root and outside the custom ghost hierarchy. Each object can be assigned once;
+there is a maximum of 16 sources per car. Removing an addon-created source also
+deletes its helper; removing a user-assigned source only removes the assignment.
+
+Assigned sources are authoring helpers: they are temporarily excluded from GLB
+export and restored afterward, including on export failure. Native glTF light
+export is disabled to avoid duplicate or uncontrolled runtime lights. Their
+car-local transforms and settings are instead exported in `manifest.json`:
 
 ```json
 {
   "lights": {
-    "headlights": { "material": "headlight_emission" },
-    "brakeLights": { "material": "brake_emission" },
-    "reverseLights": { "material": "reverse_emission" }
+    "headlights": null,
+    "brakeLights": {
+      "material": "brake_emission",
+      "emissiveIntensity": 10,
+      "sources": [{
+        "name": "tail_left",
+        "position": [-0.7, 0.8, -2.0],
+        "direction": [0, 0, -1],
+        "color": [1, 0, 0],
+        "intensity": 5,
+        "distance": 5,
+        "angle": 1.2217304763960306,
+        "penumbra": 0.5
+      }]
+    },
+    "reverseLights": null
   }
 }
 ```
+
+Source positions use car-local game coordinates `(Blender X, Blender Z,
+-Blender Y)`. Directions use the same basis and are normalized. `color` is a
+linear RGB triplet, `intensity` is in candela, `distance` is a positive cutoff
+in meters, `angle` is the cone half-angle in radians (half Blender Spot Size),
+and `penumbra` is in `[0, 1]` from Blender Spot Blend. Blender and game beam
+falloff are not guaranteed to look identical.
+
+Manifest import recreates missing source helpers and restores materials,
+emission levels, source positions/directions and beam settings. Existing
+material-only version 8 roles import with full emission `10` and no sources.
+Unknown fields, invalid values, duplicate names and conflicting existing
+objects are rejected. Preserve `packageVersion` when re-exporting unless the
+user explicitly requests a change.
+
+The runtime contract for the corresponding game update is:
+
+| Input | Headlights | Tail / brake | Reverse |
+| --- | --- | --- | --- |
+| Lights off, no brake | 0% | 0% | 100% only in reverse gear |
+| Lights on, no brake | 100% | 50% | 100% only in reverse gear |
+| Lights off, braking | 0% | 100% | 100% only in reverse gear |
+| Lights on, braking | 100% | 100% | 100% only in reverse gear |
+
+These percentages multiply both source intensity and material emission.
+Tail/brake and reverse lamps should have separate red and white materials.
+The addon exports this contract; the game loader/controller update is a separate
+step and is required to consume the new nullable definitions and source data.
 
 ## Dashboard Screen
 

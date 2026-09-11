@@ -171,6 +171,206 @@ def game_position_to_blender(position):
     return Vector((position[0], -position[2], position[1]))
 
 
+LIGHT_ROLES = (
+    ("headlights", "headlights", "Headlights"),
+    ("brakeLights", "brake_lights", "Tail / Brake Lights"),
+    ("reverseLights", "reverse_lights", "Reverse Lights"),
+)
+LIGHT_ROLE_ITEMS = tuple((role, label, "") for role, _prefix, label in LIGHT_ROLES)
+LIGHT_HELPER_PROP = "vectorg_light_helper"
+MAX_LIGHT_SOURCES = 16
+
+
+def light_object_poll(_settings, obj):
+    return obj.type == "LIGHT" and obj.data.type == "SPOT"
+
+
+def light_helper_objects():
+    settings = getattr(bpy.context.scene, "car_exporter", None)
+    assigned = [source.object_ref for source in settings.light_sources if source.object_ref] if settings else []
+    return list(dict.fromkeys([obj for obj in bpy.data.objects if obj.get(LIGHT_HELPER_PROP)] + assigned))
+
+
+def parse_lights_config(value):
+    """Canonical optional light contract; also accepts existing material-only roles."""
+    if value is None:
+        return None
+    roles = {role for role, _prefix, _label in LIGHT_ROLES}
+    if not isinstance(value, dict) or set(value) - roles:
+        raise ValueError("Manifest lights must be null or an object with known light roles")
+
+    def number(value, label, minimum=0, maximum=None, positive=False):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or value < minimum or (positive and value <= 0) or (maximum is not None and value > maximum)):
+            raise ValueError(f"{label} is invalid")
+        return value
+
+    def vector(value, label):
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError(f"{label} must have three components")
+        return [number(component, label, minimum=-1e30, maximum=1e30) for component in value]
+
+    result = {}
+    names = set()
+    for role, _prefix, _label in LIGHT_ROLES:
+        config = value.get(role)
+        if config is None:
+            result[role] = None
+            continue
+        if not isinstance(config, dict) or set(config) - {"material", "emissiveIntensity", "sources"}:
+            raise ValueError(f"Manifest lights.{role} is invalid")
+        material = config.get("material")
+        if material is not None and (not isinstance(material, str) or not material.strip()):
+            raise ValueError(f"Manifest lights.{role}.material must be null or a material name")
+        emission = number(config.get("emissiveIntensity", 10), f"{role}.emissiveIntensity")
+        sources = config.get("sources")
+        if sources is not None and not isinstance(sources, list):
+            raise ValueError(f"Manifest lights.{role}.sources must be null or a list")
+        parsed = []
+        for source in sources or []:
+            fields = {"name", "position", "direction", "color", "intensity", "distance", "angle", "penumbra"}
+            if not isinstance(source, dict) or set(source) != fields:
+                raise ValueError(f"Manifest lights.{role} source fields are invalid")
+            name = source["name"]
+            if not isinstance(name, str) or not name.strip() or name in names:
+                raise ValueError("Light source names must be non-empty and unique across roles")
+            names.add(name)
+            if len(names) > MAX_LIGHT_SOURCES:
+                raise ValueError(f"A car may have at most {MAX_LIGHT_SOURCES} light sources")
+            direction = vector(source["direction"], f"{name}.direction")
+            length = math.sqrt(sum(component * component for component in direction))
+            if length < 1e-8:
+                raise ValueError(f"{name}.direction must be nonzero")
+            color = vector(source["color"], f"{name}.color")
+            if any(component < 0 or component > 1 for component in color):
+                raise ValueError(f"{name}.color components must be in [0, 1]")
+            parsed.append({
+                "name": name,
+                "position": vector(source["position"], f"{name}.position"),
+                "direction": [component / length for component in direction],
+                "color": color,
+                "intensity": number(source["intensity"], f"{name}.intensity"),
+                "distance": number(source["distance"], f"{name}.distance", positive=True),
+                "angle": number(source["angle"], f"{name}.angle", maximum=math.pi / 2, positive=True),
+                "penumbra": number(source["penumbra"], f"{name}.penumbra", maximum=1),
+            })
+        result[role] = {"material": material, "emissiveIntensity": emission, "sources": parsed or None} if material or parsed else None
+    return result if any(result.values()) else None
+
+
+def build_lights_config(settings):
+    root = settings.car_root_object
+    result = {}
+    used = set()
+    for role, prefix, label in LIGHT_ROLES:
+        sources = []
+        for source in settings.light_sources:
+            if source.role != role:
+                continue
+            obj = source.object_ref
+            if not obj or not light_object_poll(None, obj):
+                raise ValueError(f"{label} source requires a Spot light object")
+            if not root or obj == root or not is_object_in_tree(root, obj) or obj not in list(bpy.context.scene.objects):
+                raise ValueError(f"Light {obj.name} must be in the scene beneath the car root")
+            if is_object_in_tree(settings.ghost_root_object, obj):
+                raise ValueError(f"Light {obj.name} must be outside the custom ghost hierarchy")
+            if obj.children:
+                raise ValueError(f"Light helper {obj.name} must not have children")
+            if obj in used:
+                raise ValueError(f"Light object is assigned more than once: {obj.name}")
+            used.add(obj)
+            try:
+                inverse = root.matrix_world.inverted()
+                position = inverse @ obj.matrix_world.translation
+                target = inverse @ (obj.matrix_world @ Vector((0, 0, -1)))
+            except ValueError as error:
+                raise ValueError(f"Light {obj.name} has a singular car transform") from error
+            sources.append({
+                "name": obj.name,
+                "position": blender_position_to_game(position),
+                "direction": blender_position_to_game(target - position),
+                "color": list(obj.data.color),
+                "intensity": source.intensity,
+                "distance": source.distance,
+                "angle": obj.data.spot_size / 2,
+                "penumbra": obj.data.spot_blend,
+            })
+        material = getattr(settings, f"{prefix}_material")
+        result[role] = {"material": material.name if material else None,
+                        "emissiveIntensity": getattr(settings, f"{prefix}_emissive_intensity"),
+                        "sources": sources or None}
+    if any(source.role not in {role for role, _prefix, _label in LIGHT_ROLES} for source in settings.light_sources):
+        raise ValueError("Unknown vehicle light role")
+    return parse_lights_config(result)
+
+
+def remove_owned_light_helper(obj):
+    if obj and obj.get(LIGHT_HELPER_PROP):
+        data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data.users == 0:
+            bpy.data.lights.remove(data)
+
+
+def clear_light_sources(settings, keep_names=()):
+    helpers = {source.object_ref for source in settings.light_sources if source.object_ref}
+    settings.light_sources.clear()
+    for obj in helpers:
+        if obj.name not in keep_names:
+            remove_owned_light_helper(obj)
+
+
+def create_light_helper(context, settings, name):
+    data = bpy.data.lights.new(name=name, type="SPOT")
+    obj = bpy.data.objects.new(name, data)
+    context.scene.collection.objects.link(obj)
+    obj.parent = settings.car_root_object
+    obj[LIGHT_HELPER_PROP] = True
+    data.show_cone = False
+    return obj
+
+
+def validate_light_import(root, config):
+    for role in (config or {}).values():
+        for source in (role or {}).get("sources") or []:
+            if root is None:
+                raise ValueError("Manifest car root object is required to import light sources")
+            obj = bpy.data.objects.get(source["name"])
+            if obj and (not light_object_poll(None, obj) or not is_object_in_tree(root, obj) or obj == root or obj.children):
+                raise ValueError(f"Light source name conflicts with an existing object: {source['name']}")
+
+
+def import_lights_config(context, settings, config):
+    validate_light_import(settings.car_root_object, config)
+    names = {source["name"] for role in (config or {}).values() for source in (role or {}).get("sources") or []}
+    clear_light_sources(settings, names)
+    for role, prefix, _label in LIGHT_ROLES:
+        light = (config or {}).get(role) or {}
+        set_material_pointer(settings, f"{prefix}_material", light.get("material"))
+        setattr(settings, f"{prefix}_emissive_intensity", light.get("emissiveIntensity", 10))
+        for source in light.get("sources") or []:
+            obj = bpy.data.objects.get(source["name"])
+            if obj is None:
+                obj = create_light_helper(context, settings, source["name"])
+            # Imported coordinates are car-local, independent of any previous parenting.
+            obj.parent = settings.car_root_object
+            obj.matrix_parent_inverse.identity()
+            obj.location = game_position_to_blender(source["position"])
+            obj.rotation_mode = "QUATERNION"
+            obj.rotation_quaternion = game_position_to_blender(source["direction"]).to_track_quat('-Z', 'Y')
+            obj.scale = (1, 1, 1)
+            if obj.data.users > 1:
+                obj.data = obj.data.copy()
+            obj.data.color = source["color"]
+            obj.data.spot_size = source["angle"] * 2
+            obj.data.spot_blend = source["penumbra"]
+            entry = settings.light_sources.add()
+            entry.role = role
+            entry.object_ref = obj
+            entry.intensity = source["intensity"]
+            entry.distance = source["distance"]
+
+
 def next_helper_name(prefix):
     index = 1
     while bpy.data.objects.get(f"{prefix}_{index:02d}"):
@@ -358,7 +558,7 @@ def excluded_ghost_objects(settings):
 
 
 def car_export_objects(settings):
-    excluded = set(guide_objects() + downforce_helper_objects() + excluded_ghost_objects(settings))
+    excluded = set(guide_objects() + downforce_helper_objects() + light_helper_objects() + excluded_ghost_objects(settings))
     return [obj for obj in bpy.context.scene.objects if obj not in excluded]
 
 
@@ -918,7 +1118,7 @@ def create_size_guide(settings):
 
 
 def with_helpers_unlinked(callback, excluded_objects=()):
-    helpers = list(dict.fromkeys(guide_objects() + downforce_helper_objects() + list(excluded_objects)))
+    helpers = list(dict.fromkeys(guide_objects() + downforce_helper_objects() + light_helper_objects() + list(excluded_objects)))
     states = [(obj, list(obj.users_collection)) for obj in helpers]
     try:
         for obj, collections in states:
@@ -1568,6 +1768,11 @@ def validate_scene(settings):
         if index == 0 and not material_is_assigned_to_geometry(material, car_objects):
             errors.append(f"Default body color material is not assigned to car geometry: {material.name}")
 
+    try:
+        build_lights_config(settings)
+    except ValueError as error:
+        errors.append(str(error))
+
     for label, prop_name in (
         ("Headlights", "headlights_material"),
         ("Brake lights", "brake_lights_material"),
@@ -1672,6 +1877,15 @@ class CarDownForcePointSettings(PropertyGroup):
         get=get_max_force_kg,
         set=set_max_force_kg,
     )
+
+
+class CarLightSourceSettings(PropertyGroup):
+    role: EnumProperty(name="Role", items=LIGHT_ROLE_ITEMS, default="headlights")
+    object_ref: PointerProperty(name="Spot Light", type=bpy.types.Object, poll=light_object_poll)
+    intensity: FloatProperty(name="Full Game Intensity (cd)", default=100.0, min=0.0,
+                             description="Full-strength game light output in candela; independent of Blender Power")
+    distance: FloatProperty(name="Game Range (m)", default=40.0, min=0.01,
+                            description="Finite light cutoff in game meters")
 
 
 class CarWheelSettings(PropertyGroup):
@@ -2081,8 +2295,8 @@ class CarExporterSettings(PropertyGroup):
         type=bpy.types.Material,
     )
     brake_lights_material: PointerProperty(
-        name="Brake Lights",
-        description="Emissive material illuminated while braking",
+        name="Tail / Brake Lights",
+        description="Half emission with headlights on; full emission while braking",
         type=bpy.types.Material,
     )
     reverse_lights_material: PointerProperty(
@@ -2090,6 +2304,10 @@ class CarExporterSettings(PropertyGroup):
         description="Emissive material illuminated while reversing",
         type=bpy.types.Material,
     )
+    headlights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
+    brake_lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
+    reverse_lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
+    light_sources: CollectionProperty(type=CarLightSourceSettings)
     dashboard_screen_object: PointerProperty(
         name="Screen",
         description="Mesh object used as the in-game dashboard display",
@@ -2486,6 +2704,7 @@ class CarExporterSettings(PropertyGroup):
 
 
 def clear_configuration_settings(settings):
+    clear_light_sources(settings)
     center_of_mass = settings.center_of_mass_object
     if center_of_mass and center_of_mass.get(CENTER_OF_MASS_HELPER_PROP):
         bpy.data.objects.remove(center_of_mass, do_unlink=True)
@@ -2525,6 +2744,8 @@ def clear_configuration_settings(settings):
     settings.headlights_material = None
     settings.brake_lights_material = None
     settings.reverse_lights_material = None
+    for _role, prefix, _label in LIGHT_ROLES:
+        setattr(settings, f"{prefix}_emissive_intensity", 10.0)
     settings.dashboard_screen_object = None
     settings.colliders.clear()
     settings.down_force_points.clear()
@@ -2872,15 +3093,7 @@ def build_manifest(settings):
                 "volume": getattr(settings, f"sound_{slot}_volume"),
             }
 
-    lights = {
-        key: {"material": material.name}
-        for key, material in (
-            ("headlights", settings.headlights_material),
-            ("brakeLights", settings.brake_lights_material),
-            ("reverseLights", settings.reverse_lights_material),
-        )
-        if material
-    }
+    lights = build_lights_config(settings)
 
     dashboard = None
     if settings.dashboard_screen_object:
@@ -3180,6 +3393,76 @@ class CAR_EXPORTER_OT_remove_center_of_mass(Operator):
         settings.center_of_mass_object = None
         if helper and helper.get(CENTER_OF_MASS_HELPER_PROP):
             bpy.data.objects.remove(helper, do_unlink=True)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_add_light_source(Operator):
+    bl_idname = "car_exporter.add_light_source"
+    bl_label = "Add Light Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    role: EnumProperty(name="Role", items=LIGHT_ROLE_ITEMS, default="headlights")
+    use_selected: BoolProperty(default=False, options={"HIDDEN"})
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        root = settings.car_root_object
+        if not root:
+            self.report({"ERROR"}, "Select Car Root before adding a light")
+            return {"CANCELLED"}
+        if len(settings.light_sources) >= MAX_LIGHT_SOURCES:
+            self.report({"ERROR"}, f"A car may have at most {MAX_LIGHT_SOURCES} light sources")
+            return {"CANCELLED"}
+        if self.use_selected:
+            obj = context.active_object
+            if (not obj or not light_object_poll(None, obj) or obj == root or not is_object_in_tree(root, obj)
+                    or is_object_in_tree(settings.ghost_root_object, obj) or obj.children):
+                self.report({"ERROR"}, "Select a childless Spot light beneath Car Root, outside the ghost hierarchy")
+                return {"CANCELLED"}
+            if any(source.object_ref == obj for source in settings.light_sources):
+                self.report({"ERROR"}, "Selected light is already assigned")
+                return {"CANCELLED"}
+        else:
+            try:
+                position = root.matrix_world.inverted() @ context.scene.cursor.location
+            except ValueError:
+                self.report({"ERROR"}, "Car Root has a singular transform; correct its scale before adding a light")
+                return {"CANCELLED"}
+            obj = create_light_helper(context, settings, next_helper_name(self.role))
+            obj.location = position
+            # Blender -Y maps to game +Z (forward); each spotlight emits along local -Z.
+            downward_angle = math.radians(2)
+            direction = (Vector((0, -math.cos(downward_angle), -math.sin(downward_angle)))
+                         if self.role == "headlights" else Vector((0, 1, 0)))
+            obj.rotation_mode = "QUATERNION"
+            obj.rotation_quaternion = direction.to_track_quat('-Z', 'Y')
+            obj.data.color = (1, 0, 0) if self.role == "brakeLights" else (1, 1, 1)
+            obj.data.spot_size = math.radians(40 if self.role == "headlights" else 140)
+            obj.data.spot_blend = 0.5
+        source = settings.light_sources.add()
+        source.role = self.role
+        source.object_ref = obj
+        source.intensity = 100.0 if self.role == "headlights" else 5.0 if self.role == "brakeLights" else 10.0
+        source.distance = 40.0 if self.role == "headlights" else 5.0
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_light_source(Operator):
+    bl_idname = "car_exporter.remove_light_source"
+    bl_label = "Remove Light Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty()
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if 0 <= self.index < len(settings.light_sources):
+            obj = settings.light_sources[self.index].object_ref
+            settings.light_sources.remove(self.index)
+            if not any(source.object_ref == obj for source in settings.light_sources):
+                remove_owned_light_helper(obj)
         return {"FINISHED"}
 
 
@@ -3837,6 +4120,7 @@ def export_car_glb(context, filepath, max_texture_size, optimize_color_textures,
             use_selection=False,
             export_apply=True,
             export_cameras=True,
+            export_lights=False,
             **gltf_image_export_options(jpeg_quality),
             **gltf_armature_export_options(scene_settings(context)),
         )
@@ -3983,6 +4267,10 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         try:
             ghost_config = parse_ghost_config(data.get("ghost"))
             armature_config = parse_armature_config(data.get("armature"))
+            lights_config = parse_lights_config(data.get("lights"))
+            import_body = data.get("body")
+            import_root = find_object(import_body.get("obj", "")) if isinstance(import_body, dict) else None
+            validate_light_import(import_root, lights_config)
         except ValueError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -4452,15 +4740,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             "y",
         )
 
-        lights = data.get("lights", {})
-        for key, prop_name in (
-            ("headlights", "headlights_material"),
-            ("brakeLights", "brake_lights_material"),
-            ("reverseLights", "reverse_lights_material"),
-        ):
-            light = lights.get(key, {}) if isinstance(lights, dict) else {}
-            material_name = light.get("material", "") if isinstance(light, dict) else ""
-            set_material_pointer(settings, prop_name, material_name)
+        import_lights_config(context, settings, lights_config)
 
         dashboard = data.get("dashboard", {})
         screen = dashboard.get("screen", {}) if isinstance(dashboard, dict) else {}
@@ -4756,6 +5036,39 @@ def draw_body_physics(layout, settings):
     draw_split_prop(layout, settings, "drag_per_downforce")
 
 
+def draw_vehicle_lights(layout, settings):
+    for role, prefix, label in LIGHT_ROLES:
+        box = layout.box()
+        box.label(text=label)
+        box.label(text="Material and sources are optional")
+        draw_split_prop(box, settings, f"{prefix}_material")
+        emission = box.column()
+        emission.enabled = getattr(settings, f"{prefix}_material") is not None
+        draw_split_prop(emission, settings, f"{prefix}_emissive_intensity")
+        if role == "brakeLights":
+            box.label(text="Lights on: 50% | Braking: 100%")
+        for index, source in enumerate(settings.light_sources):
+            if source.role != role:
+                continue
+            item = box.box()
+            row = item.row(align=True)
+            row.prop(source, "object_ref", text="Spot")
+            row.operator("car_exporter.remove_light_source", text="", icon="X").index = index
+            obj = source.object_ref
+            if obj and light_object_poll(None, obj):
+                draw_split_prop(item, obj.data, "color")
+                draw_split_prop(item, obj.data, "spot_size")
+                draw_split_prop(item, obj.data, "spot_blend")
+            draw_split_prop(item, source, "intensity")
+            draw_split_prop(item, source, "distance")
+        row = box.row(align=True)
+        row.enabled = len(settings.light_sources) < MAX_LIGHT_SOURCES
+        row.operator("car_exporter.add_light_source", text="Add Spot", icon="ADD").role = role
+        assign = row.operator("car_exporter.add_light_source", text="Use Selected")
+        assign.role = role
+        assign.use_selected = True
+
+
 class CAR_EXPORTER_PT_car_export(Panel):
     bl_label = "VectorG Car Exporter"
     bl_idname = "CAR_EXPORTER_PT_car_export"
@@ -4799,9 +5112,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         box = layout.box()
         box.label(text="Lights")
-        draw_split_prop(box, settings, "headlights_material")
-        draw_split_prop(box, settings, "brake_lights_material")
-        draw_split_prop(box, settings, "reverse_lights_material")
+        draw_vehicle_lights(box, settings)
 
         box = layout.box()
         box.label(text="Dashboard")
@@ -4903,6 +5214,7 @@ classes = (
     CarBodyColorSettings,
     CarColliderSettings,
     CarDownForcePointSettings,
+    CarLightSourceSettings,
     CarWheelSettings,
     CarArmatureJointSettings,
     CarGhostWheelSettings,
@@ -4921,6 +5233,8 @@ classes = (
     CAR_EXPORTER_OT_remove_center_of_mass,
     CAR_EXPORTER_OT_add_downforce_point,
     CAR_EXPORTER_OT_remove_downforce_point,
+    CAR_EXPORTER_OT_add_light_source,
+    CAR_EXPORTER_OT_remove_light_source,
     CAR_EXPORTER_OT_add_body_color,
     CAR_EXPORTER_OT_remove_body_color,
     CAR_EXPORTER_OT_move_body_color,

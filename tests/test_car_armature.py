@@ -92,6 +92,7 @@ class ArmatureTests(unittest.TestCase):
                 context=SimpleNamespace(scene=SimpleNamespace(objects=self.scene_objects)),
             ),
             "guide_objects": lambda: [], "downforce_helper_objects": lambda: [],
+            "light_helper_objects": lambda: [],
         }
         selected = []
         for node in ast.parse(ADDON.read_text(encoding="utf-8")).body:
@@ -374,6 +375,7 @@ class ArmatureTests(unittest.TestCase):
                     "export_hierarchy_flatten_bones", "export_hierarchy_flatten_objs"]:
             self.assertFalse(calls[0][key])
         self.assertTrue(calls[0]["export_apply"])
+        self.assertFalse(calls[0]["export_lights"])
         self.assertEqual(calls[0]["export_image_quality"], 90)
         with self.assertRaisesRegex(RuntimeError, "did not finish"):
             self.call("export_car_glb", context, Path("car.glb"), 2048, True, 90)
@@ -388,7 +390,7 @@ class ArmatureTests(unittest.TestCase):
             sound_pitch_offset=0, use_custom_sounds=False, headlights_material=None,
             brake_lights_material=None, reverse_lights_material=None,
             dashboard_screen_object=None, center_of_mass_object=None, colliders=[],
-            down_force_points=[], air_drag=1, body_colors=[], car_id="test",
+            down_force_points=[], drag_per_downforce=0.2, air_drag=1, body_colors=[], car_id="test",
             package_version="test-rig", display_name="Test", car_class="test",
             vehicle_tag_tarmac=True, vehicle_tag_offroad=False, hp=100, drive="rwd",
             max_rpm=8000, idle_rpm=800, redline_rpm=7000, rev_limit=7500,
@@ -405,6 +407,7 @@ class ArmatureTests(unittest.TestCase):
         existing_wheels = {"front": {"l": {"joint": {"obj": "joint_front_l"}}}}
         self.api.update({
             "build_ghost_config": lambda settings: None,
+            "build_lights_config": lambda settings: None,
             "sample_torque_curve": lambda settings: [],
             "build_wheels_config": lambda settings: copy.deepcopy(existing_wheels),
             "build_presets_config": lambda settings: [],
