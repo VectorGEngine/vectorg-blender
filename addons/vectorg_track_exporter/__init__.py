@@ -14,10 +14,15 @@ import re
 import shutil
 import struct
 import tempfile
+import time
+import traceback
 import zipfile
 from pathlib import Path
 
+import blf
 import bpy
+import gpu
+from gpu_extras.batch import batch_for_shader
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ExportHelper
 from mathutils import Matrix, Vector
@@ -983,6 +988,43 @@ def restore_export_textures(restored_nodes, temp_images):
         finally:
             if temporary_file:
                 Path(temporary_file).unlink(missing_ok=True)
+
+
+def iter_export_texture_optimization(
+    objects,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    jpeg_quality,
+    restored_nodes,
+    temp_images,
+):
+    """Yield (index, total, image name) before each texture; the caller restores the collected nodes and images."""
+    if max_size <= 0:
+        return
+    usage_by_image = classify_texture_usage(objects)
+    nodes = [node for material in export_materials(objects) for node in material_texture_nodes(material)]
+    sources = list(dict.fromkeys(node.image for node in nodes))
+    replacements = {}
+    for index, source in enumerate(sources):
+        yield index, len(sources), source.name
+        replacement = optimized_export_image(
+            source,
+            usage_by_image.get(source, {"ambiguous"}),
+            max_size,
+            optimize_color_textures,
+            temporary_directory,
+            len(replacements),
+            jpeg_quality,
+        )
+        replacements[source] = replacement or source
+        if replacement:
+            temp_images.append(replacement)
+    for node in nodes:
+        replacement = replacements[node.image]
+        if replacement is not node.image:
+            restored_nodes.append((node, node.image))
+            node.image = replacement
 
 
 def gltf_image_export_options(jpeg_quality):
@@ -3332,6 +3374,292 @@ def export_track_glb(
     validate_hdr_not_embedded(filepath, hdr_image)
 
 
+EXPORT_RESULT_SECONDS = 4.0
+EXPORT_PROGRESS_SPACES = (
+    "SpaceView3D", "SpaceProperties", "SpaceOutliner", "SpaceImageEditor", "SpaceNodeEditor",
+    "SpaceTextEditor", "SpaceSequenceEditor", "SpaceGraphEditor", "SpaceDopeSheetEditor",
+    "SpaceNLA", "SpaceClipEditor", "SpaceInfo", "SpaceConsole", "SpaceFileBrowser",
+    "SpacePreferences", "SpaceSpreadsheet",
+)
+EXPORT_PROGRESS_COLORS = {
+    "RUNNING": (0.28, 0.52, 0.90, 1.0),
+    "SUCCESS": (0.30, 0.70, 0.36, 1.0),
+    "FAILED": (0.82, 0.30, 0.30, 1.0),
+    "CANCELLED": (0.75, 0.60, 0.25, 1.0),
+}
+EXPORT_PROGRESS_TITLES = {
+    "RUNNING": "Exporting Track",
+    "SUCCESS": "Export Complete",
+    "FAILED": "Export Failed",
+    "CANCELLED": "Export Cancelled",
+}
+export_progress_state = {"status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": []}
+
+
+class TrackValidationError(RuntimeError):
+    def __init__(self, errors, warnings):
+        super().__init__(errors[0])
+        self.errors = errors
+        self.warnings = warnings
+
+
+def export_progress_active():
+    return export_progress_state["status"] is not None
+
+
+def redraw_all_areas():
+    window_manager = bpy.context.window_manager
+    for window in window_manager.windows if window_manager else ():
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+def update_export_progress(status=None, fraction=None, message=None, detail=None):
+    state = export_progress_state
+    if not state["handlers"]:
+        for space_name in EXPORT_PROGRESS_SPACES:
+            space = getattr(bpy.types, space_name, None)
+            if space:
+                handler = space.draw_handler_add(draw_export_progress, (), "WINDOW", "POST_PIXEL")
+                state["handlers"].append((space, handler))
+    for key, value in (("status", status), ("fraction", fraction), ("message", message), ("detail", detail)):
+        if value is not None:
+            state[key] = value
+    redraw_all_areas()
+
+
+def hide_export_progress():
+    state = export_progress_state
+    for space, handler in state["handlers"]:
+        space.draw_handler_remove(handler, "WINDOW")
+    state.update(status=None, fraction=0.0, message="", detail="", handlers=[])
+    try:
+        redraw_all_areas()
+    except AttributeError:
+        pass
+
+
+def draw_export_rect(shader, x, y, width, height, color):
+    batch = batch_for_shader(
+        shader,
+        "TRIS",
+        {"pos": ((x, y), (x + width, y), (x + width, y + height), (x, y + height))},
+        indices=((0, 1, 2), (0, 2, 3)),
+    )
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def fit_export_text(text, max_width, keep_end=False):
+    if blf.dimensions(0, text)[0] <= max_width:
+        return text
+    while text:
+        text = text[1:] if keep_end else text[:-1]
+        fitted = "…" + text if keep_end else text + "…"
+        if blf.dimensions(0, fitted)[0] <= max_width:
+            return fitted
+    return ""
+
+
+def draw_export_text(text, x, y, size, color, max_width, align="LEFT", keep_end=False):
+    blf.size(0, size)
+    text = fit_export_text(text, max_width, keep_end)
+    if align == "CENTER":
+        x -= blf.dimensions(0, text)[0] / 2
+    elif align == "RIGHT":
+        x -= blf.dimensions(0, text)[0]
+    blf.color(0, *color)
+    blf.position(0, x, y, 0)
+    blf.draw(0, text)
+
+
+def draw_export_progress():
+    state = export_progress_state
+    context = bpy.context
+    area, region = context.area, context.region
+    if state["status"] is None or not area or not region or not context.window:
+        return
+    scale = context.preferences.system.ui_scale
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    shader.bind()
+    draw_export_rect(shader, 0, 0, region.width, region.height, (0.0, 0.0, 0.0, 0.35))
+
+    largest = max(
+        (candidate for candidate in context.window.screen.areas if candidate.type != "EMPTY"),
+        key=lambda candidate: candidate.width * candidate.height,
+        default=None,
+    )
+    if area != largest:
+        gpu.state.blend_set("NONE")
+        return
+
+    padding = 16 * scale
+    width = min(460 * scale, region.width - 2 * padding)
+    height = 138 * scale
+    x = (region.width - width) / 2
+    y = (region.height - height) / 2
+    inner = width - 2 * padding
+    finished = state["status"] != "RUNNING"
+    draw_export_rect(shader, x - scale, y - scale, width + 2 * scale, height + 2 * scale, (0.36, 0.36, 0.36, 1.0))
+    draw_export_rect(shader, x, y, width, height, (0.12, 0.12, 0.12, 0.97))
+
+    bar_height = 14 * scale
+    bar_y = y + height - 52 * scale
+    fraction = min(max(state["fraction"], 0.0), 1.0)
+    draw_export_rect(shader, x + padding, bar_y, inner, bar_height, (0.22, 0.22, 0.22, 1.0))
+    if fraction > 0.0:
+        draw_export_rect(shader, x + padding, bar_y, inner * fraction, bar_height, EXPORT_PROGRESS_COLORS[state["status"]])
+    gpu.state.blend_set("NONE")
+
+    white, dim = (0.93, 0.93, 0.93, 1.0), (0.62, 0.62, 0.62, 1.0)
+    title_y = y + height - 28 * scale
+    draw_export_text(EXPORT_PROGRESS_TITLES[state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
+    draw_export_text(f"{round(fraction * 100)}%", x + width - padding, title_y, 14 * scale, dim, inner * 0.25, "RIGHT")
+    draw_export_text(state["message"], x + padding, bar_y - 26 * scale, 13 * scale, white, inner)
+    if state["detail"]:
+        draw_export_text(state["detail"], x + padding, bar_y - 48 * scale, 12 * scale, dim, inner, keep_end=True)
+    hint = "Click or press Esc to close" if finished else "Press Esc to cancel"
+    draw_export_text(hint, x + width / 2, y + 12 * scale, 11 * scale, dim, inner, "CENTER")
+
+
+def iter_track_zip_export(context, settings, filepath, report):
+    """Export the track ZIP one step at a time, yielding (fraction, message) before each step."""
+    yield 0.0, "Applying collision mesh scales..."
+    applied_count = apply_collision_mesh_scales(context, settings)
+    if applied_count:
+        report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
+
+    yield 0.03, "Validating track..."
+    errors, warnings = validate_scene(settings, context)
+    for message in warnings:
+        report({"WARNING"}, message)
+    if errors:
+        raise TrackValidationError(errors, warnings)
+
+    export_zip = Path(abspath(filepath))
+    if export_zip.suffix.lower() != ".zip":
+        export_zip = export_zip.with_suffix(".zip")
+    export_zip.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="track_exporter_") as temp_dir:
+        temp_path = Path(temp_dir)
+        model_path = temp_path / f"{settings.track_id}.glb"
+        map_roots = [
+            direct_child_with_role(layout.root_object, ROLE_MAP)
+            for layout in settings.layouts
+            if layout.root_object
+        ]
+        excluded_map_objects = {
+            obj for root in map_roots if root for obj in [root, *descendants(root)]
+        }
+
+        yield 0.05, "Preparing export scene..."
+        track_root = settings.track_root_object
+        selected_before = list(context.selected_objects)
+        active_before = context.view_layer.objects.active
+        export_objects = track_export_objects(track_root, excluded_map_objects)
+        visibility_before = [(obj, obj.hide_get(), obj.hide_render) for obj in export_objects]
+        restored_nodes, temp_images = [], []
+        target_names, collider_targets = [], []
+        try:
+            for index, total, name in iter_export_texture_optimization(
+                export_objects,
+                int(settings.max_texture_size),
+                settings.optimize_color_textures,
+                temp_path,
+                settings.jpeg_quality,
+                restored_nodes,
+                temp_images,
+            ):
+                yield 0.05 + 0.30 * index / total, f"Optimizing texture {index + 1}/{total}: {name}"
+
+            yield 0.35, "Exporting GLB model (this may take a while)..."
+            target_names, collider_targets = apply_dynamic_target_export_names(settings)
+            for obj, _hidden, _hide_render in visibility_before:
+                obj.hide_set(False)
+                obj.hide_render = False
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj in export_objects:
+                obj.select_set(True)
+            context.view_layer.objects.active = track_root
+            result = bpy.ops.export_scene.gltf(
+                filepath=str(model_path),
+                export_format="GLB",
+                use_selection=True,
+                export_apply=True,
+                export_extras=True,
+                export_cameras=False,
+                **gltf_image_export_options(settings.jpeg_quality),
+                **gltf_mesh_instance_export_options(),
+            )
+            if "FINISHED" not in result:
+                raise RuntimeError("Blender glTF export did not finish")
+        finally:
+            restore_dynamic_target_export_names(target_names, collider_targets)
+            restore_export_textures(restored_nodes, temp_images)
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj, hidden, hide_render in visibility_before:
+                obj.hide_set(hidden)
+                obj.hide_render = hide_render
+            for obj in selected_before:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if active_before and active_before.name in bpy.data.objects:
+                context.view_layer.objects.active = active_before
+
+        yield 0.75, "Checking HDR is not embedded..."
+        validate_hdr_not_embedded(model_path, settings.hdr_image)
+
+        yield 0.78, "Writing manifest..."
+        manifest = build_manifest(settings)
+        (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
+
+        map_layouts = [layout for layout in settings.layouts if layout.map_curve]
+        if map_layouts:
+            maps_path = temp_path / "maps"
+            maps_path.mkdir()
+            routes_path = temp_path / "routes"
+            routes_path.mkdir()
+            for index, layout in enumerate(map_layouts):
+                yield 0.80 + 0.10 * index / len(map_layouts), f"Writing map and route: {layout.layout_id}"
+                write_layout_map_svg(layout, maps_path / f"{layout.layout_id}.svg")
+                route_data = layout_route_data(layout)
+                (routes_path / f"{layout.layout_id}.json").write_text(
+                    json.dumps(route_data, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+
+        line_layouts = [layout for layout in settings.layouts if layout.ideal_line]
+        for index, layout in enumerate(line_layouts):
+            yield 0.90 + 0.04 * index / len(line_layouts), f"Writing ideal line: {layout.layout_id}"
+            ideal_path = temp_path / "ideal-lines"
+            ideal_path.mkdir(exist_ok=True)
+            line_data, _warnings = layout_ideal_line_data(layout, context)
+            (ideal_path / f"{layout.layout_id}.json").write_text(
+                json.dumps(line_data, separators=(",", ":"), allow_nan=False), encoding="utf-8",
+            )
+
+        if settings.hdr_image:
+            yield 0.94, "Copying HDR..."
+            source = image_source_path(settings.hdr_image)
+            extension = image_source_extension(settings.hdr_image)
+            hdr_path = temp_path / "hdr"
+            hdr_path.mkdir()
+            destination = hdr_path / f"env{extension}"
+            if settings.hdr_image.packed_file:
+                destination.write_bytes(bytes(settings.hdr_image.packed_file.data))
+            else:
+                shutil.copy2(source, destination)
+
+        yield 0.96, f"Writing {export_zip.name}..."
+        with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in temp_path.rglob("*"):
+                if path.is_file():
+                    archive.write(path, path.relative_to(temp_path).as_posix())
+    return export_zip, len(warnings)
+
+
 class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
     bl_idname = "track_exporter.export_track_zip"
     bl_label = "Export Track Zip"
@@ -3342,96 +3670,98 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
     filepath: StringProperty(name="Export Zip", description="Destination for the exported track package", subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
 
+    @classmethod
+    def poll(cls, _context):
+        return not export_progress_active()
+
     def execute(self, context):
         settings = scene_settings(context)
+        self.steps = iter_track_zip_export(context, settings, self.filepath, self.report)
+        if context.window is None or bpy.app.background:
+            try:
+                while True:
+                    next(self.steps)
+            except StopIteration as done:
+                export_zip, _warning_count = done.value
+            except TrackValidationError as error:
+                for message in error.errors:
+                    self.report({"ERROR"}, message)
+                return {"CANCELLED"}
+            except RuntimeError as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+            self.report({"INFO"}, f"Exported {export_zip}")
+            return {"FINISHED"}
+
+        self.finished_at = None
+        self.result = {"FINISHED"}
+        self.timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        update_export_progress("RUNNING", 0.0, "Starting export...", "")
+        return {"RUNNING_MODAL"}
+
+    def finish_progress(self, status, fraction, message, detail):
+        self.finished_at = time.monotonic()
+        self.result = {"FINISHED"} if status == "SUCCESS" else {"CANCELLED"}
+        update_export_progress(status, fraction, message, detail)
+
+    def close_progress(self, context):
+        context.window_manager.event_timer_remove(self.timer)
+        hide_export_progress()
+        return self.result
+
+    def step_export(self):
         try:
-            applied_count = apply_collision_mesh_scales(context, settings)
-        except RuntimeError as error:
-            self.report({"ERROR"}, str(error))
-            return {"CANCELLED"}
-        errors, warnings = validate_scene(settings, context)
-        if applied_count:
-            self.report({"INFO"}, f"Applied scale to {applied_count} collision mesh(es)")
-        for message in warnings:
-            self.report({"WARNING"}, message)
-        if errors:
-            for message in errors:
+            fraction, message = next(self.steps)
+        except StopIteration as done:
+            export_zip, warning_count = done.value
+            warnings = f" with {warning_count} warning(s)" if warning_count else ""
+            self.report({"INFO"}, f"Exported {export_zip}")
+            self.finish_progress("SUCCESS", 1.0, f"Exported {export_zip.name}{warnings}", str(export_zip))
+        except TrackValidationError as error:
+            for message in error.errors:
                 self.report({"ERROR"}, message)
-            return {"CANCELLED"}
+            more = f"+{len(error.errors) - 1} more error(s), see the Info log" if len(error.errors) > 1 else ""
+            self.finish_progress("FAILED", export_progress_state["fraction"], error.errors[0], more)
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            self.finish_progress("FAILED", export_progress_state["fraction"], str(error), "See the system console for details")
+        else:
+            update_export_progress(fraction=fraction, message=message)
 
-        export_zip = Path(abspath(self.filepath))
-        if export_zip.suffix.lower() != ".zip":
-            export_zip = export_zip.with_suffix(".zip")
-        export_zip.parent.mkdir(parents=True, exist_ok=True)
+    def modal(self, context, event):
+        try:
+            return self.handle_event(context, event)
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            if self.finished_at is None:
+                self.steps.close()
+            self.result = {"CANCELLED"}
+            return self.close_progress(context)
 
-        with tempfile.TemporaryDirectory(prefix="track_exporter_") as temp_dir:
-            temp_path = Path(temp_dir)
-            model_filename = f"{settings.track_id}.glb"
-            map_roots = [
-                direct_child_with_role(layout.root_object, ROLE_MAP)
-                for layout in settings.layouts
-                if layout.root_object
-            ]
-            map_roots = [root for root in map_roots if root]
-            excluded_map_objects = {
-                obj for root in map_roots for obj in [root, *descendants(root)]
-            }
-            export_track_glb(
-                context,
-                settings,
-                settings.track_root_object,
-                temp_path / model_filename,
-                int(settings.max_texture_size),
-                settings.optimize_color_textures,
-                settings.jpeg_quality,
-                settings.hdr_image,
-                excluded_objects=excluded_map_objects,
-            )
-            manifest = build_manifest(settings)
-            (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
+    def handle_event(self, context, event):
+        if self.finished_at is None:
+            if event.type == "ESC" and event.value == "PRESS":
+                try:
+                    self.steps.close()
+                except Exception as error:
+                    traceback.print_exc()
+                    self.report({"ERROR"}, str(error))
+                self.report({"WARNING"}, "Track export cancelled")
+                self.finish_progress("CANCELLED", export_progress_state["fraction"], "Export cancelled", "")
+            elif event.type == "TIMER":
+                self.step_export()
+            return {"RUNNING_MODAL"}
 
-            map_curves = [layout.map_curve for layout in settings.layouts if layout.map_curve]
-            if map_curves:
-                maps_path = temp_path / "maps"
-                maps_path.mkdir()
-                routes_path = temp_path / "routes"
-                routes_path.mkdir()
-                for layout in settings.layouts:
-                    if layout.map_curve:
-                        write_layout_map_svg(layout, maps_path / f"{layout.layout_id}.svg")
-                        route_data = layout_route_data(layout)
-                        (routes_path / f"{layout.layout_id}.json").write_text(
-                            json.dumps(route_data, separators=(",", ":")),
-                            encoding="utf-8",
-                        )
-
-            for layout in settings.layouts:
-                if layout.ideal_line:
-                    ideal_path = temp_path / "ideal-lines"
-                    ideal_path.mkdir(exist_ok=True)
-                    line_data, _warnings = layout_ideal_line_data(layout, context)
-                    (ideal_path / f"{layout.layout_id}.json").write_text(
-                        json.dumps(line_data, separators=(",", ":"), allow_nan=False), encoding="utf-8",
-                    )
-
-            if settings.hdr_image:
-                source = image_source_path(settings.hdr_image)
-                extension = image_source_extension(settings.hdr_image)
-                hdr_path = temp_path / "hdr"
-                hdr_path.mkdir()
-                destination = hdr_path / f"env{extension}"
-                if settings.hdr_image.packed_file:
-                    destination.write_bytes(bytes(settings.hdr_image.packed_file.data))
-                else:
-                    shutil.copy2(source, destination)
-
-            with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in temp_path.rglob("*"):
-                    if path.is_file():
-                        archive.write(path, path.relative_to(temp_path).as_posix())
-
-        self.report({"INFO"}, f"Exported {export_zip}")
-        return {"FINISHED"}
+        if event.type == "TIMER":
+            if time.monotonic() - self.finished_at >= EXPORT_RESULT_SECONDS:
+                return self.close_progress(context)
+            return {"RUNNING_MODAL"}
+        if event.value == "PRESS" and event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC", "RET", "NUMPAD_ENTER", "SPACE"}:
+            return self.close_progress(context)
+        return {"PASS_THROUGH"}
 
     def invoke(self, context, event):
         settings = scene_settings(context)
@@ -3612,6 +3942,7 @@ def register():
 
 
 def unregister():
+    hide_export_progress()
     if update_curve_lengths in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(update_curve_lengths)
     del bpy.types.Scene.track_exporter

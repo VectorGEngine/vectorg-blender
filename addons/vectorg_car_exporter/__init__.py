@@ -14,10 +14,15 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import traceback
 import zipfile
 from pathlib import Path
 
+import blf
 import bpy
+import gpu
+from gpu_extras.batch import batch_for_shader
 from bpy_extras.io_utils import ExportHelper
 from bpy.app.handlers import persistent
 from mathutils import Vector
@@ -1134,6 +1139,27 @@ def with_helpers_unlinked(callback, excluded_objects=()):
                     collection.objects.link(obj)
 
 
+def export_helper_states(excluded_objects=()):
+    helpers = list(dict.fromkeys(guide_objects() + downforce_helper_objects() + light_helper_objects() + list(excluded_objects)))
+    return [(obj, list(obj.users_collection)) for obj in helpers]
+
+
+def unlink_export_helpers(states):
+    for obj, collections in states:
+        for collection in collections:
+            if obj.name in collection.objects.keys():
+                collection.objects.unlink(obj)
+
+
+def relink_export_helpers(states):
+    for obj, collections in states:
+        if obj.name not in bpy.data.objects:
+            continue
+        for collection in collections:
+            if obj.name not in collection.objects.keys():
+                collection.objects.link(obj)
+
+
 def node_trees(root_tree):
     trees = []
     seen = set()
@@ -1446,6 +1472,41 @@ def restore_export_textures(restored_nodes, temp_images):
         finally:
             if temporary_file:
                 Path(temporary_file).unlink(missing_ok=True)
+
+
+def iter_export_texture_optimization(
+    objects,
+    max_size,
+    optimize_color_textures,
+    temporary_directory,
+    jpeg_quality,
+    restored_nodes,
+    temp_images,
+):
+    """Yield (index, total, image name) before each texture; the caller restores the collected nodes and images."""
+    usage_by_image = classify_texture_usage(objects)
+    nodes = [node for material in export_materials(objects) for node in material_texture_nodes(material)]
+    sources = list(dict.fromkeys(node.image for node in nodes))
+    replacements = {}
+    for index, source in enumerate(sources):
+        yield index, len(sources), source.name
+        replacement = optimized_export_image(
+            source,
+            usage_by_image.get(source, {"ambiguous"}),
+            max_size,
+            optimize_color_textures,
+            temporary_directory,
+            len(replacements),
+            jpeg_quality,
+        )
+        replacements[source] = replacement or source
+        if replacement:
+            temp_images.append(replacement)
+    for node in nodes:
+        replacement = replacements[node.image]
+        if replacement is not node.image:
+            restored_nodes.append((node, node.image))
+            node.image = replacement
 
 
 def gltf_image_export_options(jpeg_quality):
@@ -3247,6 +3308,225 @@ def show_validation_popup(context, errors, warnings):
     context.window_manager.popup_menu(draw_popup, title=title, icon=icon)
 
 
+EXPORT_RESULT_SECONDS = 4.0
+EXPORT_PROGRESS_SPACES = (
+    "SpaceView3D", "SpaceProperties", "SpaceOutliner", "SpaceImageEditor", "SpaceNodeEditor",
+    "SpaceTextEditor", "SpaceSequenceEditor", "SpaceGraphEditor", "SpaceDopeSheetEditor",
+    "SpaceNLA", "SpaceClipEditor", "SpaceInfo", "SpaceConsole", "SpaceFileBrowser",
+    "SpacePreferences", "SpaceSpreadsheet",
+)
+EXPORT_PROGRESS_COLORS = {
+    "RUNNING": (0.28, 0.52, 0.90, 1.0),
+    "SUCCESS": (0.30, 0.70, 0.36, 1.0),
+    "FAILED": (0.82, 0.30, 0.30, 1.0),
+    "CANCELLED": (0.75, 0.60, 0.25, 1.0),
+}
+EXPORT_PROGRESS_TITLES = {
+    "RUNNING": "Exporting Car",
+    "SUCCESS": "Export Complete",
+    "FAILED": "Export Failed",
+    "CANCELLED": "Export Cancelled",
+}
+export_progress_state = {"status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": []}
+
+
+def export_progress_active():
+    return export_progress_state["status"] is not None
+
+
+def redraw_all_areas():
+    window_manager = bpy.context.window_manager
+    for window in window_manager.windows if window_manager else ():
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+def update_export_progress(status=None, fraction=None, message=None, detail=None):
+    state = export_progress_state
+    if not state["handlers"]:
+        for space_name in EXPORT_PROGRESS_SPACES:
+            space = getattr(bpy.types, space_name, None)
+            if space:
+                handler = space.draw_handler_add(draw_export_progress, (), "WINDOW", "POST_PIXEL")
+                state["handlers"].append((space, handler))
+    for key, value in (("status", status), ("fraction", fraction), ("message", message), ("detail", detail)):
+        if value is not None:
+            state[key] = value
+    redraw_all_areas()
+
+
+def hide_export_progress():
+    state = export_progress_state
+    for space, handler in state["handlers"]:
+        space.draw_handler_remove(handler, "WINDOW")
+    state.update(status=None, fraction=0.0, message="", detail="", handlers=[])
+    try:
+        redraw_all_areas()
+    except AttributeError:
+        pass
+
+
+def draw_export_rect(shader, x, y, width, height, color):
+    batch = batch_for_shader(
+        shader,
+        "TRIS",
+        {"pos": ((x, y), (x + width, y), (x + width, y + height), (x, y + height))},
+        indices=((0, 1, 2), (0, 2, 3)),
+    )
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def fit_export_text(text, max_width, keep_end=False):
+    if blf.dimensions(0, text)[0] <= max_width:
+        return text
+    while text:
+        text = text[1:] if keep_end else text[:-1]
+        fitted = "…" + text if keep_end else text + "…"
+        if blf.dimensions(0, fitted)[0] <= max_width:
+            return fitted
+    return ""
+
+
+def draw_export_text(text, x, y, size, color, max_width, align="LEFT", keep_end=False):
+    blf.size(0, size)
+    text = fit_export_text(text, max_width, keep_end)
+    if align == "CENTER":
+        x -= blf.dimensions(0, text)[0] / 2
+    elif align == "RIGHT":
+        x -= blf.dimensions(0, text)[0]
+    blf.color(0, *color)
+    blf.position(0, x, y, 0)
+    blf.draw(0, text)
+
+
+def draw_export_progress():
+    state = export_progress_state
+    context = bpy.context
+    area, region = context.area, context.region
+    if state["status"] is None or not area or not region or not context.window:
+        return
+    scale = context.preferences.system.ui_scale
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    shader.bind()
+    draw_export_rect(shader, 0, 0, region.width, region.height, (0.0, 0.0, 0.0, 0.35))
+
+    largest = max(
+        (candidate for candidate in context.window.screen.areas if candidate.type != "EMPTY"),
+        key=lambda candidate: candidate.width * candidate.height,
+        default=None,
+    )
+    if area != largest:
+        gpu.state.blend_set("NONE")
+        return
+
+    padding = 16 * scale
+    width = min(460 * scale, region.width - 2 * padding)
+    height = 138 * scale
+    x = (region.width - width) / 2
+    y = (region.height - height) / 2
+    inner = width - 2 * padding
+    finished = state["status"] != "RUNNING"
+    draw_export_rect(shader, x - scale, y - scale, width + 2 * scale, height + 2 * scale, (0.36, 0.36, 0.36, 1.0))
+    draw_export_rect(shader, x, y, width, height, (0.12, 0.12, 0.12, 0.97))
+
+    bar_height = 14 * scale
+    bar_y = y + height - 52 * scale
+    fraction = min(max(state["fraction"], 0.0), 1.0)
+    draw_export_rect(shader, x + padding, bar_y, inner, bar_height, (0.22, 0.22, 0.22, 1.0))
+    if fraction > 0.0:
+        draw_export_rect(shader, x + padding, bar_y, inner * fraction, bar_height, EXPORT_PROGRESS_COLORS[state["status"]])
+    gpu.state.blend_set("NONE")
+
+    white, dim = (0.93, 0.93, 0.93, 1.0), (0.62, 0.62, 0.62, 1.0)
+    title_y = y + height - 28 * scale
+    draw_export_text(EXPORT_PROGRESS_TITLES[state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
+    draw_export_text(f"{round(fraction * 100)}%", x + width - padding, title_y, 14 * scale, dim, inner * 0.25, "RIGHT")
+    draw_export_text(state["message"], x + padding, bar_y - 26 * scale, 13 * scale, white, inner)
+    if state["detail"]:
+        draw_export_text(state["detail"], x + padding, bar_y - 48 * scale, 12 * scale, dim, inner, keep_end=True)
+    hint = "Click or press Esc to close" if finished else "Press Esc to cancel"
+    draw_export_text(hint, x + width / 2, y + 12 * scale, 11 * scale, dim, inner, "CENTER")
+
+
+def iter_car_zip_export(context, settings, export_zip, apply_scales):
+    """Export the car ZIP one step at a time, yielding (fraction, message) before each step."""
+    export_zip.parent.mkdir(parents=True, exist_ok=True)
+    ensure_camera_targets(settings)
+    if apply_scales:
+        yield 0.02, "Applying scales..."
+        apply_car_hierarchy_scales(context, settings.car_root_object)
+
+    with tempfile.TemporaryDirectory(prefix="car_exporter_") as temp_dir:
+        temp_path = Path(temp_dir)
+        sounds_path = temp_path / "sounds"
+        if settings.use_custom_sounds:
+            sounds_path.mkdir()
+
+        yield 0.05, "Preparing export scene..."
+        states = export_helper_states(excluded_ghost_objects(settings))
+        carrier = None
+        restored_nodes, temp_images = [], []
+        try:
+            unlink_export_helpers(states)
+            carrier = create_body_material_export_carrier(context)
+            for index, total, name in iter_export_texture_optimization(
+                list(context.scene.objects),
+                int(settings.max_texture_size),
+                settings.optimize_color_textures,
+                temp_path,
+                settings.jpeg_quality,
+                restored_nodes,
+                temp_images,
+            ):
+                yield 0.05 + 0.35 * index / total, f"Optimizing texture {index + 1}/{total}: {name}"
+
+            yield 0.40, "Exporting GLB model (this may take a while)..."
+            result = bpy.ops.export_scene.gltf(
+                filepath=str(temp_path / f"{settings.car_id}.glb"),
+                export_format="GLB",
+                use_selection=False,
+                export_apply=True,
+                export_cameras=True,
+                export_lights=False,
+                **gltf_image_export_options(settings.jpeg_quality),
+                **gltf_armature_export_options(settings),
+            )
+            if "FINISHED" not in result:
+                raise RuntimeError("Blender glTF export did not finish")
+        finally:
+            restore_export_textures(restored_nodes, temp_images)
+            remove_body_material_export_carrier(carrier)
+            relink_export_helpers(states)
+
+        yield 0.85, "Writing manifest..."
+        manifest = build_manifest(settings)
+        (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
+
+        if settings.use_custom_sounds:
+            yield 0.88, "Copying sounds..."
+            copied = set()
+            for slot in SOUND_SLOTS:
+                if not getattr(settings, f"sound_{slot}_enabled"):
+                    continue
+                source = getattr(settings, f"sound_{slot}")
+                if not source:
+                    continue
+                source_path = Path(abspath(source))
+                if source_path.is_file() and source_path.name not in copied:
+                    shutil.copy2(source_path, sounds_path / source_path.name)
+                    copied.add(source_path.name)
+
+        yield 0.92, f"Writing {export_zip.name}..."
+        with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            if settings.use_custom_sounds:
+                archive.writestr("sounds/", "")
+            for path in temp_path.rglob("*"):
+                if path.is_file():
+                    archive.write(path, path.relative_to(temp_path).as_posix())
+
+
 class CAR_EXPORTER_OT_validate_car(Operator):
     bl_idname = "car_exporter.validate_car"
     bl_label = "Validate Car"
@@ -4180,6 +4460,10 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
         layout.separator()
         layout.prop(self, "apply_scales_before_export")
 
+    @classmethod
+    def poll(cls, _context):
+        return not export_progress_active()
+
     def execute(self, context):
         if not self.file_selector_opened:
             return self.open_file_selector(context)
@@ -4188,63 +4472,99 @@ class CAR_EXPORTER_OT_export_car_zip(Operator, ExportHelper):
         errors, warnings = validate_scene(settings)
         for msg in warnings:
             self.report({"WARNING"}, msg)
+        interactive = context.window is not None and not bpy.app.background
         if errors:
             for msg in errors:
                 self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
+            if not interactive:
+                return {"CANCELLED"}
+            more = f"+{len(errors) - 1} more error(s), see the Info log" if len(errors) > 1 else ""
+            self.start_progress(context)
+            self.finish_progress("FAILED", 0.0, errors[0], more)
+            return {"RUNNING_MODAL"}
 
         export_zip = Path(abspath(self.filepath))
         if not export_zip.name.lower().endswith(".zip"):
             export_zip = export_zip.with_suffix(".zip")
-        export_zip.parent.mkdir(parents=True, exist_ok=True)
-        ensure_camera_targets(settings)
-        if self.apply_scales_before_export:
+        self.export_zip = export_zip
+        self.warning_count = len(warnings)
+        self.steps = iter_car_zip_export(context, settings, export_zip, self.apply_scales_before_export)
+        if not interactive:
             try:
-                apply_car_hierarchy_scales(context, settings.car_root_object)
+                for _step in self.steps:
+                    pass
             except RuntimeError as error:
                 self.report({"ERROR"}, str(error))
                 return {"CANCELLED"}
+            self.report({"INFO"}, f"Exported {export_zip}")
+            return {"FINISHED"}
 
-        with tempfile.TemporaryDirectory(prefix="car_exporter_") as temp_dir:
-            temp_path = Path(temp_dir)
-            sounds_path = temp_path / "sounds"
-            if settings.use_custom_sounds:
-                sounds_path.mkdir()
+        self.start_progress(context)
+        update_export_progress("RUNNING", 0.0, "Starting export...", "")
+        return {"RUNNING_MODAL"}
 
-            model_filename = f"{settings.car_id}.glb"
-            with_helpers_unlinked(lambda: export_car_glb(
-                context,
-                temp_path / model_filename,
-                int(settings.max_texture_size),
-                settings.optimize_color_textures,
-                settings.jpeg_quality,
-            ), excluded_objects=excluded_ghost_objects(settings))
+    def start_progress(self, context):
+        self.finished_at = None
+        self.result = {"FINISHED"}
+        self.timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        context.window_manager.modal_handler_add(self)
 
-            manifest = build_manifest(settings)
-            (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
+    def finish_progress(self, status, fraction, message, detail):
+        self.finished_at = time.monotonic()
+        self.result = {"FINISHED"} if status == "SUCCESS" else {"CANCELLED"}
+        update_export_progress(status, fraction, message, detail)
 
-            copied = set()
-            if settings.use_custom_sounds:
-                for slot in SOUND_SLOTS:
-                    if not getattr(settings, f"sound_{slot}_enabled"):
-                        continue
-                    source = getattr(settings, f"sound_{slot}")
-                    if not source:
-                        continue
-                    source_path = Path(abspath(source))
-                    if source_path.is_file() and source_path.name not in copied:
-                        shutil.copy2(source_path, sounds_path / source_path.name)
-                        copied.add(source_path.name)
+    def close_progress(self, context):
+        context.window_manager.event_timer_remove(self.timer)
+        hide_export_progress()
+        return self.result
 
-            with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                if settings.use_custom_sounds:
-                    archive.writestr("sounds/", "")
-                for path in temp_path.rglob("*"):
-                    if path.is_file():
-                        archive.write(path, path.relative_to(temp_path).as_posix())
+    def step_export(self):
+        try:
+            fraction, message = next(self.steps)
+        except StopIteration:
+            warnings = f" with {self.warning_count} warning(s)" if self.warning_count else ""
+            self.report({"INFO"}, f"Exported {self.export_zip}")
+            self.finish_progress("SUCCESS", 1.0, f"Exported {self.export_zip.name}{warnings}", str(self.export_zip))
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            self.finish_progress("FAILED", export_progress_state["fraction"], str(error), "See the system console for details")
+        else:
+            update_export_progress(fraction=fraction, message=message)
 
-        self.report({"INFO"}, f"Exported {export_zip}")
-        return {"FINISHED"}
+    def modal(self, context, event):
+        try:
+            return self.handle_event(context, event)
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            if self.finished_at is None and getattr(self, "steps", None):
+                self.steps.close()
+            self.result = {"CANCELLED"}
+            return self.close_progress(context)
+
+    def handle_event(self, context, event):
+        if self.finished_at is None:
+            if event.type == "ESC" and event.value == "PRESS":
+                try:
+                    self.steps.close()
+                except Exception as error:
+                    traceback.print_exc()
+                    self.report({"ERROR"}, str(error))
+                self.report({"WARNING"}, "Car export cancelled")
+                self.finish_progress("CANCELLED", export_progress_state["fraction"], "Export cancelled", "")
+            elif event.type == "TIMER":
+                self.step_export()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "TIMER":
+            if time.monotonic() - self.finished_at >= EXPORT_RESULT_SECONDS:
+                return self.close_progress(context)
+            return {"RUNNING_MODAL"}
+        if event.value == "PRESS" and event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC", "RET", "NUMPAD_ENTER", "SPACE"}:
+            return self.close_progress(context)
+        return {"PASS_THROUGH"}
 
     def invoke(self, context, _event):
         settings = scene_settings(context)
@@ -5275,6 +5595,7 @@ def register():
 
 
 def unregister():
+    hide_export_progress()
     if bpy.app.timers.is_registered(initialize_car_exporter_defaults):
         bpy.app.timers.unregister(initialize_car_exporter_defaults)
     if initialize_car_exporter_defaults_after_load in bpy.app.handlers.load_post:
