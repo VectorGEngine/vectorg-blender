@@ -1471,7 +1471,7 @@ def validate_scene(settings):
     warnings = []
 
     if not settings.is_configured:
-        errors.append("Create configuration first")
+        errors.append("Create car structure first")
         return errors, warnings
     if not PACKAGE_VERSION_PATTERN.fullmatch(settings.package_version):
         errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
@@ -4042,7 +4042,7 @@ class CAR_EXPORTER_OT_reset_torque_curve(Operator):
 
 class CAR_EXPORTER_OT_create_configuration(Operator):
     bl_idname = "car_exporter.create_configuration"
-    bl_label = "Create Configuration"
+    bl_label = "Create Car Structure"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
