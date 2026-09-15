@@ -319,7 +319,15 @@ Transmission Off
 Transmission On
 Limiter
 Turbo
+Engine Start
+Gear Grinding
+Brake Squeal
 ```
+
+The game decides which samples loop. Engine Start, Gear Grinding, and Turbo
+play once; every other slot loops. The exporter writes no `loop` flag, and
+manifest import ignores one. Engine Start, Gear Grinding, and Brake Squeal have
+enabled and volume controls but no RPM reference.
 
 **Pitch Offset (cents)** adjusts all loaded and off-throttle engine samples for
 the vehicle. It defaults to `0`; positive values raise pitch and negative values

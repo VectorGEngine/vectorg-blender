@@ -73,17 +73,20 @@ TIRE_TYPE_ITEMS = (
 TIRE_TYPES = frozenset(item[0] for item in TIRE_TYPE_ITEMS)
 
 SOUND_SLOTS = {
-    "idle": {"label": "Idle", "default": "", "rpm": 1000, "loop": True, "volume": 0.4},
-    "off_low": {"label": "Off Low", "default": "BAC_Mono_offlow.wav", "rpm": 1000, "loop": True, "volume": 0.3},
-    "off_mid": {"label": "Off Mid", "default": "", "rpm": 1000, "loop": True, "volume": 0.3},
-    "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "loop": True, "volume": 0.3},
-    "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "loop": True, "volume": 0.4},
-    "on_mid": {"label": "On Mid", "default": "", "rpm": 1000, "loop": True, "volume": 0.4},
-    "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "loop": True, "volume": 0.5},
-    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "loop": True, "volume": 0.1},
-    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
-    "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "loop": True, "volume": 0.4},
-    "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "loop": False, "volume": 0.6},
+    "idle": {"label": "Idle", "default": "", "rpm": 1000, "volume": 0.4},
+    "off_low": {"label": "Off Low", "default": "BAC_Mono_offlow.wav", "rpm": 1000, "volume": 0.3},
+    "off_mid": {"label": "Off Mid", "default": "", "rpm": 1000, "volume": 0.3},
+    "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "volume": 0.3},
+    "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "volume": 0.4},
+    "on_mid": {"label": "On Mid", "default": "", "rpm": 1000, "volume": 0.4},
+    "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "volume": 0.5},
+    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "volume": 0.1},
+    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "volume": 0.6},
+    "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "volume": 0.4},
+    "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "volume": 0.6},
+    "engine_start": {"label": "Engine Start", "default": "", "rpm": 0, "volume": 0.8},
+    "gear_grinding": {"label": "Gear Grinding", "default": "", "rpm": 0, "volume": 0.8},
+    "brake_squeal": {"label": "Brake Squeal", "default": "", "rpm": 0, "volume": 0.5},
 }
 SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low"}
 
@@ -2849,6 +2852,57 @@ class CarExporterSettings(PropertyGroup):
         description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
+    sound_engine_start: PointerProperty(
+        name="Engine Start",
+        description="Starter sound datablock played while the engine is starting",
+        type=bpy.types.Sound,
+    )
+    sound_engine_start_enabled: BoolProperty(
+        name="Engine Start Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_engine_start_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the engine start sound",
+        default=0.8,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_gear_grinding: PointerProperty(
+        name="Gear Grinding",
+        description="Sound datablock played when a gear shift is rejected",
+        type=bpy.types.Sound,
+    )
+    sound_gear_grinding_enabled: BoolProperty(
+        name="Gear Grinding Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_gear_grinding_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the gear grinding sound",
+        default=0.8,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_brake_squeal: PointerProperty(
+        name="Brake Squeal",
+        description="Brake sound datablock played while rolling slowly to a stop under light braking",
+        type=bpy.types.Sound,
+    )
+    sound_brake_squeal_enabled: BoolProperty(
+        name="Brake Squeal Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_brake_squeal_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the brake squeal sound",
+        default=0.5,
+        min=0.0,
+        soft_max=1.0,
+    )
     sound_tranny_on_volume: FloatProperty(
         name="Volume",
         description="Playback volume multiplier for the transmission-on sound",
@@ -3317,7 +3371,6 @@ def build_manifest(settings):
             sounds[slot] = {
                 "source": sound_export_name(sound, slot),
                 "rpm": sound_reference_rpm(settings, slot, meta),
-                "loop": meta["loop"],
                 "volume": getattr(settings, f"sound_{slot}_volume"),
             }
 
@@ -4818,9 +4871,6 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 if field == "rpm" and slot in SOUND_RPM_SLOTS and value <= 0:
                     self.report({"ERROR"}, f"Manifest sounds.{slot}.rpm must be positive for an engine sample")
                     return {"CANCELLED"}
-            if "loop" in sound and not isinstance(sound["loop"], bool):
-                self.report({"ERROR"}, f"Manifest sounds.{slot}.loop must be a boolean")
-                return {"CANCELLED"}
         body = data.get("body")
         if not isinstance(body, dict):
             self.report({"ERROR"}, "Manifest body must be an object")

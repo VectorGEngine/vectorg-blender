@@ -10,7 +10,7 @@ import unittest
 
 
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
-NEW_SLOTS = ("idle", "on_mid", "off_mid")
+NEW_SLOTS = ("idle", "on_mid", "off_mid", "engine_start", "gear_grinding", "brake_squeal")
 SOUND_HELPERS = {
     "sound_sample_path", "sound_export_name", "validate_sound_sample",
     "export_sound_samples", "load_manifest_sound_samples",
@@ -55,6 +55,9 @@ class CarSoundTests(unittest.TestCase):
                                if isinstance(node, ast.For)
                                and ast.unparse(node.iter) == "SOUND_SLOTS.items()"
                                and "sounds.get(slot)" in ast.unparse(node))
+        cls.import_validation = next(node for node in ast.walk(cls.tree)
+                                     if isinstance(node, ast.For) and ast.unparse(node.iter) == "SOUND_SLOTS"
+                                     and "Manifest sounds." in ast.unparse(node))
         cls.helpers = [node for node in cls.tree.body
                        if isinstance(node, ast.FunctionDef) and node.name in SOUND_HELPERS]
 
@@ -95,6 +98,16 @@ class CarSoundTests(unittest.TestCase):
     def export(self, settings):
         return self.execute(self.export_nodes, settings=settings)["sounds"]
 
+    def validate_import(self, sounds):
+        function = ast.FunctionDef(
+            name="validate", args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=[self.import_validation], decorator_list=[],
+        )
+        errors = []
+        namespace = self.execute([function], sounds=sounds)
+        namespace["self"] = SimpleNamespace(report=lambda _, message: errors.append(message))
+        return namespace["validate"](), errors
+
     def test_unassigned_optional_slots_are_omitted(self):
         self.assertEqual(self.export(self.settings()), {"pitchOffset": 0})
 
@@ -109,34 +122,39 @@ class CarSoundTests(unittest.TestCase):
                         self.export(settings)
 
     def test_import_rejects_zero_reference_rpm_for_every_engine_slot(self):
-        validation = next(node for node in ast.walk(self.tree)
-                          if isinstance(node, ast.For) and ast.unparse(node.iter) == "SOUND_SLOTS"
-                          and "Manifest sounds." in ast.unparse(node))
-        function = ast.FunctionDef(
-            name="validate", args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=[validation], decorator_list=[],
-        )
         for slot in self.constants["SOUND_SLOTS"]:
-            errors = []
-            namespace = self.execute([function], sounds={slot: {"source": "sample.wav", "rpm": 0}})
-            namespace["self"] = SimpleNamespace(report=lambda _, message: errors.append(message))
-            result = namespace["validate"]()
+            result, errors = self.validate_import({slot: {"source": "sample.wav", "rpm": 0}})
             if slot in self.constants["SOUND_RPM_SLOTS"]:
                 self.assertEqual(result, {"CANCELLED"})
                 self.assertIn("must be positive", errors[0])
             else:
                 self.assertIsNone(result)
 
+    def test_import_ignores_legacy_loop_flags(self):
+        for slot in self.constants["SOUND_SLOTS"]:
+            for loop in [True, False, "invalid"]:
+                with self.subTest(slot=slot, loop=loop):
+                    self.assertEqual(
+                        self.validate_import({slot: {"source": "sample.wav", "rpm": 1000, "loop": loop}}),
+                        (None, []),
+                    )
+
     def test_slot_order_and_sound_datablock_inputs(self):
         self.assertEqual(list(self.constants["SOUND_SLOTS"]), [
             "idle", "off_low", "off_mid", "off_high", "on_low", "on_mid", "on_high",
             "tranny_off", "tranny_on", "limiter", "turbo",
+            "engine_start", "gear_grinding", "brake_squeal",
         ])
         self.assertEqual({node.target.id for node in self.pointers},
                          {f"sound_{slot}" for slot in self.constants["SOUND_SLOTS"]})
         for node in self.pointers:
             pointer_type = next(keyword.value for keyword in node.annotation.keywords if keyword.arg == "type")
             self.assertEqual(ast.unparse(pointer_type), "bpy.types.Sound")
+        for slot, meta in self.constants["SOUND_SLOTS"].items():
+            self.assertNotIn("loop", meta)
+            self.assertEqual(self.defaults[f"sound_{slot}_enabled"], True)
+            self.assertEqual(self.defaults[f"sound_{slot}_volume"], meta["volume"])
+            self.assertEqual(f"sound_{slot}_rpm" in self.defaults, slot in self.constants["SOUND_RPM_SLOTS"])
 
     def test_new_slots_round_trip_custom_omitted_and_disabled(self):
         for slot in NEW_SLOTS:
@@ -146,13 +164,13 @@ class CarSoundTests(unittest.TestCase):
                     if mode != "omitted":
                         setattr(settings, f"sound_{slot}", sound_datablock(f"//{slot}.wav", packed=b"audio"))
                     setattr(settings, f"sound_{slot}_enabled", mode != "disabled")
-                    setattr(settings, f"sound_{slot}_rpm", 3200)
+                    if slot in self.constants["SOUND_RPM_SLOTS"]:
+                        setattr(settings, f"sound_{slot}_rpm", 3200)
                     setattr(settings, f"sound_{slot}_volume", 0.65)
                     sounds = self.export(settings)
                     if mode == "custom":
-                        self.assertEqual(sounds[slot], {
-                            "source": f"{slot}.wav", "rpm": 3200, "volume": 0.65, "loop": True,
-                        })
+                        rpm = 3200 if slot in self.constants["SOUND_RPM_SLOTS"] else self.constants["SOUND_SLOTS"][slot]["rpm"]
+                        self.assertEqual(sounds[slot], {"source": f"{slot}.wav", "rpm": rpm, "volume": 0.65})
                     elif mode == "disabled":
                         self.assertIsNone(sounds[slot])
                     else:
@@ -184,11 +202,14 @@ class CarSoundTests(unittest.TestCase):
         for slot in NEW_SLOTS:
             setattr(settings, f"sound_{slot}", sound_datablock("custom.wav"))
             setattr(settings, f"sound_{slot}_enabled", False)
-            setattr(settings, f"sound_{slot}_rpm", 5000)
+            if slot in self.constants["SOUND_RPM_SLOTS"]:
+                setattr(settings, f"sound_{slot}_rpm", 5000)
             setattr(settings, f"sound_{slot}_volume", 0.9)
         self.execute([reset_loop], settings=settings)
         for slot in NEW_SLOTS:
-            for suffix in ("", "_enabled", "_rpm", "_volume"):
+            suffixes = ("", "_enabled", "_rpm", "_volume") if slot in self.constants["SOUND_RPM_SLOTS"] \
+                else ("", "_enabled", "_volume")
+            for suffix in suffixes:
                 key = f"sound_{slot}{suffix}"
                 self.assertEqual(getattr(settings, key), self.defaults[key])
 
