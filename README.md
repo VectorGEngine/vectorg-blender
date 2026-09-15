@@ -312,10 +312,11 @@ All editable values are stored in `Scene.car_exporter`, so values are saved insi
 Audio uses fixed logical slots instead of free-form files:
 
 ```text
-Transmission On
+Idle
+Off Low / Mid / High
+On Low / Mid / High
 Transmission Off
-On Low / High
-Off Low / High
+Transmission On
 Limiter
 Turbo
 ```
@@ -325,13 +326,43 @@ the vehicle. It defaults to `0`; positive values raise pitch and negative values
 lower it. The exporter writes it as `sounds.pitchOffset` next to the logical
 sample slots.
 
-Each sound has an enabled checkbox that defaults on. An enabled sound with an
-assigned file exports that custom sample. An enabled sound without a file is
+Each sound selects a Blender Sound datablock from the current file and has an
+enabled checkbox that defaults on. An enabled sound with an assigned datablock
+exports that custom sample. An enabled sound without a datablock is
 omitted from the vehicle manifest so the game uses its default sample. A
 disabled sound is written as `null`, which explicitly disables the game default.
 
-Assigned and enabled files are copied into `sounds/`. Disabled files are not
-packaged.
+Assigned and enabled sounds are written into `sounds/` using their slot name
+and original file extension. If the stored path has no extension, the exporter
+uses the datablock name or recognizes WAV, Ogg, FLAC, AIFF, and ID3-tagged MP3
+headers. Unrecognized audio requires its original extension in the datablock
+name instead of exporting a file without an extension.
+Packed sounds export directly from the data stored
+in the `.blend`, even if their original file is missing. Unpacked sounds export
+from the file referenced by their datablock, resolving linked-library paths.
+Disabled sounds are not packaged. Manifest import loads custom samples into
+Blender Sound datablocks and assigns them to their slots.
+
+Idle, On Mid (`on_mid`), and Off Mid (`off_mid`) are optional looping samples.
+Their datablock, enabled, RPM, and volume controls follow the same rules as Low and
+High. The shared sound profile currently supplies no idle or mid recordings.
+
+Engine bands peak at 0% (idle), 15% (low), 50% (mid), and 100% (high) of the
+vehicle's idle-to-redline RPM range. The game crossfades between neighboring
+available bands separately for throttle-on and throttle-off, then blends those
+two sides by engine load. Idle is a single shared loop, without a volume boost
+at partial throttle. A missing band is skipped; the nearest available band
+covers RPM outside the available range. A side with no samples stays silent.
+These band positions are shared game constants; each sample's RPM control
+sets its pitch reference, not its blend position. Driving and replay use the
+same band mixer.
+
+For every engine loop, RPM is the actual engine speed represented by the
+recording and must be positive. Playback uses the ratio of actual engine RPM
+to that reference: matching RPM contributes zero detune, half RPM contributes
+one octave down, and double RPM contributes one octave up. The game then adds
+the configured Pitch Offset; redline RPM does not add a pitch shift. On High also receives
+a 4.5 dB presence boost at 2600 Hz (Q 0.8); cockpit filtering still applies.
 
 ## Body Colors
 

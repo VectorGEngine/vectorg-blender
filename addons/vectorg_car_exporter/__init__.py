@@ -73,16 +73,19 @@ TIRE_TYPE_ITEMS = (
 TIRE_TYPES = frozenset(item[0] for item in TIRE_TYPE_ITEMS)
 
 SOUND_SLOTS = {
-    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
-    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "loop": True, "volume": 0.1},
-    "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "loop": True, "volume": 0.5},
-    "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "loop": True, "volume": 0.4},
-    "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "loop": True, "volume": 0.3},
+    "idle": {"label": "Idle", "default": "", "rpm": 1000, "loop": True, "volume": 0.4},
     "off_low": {"label": "Off Low", "default": "BAC_Mono_offlow.wav", "rpm": 1000, "loop": True, "volume": 0.3},
+    "off_mid": {"label": "Off Mid", "default": "", "rpm": 1000, "loop": True, "volume": 0.3},
+    "off_high": {"label": "Off High", "default": "BAC_Mono_offveryhigh.wav", "rpm": 1000, "loop": True, "volume": 0.3},
+    "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "loop": True, "volume": 0.4},
+    "on_mid": {"label": "On Mid", "default": "", "rpm": 1000, "loop": True, "volume": 0.4},
+    "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "loop": True, "volume": 0.5},
+    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "loop": True, "volume": 0.1},
+    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "loop": True, "volume": 0.6},
     "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "loop": True, "volume": 0.4},
     "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "loop": False, "volume": 0.6},
 }
-SOUND_RPM_SLOTS = {"on_high", "on_low", "off_high", "off_low"}
+SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low"}
 
 ORIENTATION_DOT_THRESHOLD = math.cos(math.radians(1.0))
 STEERING_WHEEL_DOT_THRESHOLD = math.cos(math.radians(45.0))
@@ -160,6 +163,96 @@ def dot_axis(obj, local_axis, world_axis):
 
 def abspath(path):
     return bpy.path.abspath(path) if path else ""
+
+
+def sound_sample_path(sound):
+    if not sound.filepath:
+        raise ValueError(f'Sound "{sound.name}" has no audio file or packed data')
+    path = Path(bpy.path.abspath(sound.filepath, library=sound.library))
+    if not path.is_file():
+        raise ValueError(f'Sound "{sound.name}" file does not exist: {path}')
+    return path
+
+
+def sound_export_name(sound, slot):
+    # Slot names keep different datablocks with the same source filename distinct.
+    # Blender's // prefix is relative to the blend file, not a Windows UNC share.
+    suffix = Path(sound.filepath.replace("\\", "/").lstrip("/")).suffix
+    if not suffix:
+        suffix = Path(re.sub(r"\.\d{3}$", "", sound.name)).suffix
+    if not suffix:
+        if sound.packed_file is not None:
+            header = bytes(sound.packed_file.data[:16])
+        else:
+            with sound_sample_path(sound).open("rb") as stream:
+                header = stream.read(16)
+        if header[:4] in (b"RIFF", b"RF64") and header[8:12] == b"WAVE":
+            suffix = ".wav"
+        elif header.startswith(b"OggS"):
+            suffix = ".ogg"
+        elif header.startswith(b"fLaC"):
+            suffix = ".flac"
+        elif header[:4] == b"FORM" and header[8:12] in (b"AIFF", b"AIFC"):
+            suffix = ".aiff"
+        elif header.startswith(b"ID3"):
+            suffix = ".mp3"
+        else:
+            raise ValueError(f'Cannot determine audio extension for sound "{sound.name}"; give its datablock the original audio extension')
+    return f"{slot}{suffix}"
+
+
+def validate_sound_sample(sound):
+    if sound.packed_file is not None:
+        if sound.packed_file.size <= 0:
+            raise ValueError(f'Sound "{sound.name}" has empty packed data')
+    else:
+        sound_sample_path(sound)
+
+
+def sound_reference_rpm(settings, slot, meta):
+    if slot not in SOUND_RPM_SLOTS:
+        return meta["rpm"]
+    rpm = getattr(settings, f"sound_{slot}_rpm")
+    if isinstance(rpm, bool) or not isinstance(rpm, (int, float)) or not math.isfinite(rpm) or rpm <= 0:
+        raise ValueError(f"Sound {slot} reference RPM must be a finite positive number")
+    return rpm
+
+
+def export_sound_samples(settings, sounds_path):
+    if not settings.use_custom_sounds:
+        return
+    for slot in SOUND_SLOTS:
+        if not getattr(settings, f"sound_{slot}_enabled"):
+            continue
+        sound = getattr(settings, f"sound_{slot}")
+        if sound is None:
+            continue
+        validate_sound_sample(sound)
+        destination = sounds_path / sound_export_name(sound, slot)
+        if sound.packed_file is not None:
+            destination.write_bytes(bytes(sound.packed_file.data))
+        else:
+            shutil.copy2(sound_sample_path(sound), destination)
+
+
+def load_manifest_sound_samples(sounds, manifest_path):
+    sound_root = (manifest_path.parent / "sounds").resolve()
+    paths = {}
+    for slot in SOUND_SLOTS:
+        sound = sounds.get(slot)
+        if not isinstance(sound, dict):
+            continue
+        path = (sound_root / sound["source"].strip()).resolve()
+        if not path.is_relative_to(sound_root) or not path.is_file():
+            raise ValueError(f'Manifest sound {slot} must reference an existing file inside sounds/: {sound["source"]}')
+        paths[slot] = path
+    loaded = {}
+    for slot, path in paths.items():
+        try:
+            loaded[slot] = bpy.data.sounds.load(str(path), check_existing=True)
+        except RuntimeError as error:
+            raise ValueError(f"Unable to load manifest sound {slot}: {error}") from error
+    return loaded
 
 
 def relative_to_car(car_obj, obj):
@@ -1849,9 +1942,14 @@ def validate_scene(settings):
         for slot in SOUND_SLOTS:
             if not getattr(settings, f"sound_{slot}_enabled"):
                 continue
-            path = getattr(settings, f"sound_{slot}")
-            if path and not os.path.isfile(abspath(path)):
-                errors.append(f"Sound file for {slot} does not exist: {path}")
+            sound = getattr(settings, f"sound_{slot}")
+            if sound is not None:
+                try:
+                    validate_sound_sample(sound)
+                    sound_export_name(sound, slot)
+                    sound_reference_rpm(settings, slot, SOUND_SLOTS[slot])
+                except ValueError as error:
+                    errors.append(f"Sound {slot}: {error}")
 
     if not settings.car_id:
         errors.append("Car ID is required")
@@ -2602,92 +2700,153 @@ class CarExporterSettings(PropertyGroup):
         min=0.01,
         update=update_roof_target_distance,
     )
-    sound_tranny_on: StringProperty(
+    sound_tranny_on: PointerProperty(
         name="Transmission On",
-        description="Transmission sound file played while engine torque is applied",
-        subtype="FILE_PATH",
-        default="",
+        description="Transmission sound datablock played while engine torque is applied",
+        type=bpy.types.Sound,
     )
     sound_tranny_on_enabled: BoolProperty(
         name="Transmission On Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_tranny_off: StringProperty(
+    sound_tranny_off: PointerProperty(
         name="Transmission Off",
-        description="Transmission sound file played while coasting or using engine braking",
-        subtype="FILE_PATH",
-        default="",
+        description="Transmission sound datablock played while coasting or using engine braking",
+        type=bpy.types.Sound,
     )
     sound_tranny_off_enabled: BoolProperty(
         name="Transmission Off Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_on_high: StringProperty(
+    sound_idle: PointerProperty(
+        name="Idle",
+        description="Engine sound datablock used near idle RPM",
+        type=bpy.types.Sound,
+    )
+    sound_idle_enabled: BoolProperty(
+        name="Idle Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_idle_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the idle sample",
+        default=1000,
+        min=1,
+    )
+    sound_idle_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the idle sound",
+        default=0.4,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_on_mid: PointerProperty(
+        name="On Mid",
+        description="Mid-RPM engine sound datablock used while throttle is applied",
+        type=bpy.types.Sound,
+    )
+    sound_on_mid_enabled: BoolProperty(
+        name="On Mid Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_on_mid_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the on mid sample",
+        default=1000,
+        min=1,
+    )
+    sound_on_mid_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the on mid sound",
+        default=0.4,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_off_mid: PointerProperty(
+        name="Off Mid",
+        description="Mid-RPM engine sound datablock used while the throttle is released",
+        type=bpy.types.Sound,
+    )
+    sound_off_mid_enabled: BoolProperty(
+        name="Off Mid Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_off_mid_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the off mid sample",
+        default=1000,
+        min=1,
+    )
+    sound_off_mid_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the off mid sound",
+        default=0.3,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_on_high: PointerProperty(
         name="On High",
-        description="High-RPM engine sound file used while throttle is applied",
-        subtype="FILE_PATH",
-        default="",
+        description="High-RPM engine sound datablock used while throttle is applied",
+        type=bpy.types.Sound,
     )
     sound_on_high_enabled: BoolProperty(
         name="On High Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_on_low: StringProperty(
+    sound_on_low: PointerProperty(
         name="On Low",
-        description="Low-RPM engine sound file used while throttle is applied",
-        subtype="FILE_PATH",
-        default="",
+        description="Low-RPM engine sound datablock used while throttle is applied",
+        type=bpy.types.Sound,
     )
     sound_on_low_enabled: BoolProperty(
         name="On Low Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_off_high: StringProperty(
+    sound_off_high: PointerProperty(
         name="Off High",
-        description="High-RPM engine sound file used while the throttle is released",
-        subtype="FILE_PATH",
-        default="",
+        description="High-RPM engine sound datablock used while the throttle is released",
+        type=bpy.types.Sound,
     )
     sound_off_high_enabled: BoolProperty(
         name="Off High Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_off_low: StringProperty(
+    sound_off_low: PointerProperty(
         name="Off Low",
-        description="Low-RPM engine sound file used while the throttle is released",
-        subtype="FILE_PATH",
-        default="",
+        description="Low-RPM engine sound datablock used while the throttle is released",
+        type=bpy.types.Sound,
     )
     sound_off_low_enabled: BoolProperty(
         name="Off Low Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_limiter: StringProperty(
+    sound_limiter: PointerProperty(
         name="Limiter",
-        description="Sound file played while the engine is touching the rev limiter",
-        subtype="FILE_PATH",
-        default="",
+        description="Sound datablock played while the engine is touching the rev limiter",
+        type=bpy.types.Sound,
     )
     sound_limiter_enabled: BoolProperty(
         name="Limiter Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
-    sound_turbo: StringProperty(
+    sound_turbo: PointerProperty(
         name="Turbo",
-        description="Turbo sound file played after boost is released",
-        subtype="FILE_PATH",
-        default="",
+        description="Turbo sound datablock played after boost is released",
+        type=bpy.types.Sound,
     )
     sound_turbo_enabled: BoolProperty(
         name="Turbo Enabled",
-        description="Use the default sound when no file is assigned, use the assigned custom sound, or turn off to disable it",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
     sound_tranny_on_volume: FloatProperty(
@@ -2708,7 +2867,7 @@ class CarExporterSettings(PropertyGroup):
         name="RPM",
         description="Reference engine speed for pitching the high-RPM throttle-on sample",
         default=1000,
-        min=0,
+        min=1,
     )
     sound_on_high_volume: FloatProperty(
         name="Volume",
@@ -2721,7 +2880,7 @@ class CarExporterSettings(PropertyGroup):
         name="RPM",
         description="Reference engine speed for pitching the low-RPM throttle-on sample",
         default=1000,
-        min=0,
+        min=1,
     )
     sound_on_low_volume: FloatProperty(
         name="Volume",
@@ -2734,7 +2893,7 @@ class CarExporterSettings(PropertyGroup):
         name="RPM",
         description="Reference engine speed for pitching the high-RPM throttle-off sample",
         default=1000,
-        min=0,
+        min=1,
     )
     sound_off_high_volume: FloatProperty(
         name="Volume",
@@ -2747,7 +2906,7 @@ class CarExporterSettings(PropertyGroup):
         name="RPM",
         description="Reference engine speed for pitching the low-RPM throttle-off sample",
         default=1000,
-        min=0,
+        min=1,
     )
     sound_off_low_volume: FloatProperty(
         name="Volume",
@@ -2856,7 +3015,7 @@ def clear_configuration_settings(settings):
         setattr(settings, f"{prefix}_target_distance", 0.01)
     for slot, meta in SOUND_SLOTS.items():
         setattr(settings, f"sound_{slot}_enabled", True)
-        setattr(settings, f"sound_{slot}", "")
+        setattr(settings, f"sound_{slot}", None)
         setattr(settings, f"sound_{slot}_volume", meta["volume"])
         if slot in SOUND_RPM_SLOTS:
             setattr(settings, f"sound_{slot}_rpm", meta["rpm"])
@@ -3152,13 +3311,12 @@ def build_manifest(settings):
             if not getattr(settings, f"sound_{slot}_enabled"):
                 sounds[slot] = None
                 continue
-            source_path = getattr(settings, f"sound_{slot}")
-            if not source_path:
+            sound = getattr(settings, f"sound_{slot}")
+            if sound is None:
                 continue
-            source_name = Path(abspath(source_path)).name
             sounds[slot] = {
-                "source": source_name,
-                "rpm": getattr(settings, f"sound_{slot}_rpm") if slot in SOUND_RPM_SLOTS else meta["rpm"],
+                "source": sound_export_name(sound, slot),
+                "rpm": sound_reference_rpm(settings, slot, meta),
                 "loop": meta["loop"],
                 "volume": getattr(settings, f"sound_{slot}_volume"),
             }
@@ -3506,17 +3664,7 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
 
         if settings.use_custom_sounds:
             yield 0.88, "Copying sounds..."
-            copied = set()
-            for slot in SOUND_SLOTS:
-                if not getattr(settings, f"sound_{slot}_enabled"):
-                    continue
-                source = getattr(settings, f"sound_{slot}")
-                if not source:
-                    continue
-                source_path = Path(abspath(source))
-                if source_path.is_file() and source_path.name not in copied:
-                    shutil.copy2(source_path, sounds_path / source_path.name)
-                    copied.add(source_path.name)
+            export_sound_samples(settings, sounds_path)
 
         yield 0.92, f"Writing {export_zip.name}..."
         with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -4667,6 +4815,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                     self.report({"ERROR"}, f"Manifest sounds.{slot}.{field} must be a finite non-negative number")
                     return {"CANCELLED"}
+                if field == "rpm" and slot in SOUND_RPM_SLOTS and value <= 0:
+                    self.report({"ERROR"}, f"Manifest sounds.{slot}.rpm must be positive for an engine sample")
+                    return {"CANCELLED"}
             if "loop" in sound and not isinstance(sound["loop"], bool):
                 self.report({"ERROR"}, f"Manifest sounds.{slot}.loop must be a boolean")
                 return {"CANCELLED"}
@@ -4917,6 +5068,12 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be positive")
                     return {"CANCELLED"}
 
+        try:
+            loaded_sounds = load_manifest_sound_samples(sounds, manifest_path)
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
         settings.is_configured = True
         import_ghost_config(settings, ghost_config)
         import_armature_config(settings, armature_config)
@@ -4929,14 +5086,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         for slot, meta in SOUND_SLOTS.items():
             sound = sounds.get(slot)
             setattr(settings, f"sound_{slot}_enabled", slot not in sounds or sound is not None)
-            setattr(settings, f"sound_{slot}", "")
+            setattr(settings, f"sound_{slot}", loaded_sounds.get(slot))
             if not isinstance(sound, dict):
                 continue
-            setattr(
-                settings,
-                f"sound_{slot}",
-                str(manifest_path.parent / "sounds" / sound["source"].strip()),
-            )
             setattr(settings, f"sound_{slot}_volume", sound.get("volume", meta["volume"]))
             if slot in SOUND_RPM_SLOTS:
                 setattr(settings, f"sound_{slot}_rpm", sound.get("rpm", meta["rpm"]))
@@ -5529,7 +5681,9 @@ class CAR_EXPORTER_PT_car_export(Panel):
                 )
                 controls = sound_section.column()
                 controls.enabled = getattr(settings, f"sound_{slot}_enabled")
-                draw_split_prop(controls, settings, f"sound_{slot}", label="File")
+                sound_picker = controls.split(factor=0.4, align=True)
+                sound_picker.label(text="Sound")
+                sound_picker.template_ID(settings, f"sound_{slot}", open="sound.open")
                 if slot in SOUND_RPM_SLOTS:
                     draw_split_prop(controls, settings, f"sound_{slot}_rpm")
                 draw_split_prop(controls, settings, f"sound_{slot}_volume")
