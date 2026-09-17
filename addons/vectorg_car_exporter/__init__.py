@@ -1863,8 +1863,8 @@ def validate_scene(settings):
                 wheel.max_brake_force,
             )):
                 errors.append(f"{label} {group} handling values must be non-negative")
-            if wheel.grip_factor <= 0:
-                errors.append(f"{label} {group} grip factor must be a positive number")
+            if not 1.0 <= wheel.grip_factor <= 1.6:
+                errors.append(f"{label} {group} wheel grip factor must be between 1.0 and 1.6")
             for key in ("l", "r"):
                 rest_length = wheel_rest_lengths.get((group, key))
                 if rest_length is not None and rest_length + wheel.suspension_offset <= 0:
@@ -2133,7 +2133,8 @@ class CarWheelSettings(PropertyGroup):
     toe: FloatProperty(default=-0.15, options={"HIDDEN"})
     grip_factor: FloatProperty(
         default=1.0,
-        min=0.01,
+        min=1.0,
+        max=1.6,
         options={"HIDDEN"},
     )
 
@@ -2243,7 +2244,8 @@ class CarWheelPresetSettings(PropertyGroup):
         name="Grip Factor",
         description="Multiplier for this wheel's pressure-derived grip",
         default=1.0,
-        min=0.01,
+        min=1.0,
+        max=1.6,
     )
 
 
@@ -5195,8 +5197,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 if any(wheel_data[field] < 0 for field in non_negative_fields):
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} handling values must be non-negative")
                     return {"CANCELLED"}
-                if wheel_data["gripFactor"] <= 0:
-                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be positive")
+                if not 1.0 <= wheel_data["gripFactor"] <= 1.6:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be between 1.0 and 1.6")
                     return {"CANCELLED"}
 
         try:
