@@ -38,6 +38,26 @@ from bpy.props import (
 from bpy.types import Operator, Panel, PropertyGroup
 
 
+DIFFERENTIAL_FIELDS = (
+    ("frontAccelLock", "front_accel_lock", 0.0),
+    ("frontDecelLock", "front_decel_lock", 0.0),
+    ("rearAccelLock", "rear_accel_lock", 0.0),
+    ("rearDecelLock", "rear_decel_lock", 0.0),
+    ("centerRearBias", "center_rear_bias", 0.5),
+)
+
+
+def preset_differential_config(preset_data):
+    """Manifest presets must supply all differential settings explicitly."""
+    value = preset_data.get("differential")
+    if not isinstance(value, dict) or set(value) != {key for key, _prop, _default in DIFFERENTIAL_FIELDS}:
+        raise ValueError("Differential must contain exactly the five lock and balance settings")
+    for key, number in value.items():
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) or not 0 <= number <= 1:
+            raise ValueError(f"Differential {key} must be a finite number between 0 and 1")
+    return dict(value)
+
+
 WHEEL_KEYS = (
     ("front", "l", True),
     ("front", "r", True),
@@ -1792,6 +1812,10 @@ def validate_scene(settings):
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
         if not math.isfinite(preset.brake_bias) or not 0.0 <= preset.brake_bias <= 1.0:
             errors.append(f"{label} brake bias must be between 0 and 1")
+        for key, prop, _default in DIFFERENTIAL_FIELDS:
+            value = getattr(preset, prop)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                errors.append(f"{label} differential {key} must be between 0 and 1")
         if not math.isfinite(preset.final_drive_ratio) or preset.final_drive_ratio <= 0:
             errors.append(f"{label} final drive ratio must be positive")
         if not math.isfinite(preset.reverse_ratio) or preset.reverse_ratio >= 0:
@@ -2297,6 +2321,46 @@ class CarPresetSettings(PropertyGroup):
         name="Brake Bias",
         description="Front brake force proportion",
         default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    front_accel_lock: FloatProperty(
+        name="Front Accel Lock",
+        description="Axle lock: zero is open, one enforces equal left and right wheel angular speed",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    front_decel_lock: FloatProperty(
+        name="Front Decel Lock",
+        description="Axle lock: zero is open, one enforces equal left and right wheel angular speed",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    rear_accel_lock: FloatProperty(
+        name="Rear Accel Lock",
+        description="Axle lock: zero is open, one enforces equal left and right wheel angular speed",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    rear_decel_lock: FloatProperty(
+        name="Rear Decel Lock",
+        description="Axle lock: zero is open, one enforces equal left and right wheel angular speed",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    center_rear_bias: FloatProperty(
+        name="Center Rear Bias",
+        description="Rear share of AWD drive torque; zero is all front, one is all rear",
+        default=0.5,
         min=0.0,
         max=1.0,
         subtype="FACTOR",
@@ -3193,6 +3257,15 @@ def wheel_preset_config(wheel):
     }
 
 
+def build_differential_config(preset, drive):
+    values = {key: getattr(preset, prop) for key, prop, _default in DIFFERENTIAL_FIELDS}
+    if drive.lower() == "fwd":
+        values.update(rearAccelLock=0.0, rearDecelLock=0.0, centerRearBias=0.0)
+    elif drive.lower() == "rwd":
+        values.update(frontAccelLock=0.0, frontDecelLock=0.0, centerRearBias=1.0)
+    return values
+
+
 def build_presets_config(settings):
     ensure_default_presets(settings)
     return [
@@ -3210,6 +3283,7 @@ def build_presets_config(settings):
             "escLevel": preset.esc_level,
             "tractionControlLevel": preset.traction_control_level,
             "brakeBias": preset.brake_bias,
+            "differential": build_differential_config(preset, settings.drive),
             "gearing": {
                 "finalDriveRatio": preset.final_drive_ratio,
                 "gearRatios": {
@@ -4283,6 +4357,7 @@ def default_preset_values(settings):
         "esc_level": 0,
         "traction_control_level": settings.traction_control_max_level,
         "brake_bias": 0.6,
+        **{prop: default for _key, prop, default in DIFFERENTIAL_FIELDS},
         "final_drive_ratio": 5.0,
         "reverse_ratio": -3.57,
         "forward_gear_count": 6,
@@ -4489,6 +4564,7 @@ def apply_preset_values(values, target):
         "esc_level",
         "traction_control_level",
         "brake_bias",
+        *(prop for _key, prop, _default in DIFFERENTIAL_FIELDS),
         "final_drive_ratio",
         "reverse_ratio",
         "forward_gear_count",
@@ -4979,6 +5055,11 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             if not isinstance(preset_data, dict):
                 self.report({"ERROR"}, f"Manifest preset {preset_index} must be an object")
                 return {"CANCELLED"}
+            try:
+                preset_differential_config(preset_data)
+            except ValueError as error:
+                self.report({"ERROR"}, f"Manifest preset {preset_index}: {error}")
+                return {"CANCELLED"}
             gearing = preset_data.get("gearing")
             if not isinstance(gearing, dict):
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.gearing must be an object")
@@ -5232,6 +5313,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.esc_level = preset_data["escLevel"]
             preset.traction_control_level = preset_data["tractionControlLevel"]
             preset.brake_bias = preset_data["brakeBias"]
+            differential = preset_differential_config(preset_data)
+            for key, prop, _default in DIFFERENTIAL_FIELDS:
+                setattr(preset, prop, differential[key])
             gearing = preset_data["gearing"]
             ratios = gearing["gearRatios"]
             preset.final_drive_ratio = gearing["finalDriveRatio"]
@@ -5503,6 +5587,8 @@ def draw_presets(layout, settings):
         draw_split_prop(gearing_box, preset, f"gear_{index}")
     draw_split_prop(gearing_box, preset, "final_drive_ratio")
 
+    draw_differential(layout.box(), settings)
+
     for group in ("front", "rear"):
         axle_box = layout.box()
         axle_box.label(text=f"{group.title()} Wheels")
@@ -5524,6 +5610,21 @@ def draw_presets(layout, settings):
         estimate = brake_value.operator("car_exporter.estimate_brake_force", text="", icon="FILE_REFRESH")
         estimate.axle = group
         draw_split_prop(axle_box, wheel, "grip_factor")
+
+
+def draw_differential(layout, settings):
+    layout.label(text="Differential")
+    preset = active_preset(settings)
+    if not preset:
+        layout.label(text="Add a car preset to configure differential", icon="INFO")
+        return
+    drive = settings.drive.lower()
+    for axle in ("front", "rear"):
+        if drive == "awd" or drive == ("fwd" if axle == "front" else "rwd"):
+            draw_split_prop(layout, preset, f"{axle}_accel_lock")
+            draw_split_prop(layout, preset, f"{axle}_decel_lock")
+    if drive == "awd":
+        draw_split_prop(layout, preset, "center_rear_bias", label="Rear Torque Share")
 
 
 def draw_cameras(layout, settings):

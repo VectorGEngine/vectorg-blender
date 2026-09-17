@@ -70,6 +70,13 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
       "escLevel": 0,
       "tractionControlLevel": 5,
       "brakeBias": 0.6,
+      "differential": {
+        "frontAccelLock": 0.0,
+        "frontDecelLock": 0.0,
+        "rearAccelLock": 0.0,
+        "rearDecelLock": 0.0,
+        "centerRearBias": 0.5
+      },
       "gearing": {
         "finalDriveRatio": 5.0,
         "gearRatios": {
@@ -110,6 +117,15 @@ nonnegative `engine.engineBraking` value (default `0.2`). It is unitless: `0.2`
 applies 20% of peak engine torque at maximum RPM with zero throttle, decreasing
 toward idle or as throttle increases.
 Each preset exports its final drive and individual ratios under `gearing`.
+The separate Differential section edits the selected car preset and exposes
+acceleration and deceleration locks on driven axles, plus rear torque share for
+AWD. FWD exports zero rear locks and `centerRearBias: 0` (all front); RWD exports
+zero front locks and `centerRearBias: 1` (all rear). Values export under `differential` as
+numbers from 0 to 1. Zero lock is open; full lock enforces equal wheel angular
+speeds. Center rear bias controls torque distribution, not axle speed locking.
+Every manifest preset must contain all five valid fields. The game reads its
+factory differential settings from these per-car presets; it has no global
+fallback differential setup.
 The Torque Curve section exports `engine.torqueFactor`, which scales drive and
 engine-braking torque before tire-force limits are applied.
 The game applies auto blip only when both its gameplay setting and the vehicle's
