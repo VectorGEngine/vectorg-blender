@@ -5735,27 +5735,6 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_vehicle_tags(box, settings)
 
         box = layout.box()
-        box.label(text="Body")
-        draw_split_prop(box, settings, "car_root_object")
-        box.separator(type="LINE")
-        draw_body_colors(box, settings)
-
-        draw_custom_ghost(layout.box(), settings)
-
-        box = layout.box()
-        box.label(text="Steering Wheel")
-        draw_split_prop(box, settings, "steering_wheel_object")
-        draw_split_prop(box, settings, "steering_wheel_spin_axis")
-
-        box = layout.box()
-        box.label(text="Lights")
-        draw_vehicle_lights(box, settings)
-
-        box = layout.box()
-        box.label(text="Dashboard")
-        draw_split_prop(box, settings, "dashboard_screen_object")
-
-        box = layout.box()
         box.label(text="Engine")
         for prop in (
             "drive",
@@ -5780,6 +5759,12 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_torque_curve(box, settings)
 
         box = layout.box()
+        box.label(text="Driver Assists")
+        draw_split_prop(box, settings, "abs_max_level")
+        draw_split_prop(box, settings, "esc_max_level")
+        draw_split_prop(box, settings, "traction_control_max_level")
+
+        box = layout.box()
         box.label(text="Gears")
         draw_split_prop(box, settings, "shift_cooldown")
         draw_split_prop(box, settings, "auto_blip")
@@ -5792,20 +5777,31 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_body_physics(box, settings)
 
         box = layout.box()
+        box.label(text="Body")
+        draw_split_prop(box, settings, "car_root_object")
+        box.separator(type="LINE")
+        draw_body_colors(box, settings)
+
+        box = layout.box()
         box.label(text="Colliders")
         draw_colliders(box, settings)
 
         box = layout.box()
-        box.label(text="Wheel Setup")
-        draw_wheels(box, settings)
-
-        draw_armature(layout.box(), settings)
+        box.label(text="Steering Wheel")
+        draw_split_prop(box, settings, "steering_wheel_object")
+        draw_split_prop(box, settings, "steering_wheel_spin_axis")
 
         box = layout.box()
-        box.label(text="Driver Assists")
-        draw_split_prop(box, settings, "abs_max_level")
-        draw_split_prop(box, settings, "esc_max_level")
-        draw_split_prop(box, settings, "traction_control_max_level")
+        box.label(text="Dashboard")
+        draw_split_prop(box, settings, "dashboard_screen_object")
+
+        box = layout.box()
+        box.label(text="Lights")
+        draw_vehicle_lights(box, settings)
+
+        box = layout.box()
+        box.label(text="Wheel Setup")
+        draw_wheels(box, settings)
 
         box = layout.box()
         draw_presets(box, settings)
@@ -5813,6 +5809,10 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Cameras")
         draw_cameras(box, settings)
+
+        draw_armature(layout.box(), settings)
+
+        draw_custom_ghost(layout.box(), settings)
 
         box = layout.box()
         box.label(text="Audio")
@@ -5838,7 +5838,6 @@ class CAR_EXPORTER_PT_car_export(Panel):
                 if slot in SOUND_RPM_SLOTS:
                     draw_split_prop(controls, settings, f"sound_{slot}_rpm")
                 draw_split_prop(controls, settings, f"sound_{slot}_volume")
-
         box = layout.box()
         box.operator("car_exporter.remove_configuration", icon="TRASH")
 
