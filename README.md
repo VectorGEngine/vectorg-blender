@@ -75,7 +75,7 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
         "frontDecelLock": 0.0,
         "rearAccelLock": 0.0,
         "rearDecelLock": 0.0,
-        "centerRearBias": 0.5
+        "centerBalance": 0.5
       },
       "gearing": {
         "finalDriveRatio": 5.0,
@@ -118,11 +118,11 @@ applies 20% of peak engine torque at maximum RPM with zero throttle, decreasing
 toward idle or as throttle increases.
 Each preset exports its final drive and individual ratios under `gearing`.
 The separate Differential section edits the selected car preset and exposes
-acceleration and deceleration locks on driven axles, plus rear torque share for
-AWD. FWD exports zero rear locks and `centerRearBias: 0` (all front); RWD exports
-zero front locks and `centerRearBias: 1` (all rear). Values export under `differential` as
+acceleration and deceleration locks on driven axles, plus front torque share for
+AWD. FWD exports zero rear locks and `centerBalance: 1` (all front); RWD exports
+zero front locks and `centerBalance: 0` (all rear). Values export under `differential` as
 numbers from 0 to 1. Zero lock is open; full lock enforces equal wheel angular
-speeds. Center rear bias controls torque distribution, not axle speed locking.
+speeds. Center balance controls torque distribution, not axle speed locking.
 Every manifest preset must contain all five valid fields. The game reads its
 factory differential settings from these per-car presets; it has no global
 fallback differential setup.

@@ -43,7 +43,7 @@ DIFFERENTIAL_FIELDS = (
     ("frontDecelLock", "front_decel_lock", 0.0),
     ("rearAccelLock", "rear_accel_lock", 0.0),
     ("rearDecelLock", "rear_decel_lock", 0.0),
-    ("centerRearBias", "center_rear_bias", 0.5),
+    ("centerBalance", "center_balance", 0.5),
 )
 
 
@@ -2357,9 +2357,9 @@ class CarPresetSettings(PropertyGroup):
         max=1.0,
         subtype="FACTOR",
     )
-    center_rear_bias: FloatProperty(
-        name="Center Rear Bias",
-        description="Rear share of AWD drive torque; zero is all front, one is all rear",
+    center_balance: FloatProperty(
+        name="Center Balance",
+        description="Front share of AWD drive torque; zero is all rear, one is all front",
         default=0.5,
         min=0.0,
         max=1.0,
@@ -3260,9 +3260,9 @@ def wheel_preset_config(wheel):
 def build_differential_config(preset, drive):
     values = {key: getattr(preset, prop) for key, prop, _default in DIFFERENTIAL_FIELDS}
     if drive.lower() == "fwd":
-        values.update(rearAccelLock=0.0, rearDecelLock=0.0, centerRearBias=0.0)
+        values.update(rearAccelLock=0.0, rearDecelLock=0.0, centerBalance=1.0)
     elif drive.lower() == "rwd":
-        values.update(frontAccelLock=0.0, frontDecelLock=0.0, centerRearBias=1.0)
+        values.update(frontAccelLock=0.0, frontDecelLock=0.0, centerBalance=0.0)
     return values
 
 
@@ -5624,7 +5624,7 @@ def draw_differential(layout, settings):
             draw_split_prop(layout, preset, f"{axle}_accel_lock")
             draw_split_prop(layout, preset, f"{axle}_decel_lock")
     if drive == "awd":
-        draw_split_prop(layout, preset, "center_rear_bias", label="Rear Torque Share")
+        draw_split_prop(layout, preset, "center_balance", label="Center Balance")
 
 
 def draw_cameras(layout, settings):

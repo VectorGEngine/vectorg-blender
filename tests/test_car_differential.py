@@ -29,7 +29,7 @@ class DifferentialTests(unittest.TestCase):
         defaults = {key: default for key, _prop, default in self.fields}
         self.assertEqual(defaults, {
             "frontAccelLock": 0, "frontDecelLock": 0,
-            "rearAccelLock": 0, "rearDecelLock": 0, "centerRearBias": 0.5,
+            "rearAccelLock": 0, "rearDecelLock": 0, "centerBalance": 0.5,
         })
         for bad in (None, [], {}, {"rearAccelLock": 0.5}, {**defaults, "typo": 0}):
             with self.assertRaises(ValueError):
@@ -65,14 +65,14 @@ class DifferentialTests(unittest.TestCase):
     def test_single_axle_exports_clear_unused_locks_and_fix_balance(self):
         preset = SimpleNamespace(**{prop: 0.37 for _, prop, _ in self.fields})
         for drive, active, inactive, bias in (
-            ("fwd", "front", "rear", 0.0), ("rwd", "rear", "front", 1.0),
+            ("fwd", "front", "rear", 1.0), ("rwd", "rear", "front", 0.0),
         ):
             with self.subTest(drive=drive):
                 block = self.namespace["build_differential_config"](preset, drive)
                 for mode in ("AccelLock", "DecelLock"):
                     self.assertEqual(block[active + mode], 0.37)
                     self.assertEqual(block[inactive + mode], 0.0)
-                self.assertEqual(block["centerRearBias"], bias)
+                self.assertEqual(block["centerBalance"], bias)
                 self.assertEqual(self.normalize({"differential": block}), block)
 
     def test_section_shows_only_driven_axle_controls(self):
