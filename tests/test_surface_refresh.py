@@ -15,7 +15,7 @@ FUNCTIONS = {
     "create_visual_hierarchy", "layout_root_name", "indexed_name_value", "ordered_objects",
     "layout_named_objects", "layout_nodes", "apply_generated_names", "sync_layout_node_names",
     "create_layout_hierarchy", "find_surface_group", "ensure_surface_group",
-    "refresh_track_structure", "valid_id",
+    "renamed_surface_groups", "migrate_renamed_surface_group", "refresh_track_structure", "valid_id",
 }
 
 
@@ -54,6 +54,16 @@ class Objects(list):
     def get(self, name):
         return next((obj for obj in self if obj.name == name), None)
 
+    def remove(self, obj, do_unlink=True):
+        assert do_unlink and not obj.children
+        obj.parent = None
+        super().remove(obj)
+
+
+class Matrix(tuple):
+    def copy(self):
+        return Matrix(self)
+
 
 class SurfaceRefreshTests(unittest.TestCase):
     def setUp(self):
@@ -67,8 +77,8 @@ class SurfaceRefreshTests(unittest.TestCase):
             elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
                 name = node.targets[0].id
                 if name.startswith("ROLE_") or name in {
-                    "SURFACE_IDS", "SURFACE_PROPERTY", "SHAPE_PROPERTY", "EVENT_PROPERTY",
-                    "ORDER_PROPERTY", "ID_PATTERN",
+                    "SURFACE_IDS", "RENAMED_SURFACE_IDS", "SURFACE_PROPERTY", "SHAPE_PROPERTY",
+                    "EVENT_PROPERTY", "ORDER_PROPERTY", "ID_PATTERN",
                 }:
                     selected.append(node)
         exec(compile(ast.Module(body=selected, type_ignores=[]), str(ADDON), "exec"), namespace)
@@ -142,6 +152,74 @@ class SurfaceRefreshTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn(conflict.name, message)
         self.assertEqual(self.objects, before)
+
+    def legacy_group(self, collisions, surface_id, name):
+        group = self.api.create_empty(self.context, name, collisions, "surface")
+        group["vectorg_surface"] = surface_id
+        return group
+
+    def child(self, name, parent, matrix):
+        obj = self.objects.new(name, None)
+        obj.parent = parent
+        obj.matrix_world = Matrix(matrix)
+        return obj
+
+    def test_refresh_relabels_renamed_surface_groups_in_shared_and_layouts(self):
+        for collisions in self.collision_roots():
+            self.objects.remove(self.api.find_surface_group(collisions, "kerb"))
+        shared_curb = self.legacy_group(self.shared_collisions, "curb", "SHARED_COLLISIONS_curb")
+        shared_geometry = self.child("shared_kerb_mesh", shared_curb, (1, 2, 3))
+        layout_collisions = self.collision_roots()[1]
+        layout_wet_curb = self.legacy_group(layout_collisions, "wet_curb", "gp_COLLISIONS_wet_curb")
+        before = list(self.objects)
+
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertTrue(success)
+        self.assertIn("migrated 2 renamed surface group(s)", message)
+        self.assertTrue(all(obj in self.objects for obj in before))
+        self.assertEqual(shared_curb["vectorg_surface"], "kerb")
+        self.assertEqual(shared_curb.name, "SHARED_COLLISIONS_kerb")
+        self.assertIs(shared_geometry.parent, shared_curb)
+        self.assertEqual(layout_wet_curb["vectorg_surface"], "wet_kerb")
+        self.assertEqual(layout_wet_curb.name, "gp_COLLISIONS_wet_kerb")
+        for collisions in self.collision_roots():
+            groups = [child["vectorg_surface"] for child in collisions.children if child.get("vectorg_role") == "surface"]
+            self.assertEqual(sorted(groups), sorted(self.surface_ids))
+
+        after = list(self.objects)
+        self.assertEqual(self.api.refresh_track_structure(self.context), (
+            True, "Track surface groups and layout object names refreshed",
+        ))
+        self.assertEqual(self.objects, after)
+
+    def test_refresh_merges_renamed_surface_group_into_existing_group(self):
+        layout_collisions = self.collision_roots()[2]
+        kerb = self.api.find_surface_group(layout_collisions, "kerb")
+        existing = self.child("existing_kerb_mesh", kerb, (0, 0, 0))
+        legacy = self.legacy_group(layout_collisions, "curb", "sprint_COLLISIONS_curb")
+        moved = [self.child(f"legacy_kerb_mesh_{index}", legacy, (index, 5, 0)) for index in range(2)]
+
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertTrue(success)
+        self.assertIn("migrated 1 renamed surface group(s)", message)
+        self.assertNotIn(legacy, self.objects)
+        self.assertEqual(kerb.children, [existing, *moved])
+        self.assertEqual([obj.matrix_world for obj in moved], [(0, 5, 0), (1, 5, 0)])
+        self.assertEqual(kerb.name, "sprint_COLLISIONS_kerb")
+        self.assertEqual(self.api.renamed_surface_groups(layout_collisions), [])
+
+    def test_renamed_surface_name_conflict_fails_before_changing_structure(self):
+        kerb = self.api.find_surface_group(self.shared_collisions, "kerb")
+        kerb["vectorg_surface"] = "curb"
+        kerb.name = "SHARED_COLLISIONS_curb"
+        conflict = self.objects.new("SHARED_COLLISIONS_kerb", None)
+        before = list(self.objects)
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertFalse(success)
+        self.assertIn(conflict.name, message)
+        self.assertEqual(self.objects, before)
+        self.assertEqual(kerb["vectorg_surface"], "curb")
+        self.assertEqual(kerb.name, "SHARED_COLLISIONS_curb")
 
     def test_duplicate_layout_ids_fail_before_changing_structure(self):
         self.settings.layouts[1].layout_id = self.settings.layouts[0].layout_id
@@ -600,11 +678,74 @@ def blender_tests():
                     self.assertNotIn(line.parent.name, names)
             self.assertEqual([point.co.copy() for point in line.data.splines[0].bezier_points], curve_points)
 
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(BlenderIdealLineTests)
+    class BlenderSurfaceRefreshTests(unittest.TestCase):
+        def setUp(self):
+            bpy.ops.object.select_all(action="SELECT")
+            bpy.ops.object.delete(use_global=False)
+            bpy.ops.track_exporter.create_configuration()
+            bpy.ops.track_exporter.add_layout()
+            self.settings = bpy.context.scene.track_exporter
+            self.layout = self.settings.layouts[0]
+
+        def mesh(self, name, parent, matrix_world):
+            data = bpy.data.meshes.new(name)
+            data.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+            obj = bpy.data.objects.new(name, data)
+            bpy.context.scene.collection.objects.link(obj)
+            obj.parent = parent
+            obj.matrix_world = matrix_world
+            return obj
+
+        def surface_errors(self):
+            errors, _warnings = addon.validate_scene(self.settings, bpy.context)
+            return [error for error in errors if "surface group" in error]
+
+        def assertMatrixAlmostEqual(self, actual, expected):
+            for actual_row, expected_row in zip(actual, expected):
+                for actual_value, expected_value in zip(actual_row, expected_row):
+                    self.assertAlmostEqual(actual_value, expected_value, places=5)
+
+        def test_refresh_relabels_or_merges_renamed_surface_groups_keeping_world_transforms(self):
+            shared = addon.object_with_role(self.settings.shared_root_object, addon.ROLE_COLLISIONS)
+            shared_group = addon.find_surface_group(shared, "kerb")
+            shared_group[addon.SURFACE_PROPERTY] = "curb"
+            shared_group.name = "SHARED_COLLISIONS_curb"
+            shared_mesh = self.mesh("shared_kerb", shared_group, Matrix.Translation((3, 0, 0)))
+
+            collisions = addon.direct_child_with_role(self.layout.root_object, addon.ROLE_COLLISIONS)
+            kerb = addon.find_surface_group(collisions, "kerb")
+            legacy = addon.create_empty(bpy.context, f"{collisions.name}_curb", collisions, addon.ROLE_SURFACE)
+            legacy[addon.SURFACE_PROPERTY] = "curb"
+            legacy.matrix_world = Matrix.Translation((5, -2, 1)) @ Matrix.Rotation(0.7, 4, "Z")
+            bpy.context.view_layer.update()
+            layout_mesh = self.mesh("layout_kerb", legacy, Matrix.Translation((1, 2, 3)) @ Matrix.Rotation(0.3, 4, "X"))
+            bpy.context.view_layer.update()
+            shared_before = shared_mesh.matrix_world.copy()
+            layout_before = layout_mesh.matrix_world.copy()
+            legacy_name = legacy.name
+            self.assertTrue(any("'curb'" in error for error in self.surface_errors()))
+
+            self.assertEqual(bpy.ops.track_exporter.refresh_layout_names(), {"FINISHED"})
+            bpy.context.view_layer.update()
+
+            self.assertEqual(shared_group[addon.SURFACE_PROPERTY], "kerb")
+            self.assertEqual(shared_group.name, "SHARED_COLLISIONS_kerb")
+            self.assertEqual(shared_mesh.parent, shared_group)
+            self.assertMatrixAlmostEqual(shared_mesh.matrix_world, shared_before)
+            self.assertIsNone(bpy.data.objects.get(legacy_name))
+            self.assertEqual(layout_mesh.parent, kerb)
+            self.assertMatrixAlmostEqual(layout_mesh.matrix_world, layout_before)
+            self.assertEqual(self.surface_errors(), [])
+
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite([
+        loader.loadTestsFromTestCase(BlenderIdealLineTests),
+        loader.loadTestsFromTestCase(BlenderSurfaceRefreshTests),
+    ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     addon.unregister()
     if not result.wasSuccessful():
-        raise RuntimeError("Blender ideal-line integration tests failed")
+        raise RuntimeError("Blender integration tests failed")
 
 
 if __name__ == "__main__":

@@ -151,7 +151,11 @@ groups in Shared and every configured layout, then normalize every layout's
 generated object names. Refresh also assigns checkpoint order from their order
 in the `EVENTS` hierarchy. Existing geometry and surface groups are preserved;
 repeated refreshes do not create duplicates. Use either button after updating
-the add-on to add the new surface groups to an older track. Missing collision
+the add-on to add the new surface groups to an older track. Refresh also moves
+surface groups that carry a renamed surface ID (`curb` → `kerb`, `wet_curb` →
+`wet_kerb`) onto the current ID: the group is relabeled and renamed, or, when a
+group for the current ID already exists, its contents move into that group with
+their world transforms preserved and the old group is removed. Missing collision
 roots and naming conflicts must be corrected before refreshing.
 Changing its display **Name**
 only changes player-facing metadata.
@@ -161,8 +165,8 @@ point-to-point routes use separate `start` and `finish` events. Freeform routes
 may use an open or cyclic map curve and require no race events. At least one
 spawn point remains required for every route type.
 
-Collision roots contain `tarmac`, `concrete`, `curb`, `grass`, `gravel`,
-`dirt`, `mud`, `sand`, `snow`, `ice`, `wet_tarmac`, `wet_concrete`, `wet_curb`,
+Collision roots contain `tarmac`, `concrete`, `kerb`, `grass`, `gravel`,
+`dirt`, `mud`, `sand`, `snow`, `ice`, `wet_tarmac`, `wet_concrete`, `wet_kerb`,
 and `OBSTACLES` as direct children.
 
 The `wet_` groups work like every other surface group. Geometry placed there

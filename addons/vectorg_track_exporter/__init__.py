@@ -83,7 +83,7 @@ TEXTURE_SIZE_ITEMS = (
 SURFACE_IDS = (
     "tarmac",
     "concrete",
-    "curb",
+    "kerb",
     "grass",
     "gravel",
     "dirt",
@@ -93,8 +93,14 @@ SURFACE_IDS = (
     "ice",
     "wet_tarmac",
     "wet_concrete",
-    "wet_curb",
+    "wet_kerb",
 )
+# Surface IDs renamed after tracks were authored. Refresh moves groups that still
+# carry an old ID onto the current one.
+RENAMED_SURFACE_IDS = {
+    "curb": "kerb",
+    "wet_curb": "wet_kerb",
+}
 def scene_settings(context):
     return context.scene.track_exporter
 
@@ -650,6 +656,28 @@ def ensure_surface_group(context, collision_root, surface_id):
     return group
 
 
+def renamed_surface_groups(collision_root):
+    return [
+        child for child in collision_root.children
+        if child.get(ROLE_PROPERTY) == ROLE_SURFACE and child.get(SURFACE_PROPERTY) in RENAMED_SURFACE_IDS
+    ]
+
+
+def migrate_renamed_surface_group(group, name):
+    """Relabel a group with a renamed surface ID, or merge it into the current group."""
+    surface_id = RENAMED_SURFACE_IDS[group[SURFACE_PROPERTY]]
+    target = find_surface_group(group.parent, surface_id)
+    if not target:
+        group[SURFACE_PROPERTY] = surface_id
+        group.name = name
+        return
+    for child in list(group.children):
+        matrix_world = child.matrix_world.copy()
+        child.parent = target
+        child.matrix_world = matrix_world
+    bpy.data.objects.remove(group, do_unlink=True)
+
+
 def refresh_track_structure(context):
     settings = scene_settings(context)
     if len({layout.layout_id for layout in settings.layouts}) != len(settings.layouts):
@@ -657,7 +685,8 @@ def refresh_track_structure(context):
     scopes = [("Shared", settings.shared_root_object, None)]
     scopes.extend((layout.layout_id, layout.root_object, layout) for layout in settings.layouts)
     collision_roots = []
-    missing_names = set()
+    surface_migrations = []
+    reserved_names = set()
     seen_roots = set()
     for label, root, layout in scopes:
         collisions = direct_child_with_role(root, ROLE_COLLISIONS) if root else None
@@ -669,22 +698,38 @@ def refresh_track_structure(context):
         if layout and (not valid_id(layout.layout_id) or not sync_layout_node_names(layout, validate_only=True)):
             return False, f"{label}: invalid layout ID or generated object names already in use"
         prefix = f"{layout.layout_id}_COLLISIONS" if layout else collisions.name
+        migrated_surface_ids = set()
+        for group in renamed_surface_groups(collisions):
+            surface_id = RENAMED_SURFACE_IDS[group[SURFACE_PROPERTY]]
+            name = f"{prefix}_{surface_id}"
+            if not find_surface_group(collisions, surface_id) and surface_id not in migrated_surface_ids:
+                existing = bpy.data.objects.get(name)
+                if name in reserved_names or (existing and existing is not group):
+                    return False, f"Cannot rename surface group; name already in use: {name}"
+                reserved_names.add(name)
+            migrated_surface_ids.add(surface_id)
+            surface_migrations.append((group, name))
         for surface_id in SURFACE_IDS:
-            if find_surface_group(collisions, surface_id):
+            if find_surface_group(collisions, surface_id) or surface_id in migrated_surface_ids:
                 continue
             name = f"{prefix}_{surface_id}"
-            if name in missing_names or bpy.data.objects.get(name):
+            if name in reserved_names or bpy.data.objects.get(name):
                 return False, f"Cannot create surface group; name already in use: {name}"
-            missing_names.add(name)
+            reserved_names.add(name)
         collision_roots.append(collisions)
 
+    for group, name in surface_migrations:
+        migrate_renamed_surface_group(group, name)
     for collisions in collision_roots:
         for surface_id in SURFACE_IDS:
             ensure_surface_group(context, collisions, surface_id)
     for layout in settings.layouts:
         if not sync_layout_node_names(layout):
             return False, f"{layout.layout_id}: generated object names already in use"
-    return True, "Track surface groups and layout object names refreshed"
+    message = "Track surface groups and layout object names refreshed"
+    if surface_migrations:
+        message += f"; migrated {len(surface_migrations)} renamed surface group(s)"
+    return True, message
 
 
 def node_trees(root_tree):
@@ -3009,7 +3054,10 @@ class TRACK_EXPORTER_OT_move_layout(Operator):
 class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
     bl_idname = "track_exporter.refresh_layout_names"
     bl_label = "Refresh Track Structure"
-    bl_description = "Create missing surface groups in Shared and every layout, and refresh layout object names"
+    bl_description = (
+        "Create missing surface groups in Shared and every layout, move renamed surface groups "
+        "to their current IDs, and refresh layout object names"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
