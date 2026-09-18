@@ -69,6 +69,12 @@ ROUTE_MAX_SPACING = 5.0
 ROUTE_MAX_ANGLE_DEGREES = 5.0
 ROUTE_MAX_CURVE_ERROR = 0.05
 ROUTE_MAX_WIDTH_ERROR = 0.01
+CURVE_SAMPLE_SPACING = 1.0
+IDEAL_LINE_SURFACE_SPACING = 2.0
+IDEAL_LINE_FIT_TOLERANCE = 0.05
+CURVE_FIT_TOLERANCE = 0.10
+MAP_CURVE_FIT_WIDTH_TOLERANCE = 0.005
+MAP_CURVE_FIT_TILT_TOLERANCE = math.radians(0.25)
 ROUTE_ENDPOINT_MAX_DISTANCE = 10.0
 ROUTE_EPSILON = 1e-6
 MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
@@ -1679,22 +1685,9 @@ def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000, widths=N
     count = segments if closed else segments + 1
     if widths is not None and (len(widths) != len(points) or any(not math.isfinite(w) or w <= 0 for w in widths)):
         raise ValueError("Route widths must be positive and match the route points")
-    distances = [total * i / segments for i in range(count)]
-    if widths is not None:
-        # Retain width breakpoints so a short narrowing cannot disappear between
-        # the regular planning points. Constant-width stretches stay sparse.
-        distance = 0.0
-        for i in range(1, len(points) if closed else len(points) - 1):
-            distance += spans[i - 1]
-            before = (widths[i] - widths[i - 1]) / spans[i - 1]
-            after = (widths[(i + 1) % len(points)] - widths[i]) / spans[i]
-            if abs(before - after) > 1e-7:
-                distances.append(distance)
-        distances.sort()
-        distances = [distance for i, distance in enumerate(distances)
-                     if i == 0 or distance - distances[i - 1] > 1e-6]
-    if len(distances) > max_points:
+    if count > max_points:
         raise ValueError(f"Route needs more than {max_points} planning points")
+    distances = [total * i / segments for i in range(count)]
     result, result_tilts, result_widths = [], [], []
     segment, start = 0, 0.0
     for distance in distances:
@@ -1707,7 +1700,23 @@ def ideal_resample(points, tilts, closed, spacing=6.0, max_points=5000, widths=N
         result_tilts.append(tilts[segment] + (tilts[end] - tilts[segment]) * t)
         if widths is not None:
             result_widths.append(widths[segment] + (widths[end] - widths[segment]) * t)
-    return (result, result_tilts, result_widths) if widths is not None else (result, result_tilts)
+    if widths is None:
+        return result, result_tilts
+    # Keep planning points evenly spaced (uneven spacing stalls the optimizer);
+    # each one uses the narrowest route width within half a planning span on
+    # either side, so a short narrowing still limits the line.
+    point_s = [0.0]
+    for span in spans[:len(points) - 1]:
+        point_s.append(point_s[-1] + span)
+    half = total / segments * 0.5
+    for i, distance in enumerate(distances):
+        for j, s in enumerate(point_s):
+            gap = abs(s - distance)
+            if closed:
+                gap = min(gap, total - gap)
+            if gap <= half:
+                result_widths[i] = min(result_widths[i], widths[j])
+    return result, result_tilts, result_widths
 
 
 def ideal_curvature_energy_gradient(points, rights, closed):
@@ -1836,13 +1845,14 @@ def ideal_bezier_split(curve, t):
     return [level[0] for level in levels], [level[-1] for level in reversed(levels)]
 
 
-def ideal_fit_editable_curve(points, closed, tolerance=0.1):
+def ideal_fit_editable_curve(points, closed, tolerance=0.1, accept_span=None):
     """Fit fewer controls to the dense cubic line with a 3D error bound.
 
     Endpoint tangent directions stay fixed, including across the closed seam.
     Comparing corresponding Bezier control polygons bounds the error over the
     entire span, not just at sampled points. Failed fits split until the original
-    dense segment is reached, which is retained exactly.
+    dense segment is reached, which is retained exactly. Optional
+    accept_span(start, end) can reject spans for other per-point values.
     """
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("Curve fitting tolerance must be positive")
@@ -1910,7 +1920,8 @@ def ideal_fit_editable_curve(points, closed, tolerance=0.1):
     while pending:
         start, end = pending.pop()
         curve = dense[start] if end == start + 1 else fit(start, end)
-        if end == start + 1 or within_tolerance(curve, start, end):
+        if end == start + 1 or (within_tolerance(curve, start, end)
+                                and (accept_span is None or accept_span(start, end))):
             fitted.append((start, end, curve))
         else:
             middle = (start + end) // 2
@@ -2087,20 +2098,29 @@ def project_ideal_line_to_surface(samples, tree, distance):
         raise ValueError("Surface search distance must be positive")
     result = []
     for index, sample in enumerate(samples):
-        hits = []
-        for direction in (Vector((0, 0, 1)), Vector((0, 0, -1))):
-            hit, normal, _face, hit_distance = tree.ray_cast(sample["position"], direction, distance)
-            # Reject near-vertical faces. Collision face winding may be reversed,
-            # so orient normals upwards. Only designated surface meshes are used.
-            if hit is not None and abs(normal.z) >= 0.1:
-                if normal.z < 0:
-                    normal = -normal
-                hits.append((hit_distance, hit, normal))
-        if not hits:
+        hit = vertical_surface_hit(tree, sample["position"], distance)
+        if hit is None:
             raise ValueError(f"sample {index} has no road collision surface within {distance:g} m above or below it")
-        _distance, point, normal = min(hits, key=lambda hit: hit[0])
-        result.append({**sample, "position": point, "normal": normal.normalized()})
+        point, normal = hit
+        result.append({**sample, "position": point, "normal": normal})
     return result
+
+
+def vertical_surface_hit(tree, position, distance):
+    """Nearest surface straight above or below; returns (point, upward normal) or None."""
+    hits = []
+    for direction in (Vector((0, 0, 1)), Vector((0, 0, -1))):
+        hit, normal, _face, hit_distance = tree.ray_cast(position, direction, distance)
+        # Reject near-vertical faces. Collision face winding may be reversed,
+        # so orient normals upwards. Only designated surface meshes are used.
+        if hit is not None and abs(normal.z) >= 0.1:
+            if normal.z < 0:
+                normal = -normal
+            hits.append((hit_distance, hit, normal))
+    if not hits:
+        return None
+    _distance, point, normal = min(hits, key=lambda hit: hit[0])
+    return point, normal.normalized()
 
 
 def ideal_line_surface_tree(context, layout):
@@ -2151,16 +2171,36 @@ def generate_ideal_line(context, layout):
     # Leave a little room for cubic interpolation between control points.
     points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, [max(0.0, limit - 0.15) for limit in limits])
     tree = ideal_line_surface_tree(context, layout)
-    surface_points, normals, missed = [], [], 0
+    planned = []
     for point, frame in zip(points, frames):
-        point, normal, hit = snap_ideal_point(tree, Vector(point), frame["up"])
+        point, _normal, _hit = snap_ideal_point(tree, Vector(point), frame["up"])
+        planned.append(tuple(point))
+    # Resample the smooth line through the planning points and put each sample
+    # on the road so crests between planning points are followed.
+    handles = ideal_bezier_handles(planned, closed)
+    count = len(planned)
+    surface_points, normals, missed = [], [], 0
+    for i in range(count if closed else count - 1):
+        j = (i + 1) % count
+        segment = (planned[i], handles[i][1], handles[j][0], planned[j])
+        steps = max(1, math.ceil(ideal_length(ideal_sub(planned[j], planned[i])) / IDEAL_LINE_SURFACE_SPACING - 1e-9))
+        for k in range(steps):
+            t = k / steps
+            up = frames[i]["up"].lerp(frames[j]["up"], t).normalized()
+            point, normal, hit = snap_ideal_point(tree, Vector(ideal_bezier_value(segment, t)), up)
+            surface_points.append(point)
+            normals.append(normal)
+            missed += not hit
+    if not closed:
+        point, normal, hit = snap_ideal_point(tree, Vector(planned[-1]), frames[-1]["up"])
         surface_points.append(point)
         normals.append(normal)
         missed += not hit
     unbanked = [{"position": point, "tilt": 0.0} for point in surface_points]
     cumulative, total = route_distances(unbanked, closed)
     frames = route_frames(unbanked, closed, cumulative, total, Vector((0, 0, 1)))
-    indices, handles = ideal_fit_editable_curve(surface_points, closed)
+    indices, handles = ideal_fit_editable_curve([tuple(point) for point in surface_points], closed,
+                                                IDEAL_LINE_FIT_TOLERANCE)
     data = bpy.data.curves.new(f"{layout.layout_id}_ideal_line", "CURVE")
     data.dimensions = "3D"
     data.resolution_u = 12
@@ -2181,6 +2221,172 @@ def generate_ideal_line(context, layout):
     if missed:
         warnings.append(f"{missed} points could not be snapped to a road surface; inspect height before export")
     return data, warnings, converged
+
+
+def map_curve_densify(points, tilts, widths, closed, spacing):
+    """Linear route samples at most `spacing` apart, keeping every original point."""
+    count = len(points)
+    result, result_tilts, result_widths = [], [], []
+    for i in range(count if closed else count - 1):
+        j = (i + 1) % count
+        steps = max(1, math.ceil(ideal_length(ideal_sub(points[j], points[i])) / spacing - 1e-9))
+        for k in range(steps):
+            t = k / steps
+            result.append(tuple(a + (b - a) * t for a, b in zip(points[i], points[j])))
+            result_tilts.append(tilts[i] + (tilts[j] - tilts[i]) * t)
+            result_widths.append(widths[i] + (widths[j] - widths[i]) * t)
+    if not closed:
+        result.append(tuple(points[-1]))
+        result_tilts.append(tilts[-1])
+        result_widths.append(widths[-1])
+    return result, result_tilts, result_widths
+
+
+def map_curve_span_checker(points, closed, series):
+    """accept_span for ideal_fit_editable_curve: every (values, tolerance) pair must
+    stay within tolerance of linear interpolation by arc length across a span."""
+    count = len(points)
+    cumulative = [0.0]
+    for i in range(count if closed else count - 1):
+        cumulative.append(cumulative[-1] + ideal_length(ideal_sub(points[(i + 1) % count], points[i])))
+
+    def accept(start, end):
+        span = cumulative[end] - cumulative[start]
+        for values, tolerance in series:
+            first, last = values[start], values[end % count]
+            for index in range(start + 1, end):
+                t = (cumulative[index] - cumulative[start]) / span
+                if abs(values[index] - (first + (last - first) * t)) > tolerance:
+                    return False
+        return True
+    return accept
+
+
+def decimate_curve_object(context, obj, ratio):
+    """Run Blender's Decimate Curve on every point; kept points retain radius and tilt."""
+    if ratio >= 1.0:
+        return
+    view_layer = context.view_layer
+    previous_active = view_layer.objects.active
+    previous_selected = [other for other in view_layer.objects if other.select_get()]
+    for spline in obj.data.splines:
+        for bp in spline.bezier_points:
+            bp.select_control_point = bp.select_left_handle = bp.select_right_handle = True
+    view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        bpy.ops.curve.decimate(ratio=ratio)
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+        for other in view_layer.objects:
+            other.select_set(other in previous_selected)
+        view_layer.objects.active = previous_active
+
+
+def curve_road_gap(curve, tree, distance):
+    """Largest vertical gap to the road along the curve, sampled every metre; (gap, missed samples)."""
+    samples, closed = adaptive_route_samples(curve)
+    dense, _tilts, _widths = map_curve_densify(
+        [tuple(s["position"]) for s in samples], [0.0] * len(samples), [1.0] * len(samples),
+        closed, CURVE_SAMPLE_SPACING)
+    gap, missed = 0.0, 0
+    for point in dense:
+        hit = vertical_surface_hit(tree, Vector(point), distance)
+        if hit is None:
+            missed += 1
+        else:
+            gap = max(gap, abs(hit[0].z - point[2]))
+    return gap, missed
+
+
+def rebuild_map_curve_on_surface(context, layout):
+    """Map Curve fitted to 1 m road samples; returns new curve data and the reference samples."""
+    curve = layout.map_curve
+    samples, closed = checked_curve_samples(curve, layout.route_type, with_width=True)
+    depth = road_curve_depth(curve)
+    tree = ideal_line_surface_tree(context, layout)
+    if tree is None:
+        raise ValueError("Track has no static road collision meshes to snap onto")
+    points, tilts, widths = map_curve_densify(
+        [tuple(s["position"]) for s in samples], [s["tilt"] for s in samples],
+        [s["width"] for s in samples], closed, CURVE_SAMPLE_SPACING)
+    distance = layout.map_curve_snap_distance
+    snapped, missed, largest = [], [], 0.0
+    for point in points:
+        hit = vertical_surface_hit(tree, Vector(point), distance)
+        if hit is None:
+            missed.append(point)
+            continue
+        snapped.append(tuple(hit[0]))
+        largest = max(largest, abs(hit[0].z - point[2]))
+    if missed:
+        x, y, _z = missed[0]
+        raise ValueError(f"{len(missed)} Map Curve samples have no road surface within {distance:g} m above or below "
+                         f"(first near X {x:.1f}, Y {y:.1f}); raise Surface Search or move the curve closer to the road")
+    # Edit a copy so bevel, material and radius settings carry over while linked
+    # data on other objects stays untouched.
+    accept = map_curve_span_checker(snapped, closed, [(widths, MAP_CURVE_FIT_WIDTH_TOLERANCE),
+                                                      (tilts, MAP_CURVE_FIT_TILT_TOLERANCE)])
+    indices, handles = ideal_fit_editable_curve(snapped, closed, CURVE_FIT_TOLERANCE, accept)
+    old_spline = curve.data.splines[0]
+    data = curve.data.copy()
+    data.splines.clear()
+    spline = data.splines.new("BEZIER")
+    spline.bezier_points.add(len(indices) - 1)
+    spline.use_cyclic_u = closed
+    spline.resolution_u = old_spline.resolution_u
+    spline.use_smooth = old_spline.use_smooth
+    spline.material_index = old_spline.material_index
+    # Linear per-point width and tilt match what the fit checked.
+    spline.radius_interpolation = "LINEAR"
+    spline.tilt_interpolation = "LINEAR"
+    inverse = curve.matrix_world.inverted()
+    for bp, index, (left, right) in zip(spline.bezier_points, indices, handles):
+        bp.handle_left_type = bp.handle_right_type = "FREE"
+        bp.co = inverse @ Vector(snapped[index])
+        bp.handle_left = inverse @ Vector(left)
+        bp.handle_right = inverse @ Vector(right)
+        bp.tilt = tilts[index]
+        bp.radius = widths[index] / (2 * depth) if data.use_radius else 1.0
+    reference = {"points": snapped, "tilts": tilts, "widths": widths, "closed": closed,
+                 "largest": largest, "tree": tree, "distance": distance}
+    return data, reference
+
+
+def check_rebuilt_map_curve(layout, reference):
+    """Measure the rebuilt curve as the exporter samples it: road height gap, width and tilt error."""
+    samples, _closed = adaptive_route_samples(layout.map_curve, with_width=True)
+    ref_points = [Vector(p) for p in reference["points"]]
+    count = len(ref_points)
+    kd = KDTree(count)
+    for index, point in enumerate(ref_points):
+        kd.insert(point, index)
+    kd.balance()
+
+    def reference_values(position):
+        _co, nearest, _distance = kd.find(position)
+        best = None
+        for a in (nearest - 1, nearest):
+            if not reference["closed"] and not 0 <= a < count - 1:
+                continue
+            a %= count
+            b = (a + 1) % count
+            segment = ref_points[b] - ref_points[a]
+            t = max(0.0, min(1.0, (position - ref_points[a]).dot(segment) / max(segment.length_squared, 1e-12)))
+            gap = (ref_points[a] + segment * t - position).length
+            if best is None or gap < best[0]:
+                best = (gap, t, a, b)
+        _gap, t, a, b = best
+        return tuple(values[a] + (values[b] - values[a]) * t for values in (reference["widths"], reference["tilts"]))
+
+    width_error = tilt_error = 0.0
+    for sample in samples:
+        width, tilt = reference_values(Vector(sample["position"]))
+        width_error = max(width_error, abs(sample["width"] - width))
+        tilt_error = max(tilt_error, abs(sample["tilt"] - tilt))
+    height_error, missed = curve_road_gap(layout.map_curve, reference["tree"], reference["distance"])
+    return {"width": width_error, "tilt": tilt_error, "height": height_error, "missed": missed}
 
 
 def build_manifest(settings):
@@ -2884,6 +3090,14 @@ class TrackLayoutSettings(PropertyGroup):
         description="Distance from the line to each road edge, including half the reference car width and safety margin",
         default=1.5, min=0.0, max=100.0,
     )
+    map_curve_snap_distance: FloatProperty(
+        name="Surface Search (m)", description="Maximum world-Z distance above or below each Map Curve sample when rebuilding it on the road",
+        default=5.0, min=0.01, max=50.0,
+    )
+    map_curve_decimate: FloatProperty(
+        name="Decimate Ratio", description="Fraction of the 1 m road samples kept when rebuilding the Map Curve",
+        default=0.2, min=0.01, max=1.0,
+    )
     ideal_line_snap_distance: FloatProperty(
         name="Surface Search (m)", description="Maximum world-Z distance above or below each exported ideal-line sample",
         default=2.0, min=0.01, max=20.0,
@@ -3066,6 +3280,51 @@ class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
         self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_rebuild_map_curve(Operator):
+    bl_idname = "track_exporter.rebuild_map_curve"
+    bl_label = "Rebuild Map Curve on Road"
+    bl_description = ("Resample the Map Curve onto the road collision surface, keeping its width and banking; "
+                      "replaces its control points (Undo supported)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        layout = active_layout(scene_settings(context))
+        return context.mode == "OBJECT" and layout is not None and layout.root_object is not None and layout.map_curve is not None
+
+    def execute(self, context):
+        layout = active_layout(scene_settings(context))
+        if not self.poll(context):
+            self.report({"ERROR"}, "Select a layout with a Map Curve in Object Mode")
+            return {"CANCELLED"}
+        curve = layout.map_curve
+        if curve.library:
+            self.report({"ERROR"}, "Map Curve must be a local object")
+            return {"CANCELLED"}
+        try:
+            data, reference = rebuild_map_curve_on_surface(context, layout)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, f"Map Curve {error}" if not str(error)[:1].isupper() else str(error))
+            return {"CANCELLED"}
+        curve.data = data
+        decimate_curve_object(context, curve, layout.map_curve_decimate)
+        update_layout_length(layout)
+        check = check_rebuilt_map_curve(layout, reference)
+        if check["missed"]:
+            self.report({"WARNING"}, f"{check['missed']} rebuilt samples found no road surface; inspect the curve")
+        if check["height"] > 0.1:
+            self.report({"WARNING"}, f"Rebuilt curve is up to {check['height']:.2f} m off the road between points")
+        if check["width"] > ROUTE_MAX_WIDTH_ERROR:
+            self.report({"WARNING"}, f"Road width changed by up to {check['width'] * 100:.1f} cm")
+        if layout.ideal_line:
+            self.report({"WARNING"}, "Regenerate the Ideal Line to match the rebuilt Map Curve")
+        self.report({"INFO"}, (
+            f"Map Curve rebuilt with {len(data.splines[0].bezier_points)} points; largest height correction "
+            f"{reference['largest']:.2f} m, max road gap {check['height'] * 100:.1f} cm, "
+            f"max width change {check['width'] * 100:.2f} cm"))
         return {"FINISHED"}
 
 
@@ -3904,12 +4163,15 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             draw_split_prop(length_row, current, "length")
             draw_split_prop(box, current, "root_object")
             draw_split_prop(box, current, "map_curve")
+            draw_split_prop(box, current, "map_curve_snap_distance")
+            draw_split_prop(box, current, "map_curve_decimate")
+            box.operator("track_exporter.rebuild_map_curve", icon="SNAP_FACE")
             box.separator()
             box.label(text="Ideal Line")
             box.label(text="Road width comes from Map Curve thickness")
+            draw_split_prop(box, current, "ideal_line")
             draw_split_prop(box, current, "ideal_line_edge_clearance")
             draw_split_prop(box, current, "ideal_line_snap_distance")
-            draw_split_prop(box, current, "ideal_line")
             box.operator("track_exporter.generate_ideal_line", icon="CURVE_BEZCURVE",
                          text="Regenerate Ideal Line" if current.ideal_line else "Generate Ideal Line")
             if current.ideal_line:
@@ -3968,6 +4230,7 @@ classes = (
     TRACK_EXPORTER_OT_remove_layout,
     TRACK_EXPORTER_OT_move_layout,
     TRACK_EXPORTER_OT_refresh_layout_names,
+    TRACK_EXPORTER_OT_rebuild_map_curve,
     TRACK_EXPORTER_OT_generate_ideal_line,
     TRACK_EXPORTER_OT_add_static_box_collider,
     TRACK_EXPORTER_OT_add_dynamic_box_collider,

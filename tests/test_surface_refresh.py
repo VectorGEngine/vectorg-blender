@@ -243,7 +243,7 @@ class IdealLineGeometryTests(unittest.TestCase):
     def setUpClass(cls):
         tree = ast.parse(ADDON.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name.startswith("ideal_")]
+                     and node.name.startswith(("ideal_", "map_curve_"))]
         namespace = {"math": math}
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(ADDON), "exec"), namespace)
         cls.api = SimpleNamespace(**namespace)
@@ -331,14 +331,40 @@ class IdealLineGeometryTests(unittest.TestCase):
         self.assertEqual(widths, [10, 7, 4, 6, 8])
         self.assertEqual(tilts, [0, 0.5, 1, 0.5, 0])
 
-    def test_short_narrowing_is_retained_between_regular_planning_points(self):
+    def test_map_curve_densify_keeps_original_points_and_spacing(self):
+        points, tilts, widths = self.api.map_curve_densify(
+            [(0, 0, 0), (2.5, 0, 0), (3, 0, 0)], [0, 1, 1], [10, 6, 6], False, 1.0)
+        for actual, expected in zip([p[0] for p in points], [0, 2.5 / 3, 5 / 3, 2.5, 3], strict=True):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(widths[3], 6)
+        self.assertAlmostEqual(tilts[1], 1 / 3)
+        closed, _tilts, _widths = self.api.map_curve_densify(
+            [(0, 0, 0), (2, 0, 0), (0, 2, 0)], [0] * 3, [1] * 3, True, 1.0)
+        self.assertEqual(len(closed), 2 + 3 + 2)
+        self.assertEqual(closed[0], (0, 0, 0))
+
+    def test_map_curve_span_checker_rejects_nonlinear_values(self):
+        points = [(i, 0, 0) for i in range(5)]
+        linear = self.api.map_curve_span_checker(points, False, [([0, 1, 2, 3, 4], 0.01)])
+        self.assertTrue(linear(0, 4))
+        peak = self.api.map_curve_span_checker(points, False, [([0, 1, 2, 1, 0], 0.01)])
+        self.assertFalse(peak(0, 4))
+        self.assertTrue(peak(0, 2))
+
+    def test_fit_accept_span_forces_extra_controls(self):
+        points = [(i * 2.0, 0.0, 0.0) for i in range(11)]
+        plain, _handles = self.api.ideal_fit_editable_curve(points, False, 0.05)
+        split, _handles = self.api.ideal_fit_editable_curve(
+            points, False, 0.05, lambda start, end: not start < 5 < end)
+        self.assertEqual(plain, [0, 10])
+        self.assertIn(5, split)
+
+    def test_short_narrowing_limits_nearby_evenly_spaced_planning_points(self):
         points, _tilts, widths = self.api.ideal_resample(
             [(0, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0), (12, 0, 0)],
             [0] * 5, False, 6, widths=[10, 10, 4, 10, 10])
-        by_position = {point[0]: width for point, width in zip(points, widths)}
-        self.assertEqual(by_position[3], 4)
-        self.assertEqual(by_position[2], 10)
-        self.assertEqual(by_position[4], 10)
+        self.assertEqual([p[0] for p in points], [0, 6, 12])
+        self.assertEqual(widths, [4, 4, 10])
 
     def assert_fitted_shape(self, points, closed, indices, handles):
         dense_handles = self.api.ideal_bezier_handles(points, closed)
