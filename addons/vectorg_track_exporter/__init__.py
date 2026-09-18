@@ -72,6 +72,7 @@ ROUTE_MAX_WIDTH_ERROR = 0.01
 CURVE_SAMPLE_SPACING = 1.0
 IDEAL_LINE_SURFACE_SPACING = 2.0
 IDEAL_LINE_FIT_TOLERANCE = 0.05
+IDEAL_LINE_MAX_LENGTH_WEIGHT = 0.01
 CURVE_FIT_TOLERANCE = 0.10
 MAP_CURVE_FIT_WIDTH_TOLERANCE = 0.005
 MAP_CURVE_FIT_TILT_TOLERANCE = math.radians(0.25)
@@ -1745,12 +1746,54 @@ def ideal_curvature_energy_gradient(points, rights, closed):
     return energy, gradient
 
 
-def ideal_optimize_offsets(centers, rights, closed, limits, max_iterations=400):
+def ideal_length_energy_gradient(points, rights, closed):
+    """Total path length, with its gradient along each lateral direction."""
+    count = len(points)
+    gradient = [0.0] * count
+    energy = 0.0
+    for i in range(count if closed else count - 1):
+        following = (i + 1) % count
+        step = ideal_sub(points[following], points[i])
+        length = ideal_length(step)
+        if length <= 1e-6:
+            return math.inf, gradient
+        unit = tuple(v / length for v in step)
+        energy += length
+        gradient[i] -= ideal_dot(unit, rights[i])
+        gradient[following] += ideal_dot(unit, rights[following])
+    return energy, gradient
+
+
+def ideal_line_energy(shortest_weight):
+    """Curvature energy plus a path-length penalty (Braghin et al. 2008 compromise).
+
+    Weight 0 returns None, meaning the pure minimum-curvature energy. Higher
+    weights trade some smoothness for a shorter path, which pulls the line to the
+    inside apex: pure minimum curvature keeps 180-degree hairpins on the outside.
+    """
+    if not math.isfinite(shortest_weight) or not 0.0 <= shortest_weight <= 1.0:
+        raise ValueError("Shortest vs Smooth must be between 0 and 1")
+    if shortest_weight == 0.0:
+        return None
+    # Curvature energy is in 1/m and length in m, so the scale is 1/m^2.
+    scale = shortest_weight * IDEAL_LINE_MAX_LENGTH_WEIGHT
+
+    def energy_gradient(points, rights, closed):
+        curvature, curvature_gradient = ideal_curvature_energy_gradient(points, rights, closed)
+        length, length_gradient = ideal_length_energy_gradient(points, rights, closed)
+        return (curvature + scale * length,
+                [a + scale * b for a, b in zip(curvature_gradient, length_gradient)])
+    return energy_gradient
+
+
+def ideal_optimize_offsets(centers, rights, closed, limits, max_iterations=400, energy_gradient=None):
     """Projected L-BFGS with bounded line search and pinned open endpoints.
 
+    Minimizes curvature energy unless another energy_gradient is given.
     Returns (positions, offsets, converged). A bounded, improved result may be
     returned with converged=False, which callers must report to the artist.
     """
+    energy_gradient = energy_gradient or ideal_curvature_energy_gradient
     if len(limits) != len(centers) or any(not math.isfinite(limit) or limit < 0 for limit in limits):
         raise ValueError("Edge clearance must leave space inside the road width")
     if len(centers) != len(rights) or len(centers) < (3 if closed else 2):
@@ -1767,7 +1810,7 @@ def ideal_optimize_offsets(centers, rights, closed, limits, max_iterations=400):
                 for center, right, offset in zip(centers, rights, offsets)]
 
     x = [0.0] * count
-    cost, gradient = ideal_curvature_energy_gradient(centers, rights, closed)
+    cost, gradient = energy_gradient(centers, rights, closed)
     history = []
     spacing = sum(ideal_length(ideal_sub(centers[i], centers[i - 1])) for i in range(1, count)) / (count - 1)
     initial_scale = max(1.0, spacing ** 3 / 16.0)
@@ -1800,7 +1843,7 @@ def ideal_optimize_offsets(centers, rights, closed, limits, max_iterations=400):
             candidate = [max(-bound, min(bound, value + step * delta))
                          for value, delta, bound in zip(x, direction, bounds)]
             change = ideal_sub(candidate, x)
-            next_cost, next_gradient = ideal_curvature_energy_gradient(positions(candidate), rights, closed)
+            next_cost, next_gradient = energy_gradient(positions(candidate), rights, closed)
             if ideal_dot(gradient, change) < 0 and next_cost <= cost + 1e-4 * ideal_dot(gradient, change):
                 break
             step *= 0.5
@@ -2169,7 +2212,8 @@ def generate_ideal_line(context, layout):
     frames = route_frames(planning, closed, cumulative, total, reference_up)
     rights = [tuple(frame["up"].cross(frame["forward"]).normalized()) for frame in frames]
     # Leave a little room for cubic interpolation between control points.
-    points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, [max(0.0, limit - 0.15) for limit in limits])
+    points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, [max(0.0, limit - 0.15) for limit in limits],
+                                                         energy_gradient=ideal_line_energy(layout.ideal_line_shortest_weight))
     tree = ideal_line_surface_tree(context, layout)
     planned = []
     for point, frame in zip(points, frames):
@@ -3085,6 +3129,12 @@ class TrackLayoutSettings(PropertyGroup):
         poll=curve_object_poll,
         update=update_map_curve,
     )
+    ideal_line_shortest_weight: FloatProperty(
+        name="Shortest vs Smooth",
+        description="0 = smoothest line (least curvature); higher values blend in the shortest path, "
+                    "pulling the line to the inside apex of tight corners and hairpins",
+        default=0.0, min=0.0, max=1.0,
+    )
     ideal_line_edge_clearance: FloatProperty(
         name="Edge Clearance (m)",
         description="Distance from the line to each road edge, including half the reference car width and safety margin",
@@ -3374,7 +3424,8 @@ class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
         curve.show_in_front = True
         curve["vectorg_ideal_line_generation"] = json.dumps({
             "version": 2, "method": "minimum_curvature",
-            "edgeClearance": layout.ideal_line_edge_clearance, "converged": converged,
+            "edgeClearance": layout.ideal_line_edge_clearance,
+            "shortestWeight": layout.ideal_line_shortest_weight, "converged": converged,
         })
         layout.ideal_line = curve
         update_ideal_line(layout, context)
@@ -4171,6 +4222,7 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             box.label(text="Road width comes from Map Curve thickness")
             draw_split_prop(box, current, "ideal_line")
             draw_split_prop(box, current, "ideal_line_edge_clearance")
+            draw_split_prop(box, current, "ideal_line_shortest_weight")
             draw_split_prop(box, current, "ideal_line_snap_distance")
             box.operator("track_exporter.generate_ideal_line", icon="CURVE_BEZCURVE",
                          text="Regenerate Ideal Line" if current.ideal_line else "Generate Ideal Line")

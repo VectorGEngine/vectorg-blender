@@ -242,8 +242,10 @@ class IdealLineGeometryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tree = ast.parse(ADDON.read_text(encoding="utf-8"))
-        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name.startswith(("ideal_", "map_curve_"))]
+        functions = [node for node in tree.body if (isinstance(node, ast.FunctionDef)
+                     and node.name.startswith(("ideal_", "map_curve_"))) or (
+                         isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                         and node.targets[0].id.startswith("IDEAL_LINE_"))]
         namespace = {"math": math}
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(ADDON), "exec"), namespace)
         cls.api = SimpleNamespace(**namespace)
@@ -358,6 +360,51 @@ class IdealLineGeometryTests(unittest.TestCase):
             points, False, 0.05, lambda start, end: not start < 5 < end)
         self.assertEqual(plain, [0, 10])
         self.assertIn(5, split)
+
+    @staticmethod
+    def hairpin(radius=15.0, spacing=6.0, straight=150.0):
+        """Open left 180-degree hairpin between two straights; rights point to the driver's right."""
+        points = [(i * spacing, 0.0, 0.0) for i in range(int(straight / spacing) + 1)]
+        arc = math.pi * radius
+        for k in range(1, int(arc / spacing) + 1):
+            angle = k * spacing / radius
+            if angle < math.pi:
+                points.append((straight + radius * math.sin(angle), radius - radius * math.cos(angle), 0.0))
+        points += [(straight - i * spacing, 2 * radius, 0.0) for i in range(1, int(straight / spacing) + 1)]
+        rights = []
+        for i in range(len(points)):
+            a, b = points[max(i - 1, 0)], points[min(i + 1, len(points) - 1)]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length = math.hypot(dx, dy)
+            rights.append((dy / length, -dx / length, 0.0))
+        apex = max(range(len(points)), key=lambda i: points[i][0])
+        return points, rights, apex
+
+    def test_length_gradient_matches_finite_difference(self):
+        points, rights, _apex = self.hairpin()
+        energy, gradient = self.api.ideal_length_energy_gradient(points, rights, False)
+        for index in (5, 30, 40):
+            moved = list(points)
+            moved[index] = tuple(p + r * 1e-6 for p, r in zip(points[index], rights[index]))
+            changed, _gradient = self.api.ideal_length_energy_gradient(moved, rights, False)
+            self.assertAlmostEqual((changed - energy) / 1e-6, gradient[index], places=4)
+
+    def test_zero_shortest_weight_is_pure_minimum_curvature(self):
+        self.assertIsNone(self.api.ideal_line_energy(0.0))
+        with self.assertRaises(ValueError):
+            self.api.ideal_line_energy(1.5)
+
+    def test_shortest_weight_moves_hairpin_apex_inside(self):
+        points, rights, apex = self.hairpin()
+        limits = [2.4] * len(points)
+        _p, smooth, _c = self.api.ideal_optimize_offsets(points, rights, False, limits, 3000)
+        _p, racing, _c = self.api.ideal_optimize_offsets(
+            points, rights, False, limits, 3000, self.api.ideal_line_energy(0.2))
+        # Left hairpin: inside is the driver's left, a negative right offset.
+        self.assertGreater(smooth[apex], 2.0)
+        self.assertLess(racing[apex], -2.0)
+        self.assertGreater(racing[apex - 20], 1.0)
+        self.assertGreater(racing[apex + 20], 1.0)
 
     def test_short_narrowing_limits_nearby_evenly_spaced_planning_points(self):
         points, _tilts, widths = self.api.ideal_resample(
