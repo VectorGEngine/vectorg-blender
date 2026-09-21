@@ -104,6 +104,8 @@ SOUND_SLOTS = {
     "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "volume": 0.6},
     "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "volume": 0.4},
     "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "volume": 0.6},
+    "backfire": {"label": "Backfire", "default": "", "rpm": 0, "volume": 5.0},
+    "traction_control": {"label": "Traction Control", "default": "", "rpm": 4000, "volume": 3.0},
     "engine_start": {"label": "Engine Start", "default": "", "rpm": 0, "volume": 0.8},
     "gear_grinding": {"label": "Gear Grinding", "default": "", "rpm": 0, "volume": 0.8},
     "brake_squeal": {"label": "Brake Squeal", "default": "", "rpm": 0, "volume": 0.5},
@@ -2918,6 +2920,26 @@ class CarExporterSettings(PropertyGroup):
         description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
+    sound_backfire: PointerProperty(
+        name="Backfire",
+        description="Exhaust pop sound datablock: a weak pop within its first 0.24 s followed by a strong pop. Plays on high-rev throttle lifts, loaded upshifts and the rev limiter",
+        type=bpy.types.Sound,
+    )
+    sound_backfire_enabled: BoolProperty(
+        name="Backfire Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_traction_control: PointerProperty(
+        name="Traction Control",
+        description="Engine stutter loop played while traction control cuts power; its pitch and speed follow engine RPM",
+        type=bpy.types.Sound,
+    )
+    sound_traction_control_enabled: BoolProperty(
+        name="Traction Control Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
     sound_engine_start: PointerProperty(
         name="Engine Start",
         description="Starter sound datablock played while the engine is starting",
@@ -3048,6 +3070,20 @@ class CarExporterSettings(PropertyGroup):
         default=0.6,
         min=0.0,
         soft_max=1.0,
+    )
+    sound_backfire_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the backfire sound",
+        default=5.0,
+        min=0.0,
+        soft_max=10.0,
+    )
+    sound_traction_control_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the traction-control sound",
+        default=3.0,
+        min=0.0,
+        soft_max=10.0,
     )
 
 

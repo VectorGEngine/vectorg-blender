@@ -10,7 +10,7 @@ import unittest
 
 
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
-NEW_SLOTS = ("idle", "on_mid", "off_mid", "engine_start", "gear_grinding", "brake_squeal")
+NEW_SLOTS = ("idle", "on_mid", "off_mid", "backfire", "traction_control", "engine_start", "gear_grinding", "brake_squeal")
 SOUND_HELPERS = {
     "sound_sample_path", "sound_export_name", "validate_sound_sample",
     "export_sound_samples", "load_manifest_sound_samples",
@@ -142,7 +142,7 @@ class CarSoundTests(unittest.TestCase):
     def test_slot_order_and_sound_datablock_inputs(self):
         self.assertEqual(list(self.constants["SOUND_SLOTS"]), [
             "idle", "off_low", "off_mid", "off_high", "on_low", "on_mid", "on_high",
-            "tranny_off", "tranny_on", "limiter", "turbo",
+            "tranny_off", "tranny_on", "limiter", "turbo", "backfire", "traction_control",
             "engine_start", "gear_grinding", "brake_squeal",
         ])
         self.assertEqual({node.target.id for node in self.pointers},
