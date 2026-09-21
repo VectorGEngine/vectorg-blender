@@ -641,12 +641,43 @@ def default_collider_mass(obj):
     return round(max(1.0, volume * 150.0), 2)
 
 
+def default_collider_edge_radius(obj):
+    size = object_world_bounds_size(obj)
+    if not size:
+        return 0.0
+    smallest_half_extent = min(size.x, size.y, size.z) * 0.5
+    if smallest_half_extent <= 0.0:
+        return 0.0
+    return round(min(smallest_half_extent * 0.1, 0.06), 4)
+
+
 def update_collider_object(self, _context):
     if self.object_ref:
         self.mass = default_collider_mass(self.object_ref)
+        if self.collider_type == "roundCuboid":
+            self.edge_radius = default_collider_edge_radius(self.object_ref)
     else:
         self.collider_type = "trimesh"
         self.mass = 0.0
+        self.edge_radius = 0.0
+
+
+def collider_config(collider):
+    config = {
+        "obj": object_config_name(collider.object_ref),
+        "type": collider.collider_type,
+        "mass": collider.mass,
+    }
+    if collider.collider_type == "roundCuboid":
+        config["edgeRadius"] = collider.edge_radius
+    return config
+
+
+def update_collider_type(self, _context):
+    if self.collider_type != "roundCuboid":
+        self.edge_radius = 0.0
+    elif self.edge_radius <= 0.0:
+        self.edge_radius = default_collider_edge_radius(self.object_ref)
 
 
 def is_object_in_tree(root_obj, obj):
@@ -1730,6 +1761,15 @@ def validate_scene(settings):
             warnings.append(f"Collider object is used more than once: {collider_name}")
         collider_names.add(collider_name)
         validate_object_in_car_tree(errors, car_obj, f"Collider {index}", collider.object_ref)
+        if collider.collider_type == "roundCuboid":
+            size = object_world_bounds_size(collider.object_ref)
+            smallest_half_extent = min(size.x, size.y, size.z) * 0.5 if size else 0.0
+            if collider.edge_radius <= 0.0:
+                errors.append(f"Collider {index} edge radius must be greater than zero")
+            elif collider.edge_radius >= smallest_half_extent:
+                errors.append(
+                    f"Collider {index} edge radius must be smaller than "
+                    f"{smallest_half_extent:.3f} m, half of the object's smallest dimension")
 
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
@@ -2032,8 +2072,16 @@ class CarColliderSettings(PropertyGroup):
     collider_type: EnumProperty(
         name="Type",
         description="Collision shape generated from the selected object",
-        items=(("trimesh", "Trimesh", ""), ("box", "Box", "")),
+        items=(("trimesh", "Trimesh", ""), ("box", "Box", ""), ("roundCuboid", "Round Cuboid", "")),
         default="trimesh",
+        update=update_collider_type,
+    )
+    edge_radius: FloatProperty(
+        name="Edge Radius (m)",
+        description="Radius rounding every edge of a Round Cuboid, in metres. The box is shrunk by "
+                    "this radius, so the collider keeps the authored outer size",
+        default=0.0,
+        min=0.0,
     )
     mass: FloatProperty(
         name="Mass (kg)",
@@ -3508,14 +3556,7 @@ def build_manifest(settings):
     body = {
         "obj": object_config_name(settings.car_root_object),
         "centerOfMass": object_config_name(settings.center_of_mass_object),
-        "colliders": [
-            {
-                "obj": object_config_name(collider.object_ref),
-                "type": collider.collider_type,
-                "mass": collider.mass,
-            }
-            for collider in settings.colliders
-        ],
+        "colliders": [collider_config(collider) for collider in settings.colliders],
         "downForcePoints": [
             {
                 "name": downforce_point_display_name(point, index),
@@ -5334,6 +5375,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             set_object_pointer(collider, "object_ref", collider_data.get("obj", ""))
             collider.collider_type = collider_data.get("type", "trimesh")
             collider.mass = collider_data.get("mass", 0.0)
+            collider.edge_radius = collider_data.get("edgeRadius", 0.0)
 
         wheels = data.get("wheels") or {}
         settings.wheels.clear()
@@ -5516,6 +5558,8 @@ def draw_colliders(layout, settings):
         remove.index = index
         draw_split_prop(layout, collider, "object_ref", label="Object")
         draw_split_prop(layout, collider, "collider_type", label="Type")
+        if collider.collider_type == "roundCuboid":
+            draw_split_prop(layout, collider, "edge_radius", label="Edge Radius")
         draw_split_prop(layout, collider, "mass")
 
 
