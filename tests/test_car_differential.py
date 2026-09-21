@@ -29,7 +29,7 @@ class DifferentialTests(unittest.TestCase):
         defaults = {key: default for key, _prop, default in self.fields}
         self.assertEqual(defaults, {
             "frontAccelLock": 0, "frontDecelLock": 0,
-            "rearAccelLock": 0, "rearDecelLock": 0, "centerBalance": 0.5,
+            "rearAccelLock": 0, "rearDecelLock": 0, "centerBalance": 0.5, "centerLock": 0,
         })
         for bad in (None, [], {}, {"rearAccelLock": 0.5}, {**defaults, "typo": 0}):
             with self.assertRaises(ValueError):
@@ -50,7 +50,7 @@ class DifferentialTests(unittest.TestCase):
             and isinstance(node.iter, ast.Name) and node.iter.id == "DIFFERENTIAL_FIELDS"
             and "setattr(preset, prop, differential[key])" in ast.unparse(node)
         )
-        values = (0, 0.01, 0.37, 0.99, 1)
+        values = (0, 0.01, 0.37, 0.99, 1, 0.5)
         preset = SimpleNamespace(**{prop: value for (_, prop, _), value in zip(self.fields, values)})
         block = eval(compile(ast.Expression(exported), str(ADDON), "eval"), {
             **self.namespace, "preset": preset, "settings": SimpleNamespace(drive="awd"),
@@ -73,6 +73,7 @@ class DifferentialTests(unittest.TestCase):
                     self.assertEqual(block[active + mode], 0.37)
                     self.assertEqual(block[inactive + mode], 0.0)
                 self.assertEqual(block["centerBalance"], bias)
+                self.assertEqual(block["centerLock"], 0.0)
                 self.assertEqual(self.normalize({"differential": block}), block)
 
     def test_section_shows_only_driven_axle_controls(self):

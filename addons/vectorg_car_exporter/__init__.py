@@ -44,6 +44,7 @@ DIFFERENTIAL_FIELDS = (
     ("rearAccelLock", "rear_accel_lock", 0.0),
     ("rearDecelLock", "rear_decel_lock", 0.0),
     ("centerBalance", "center_balance", 0.5),
+    ("centerLock", "center_lock", 0.0),
 )
 
 
@@ -51,7 +52,7 @@ def preset_differential_config(preset_data):
     """Manifest presets must supply all differential settings explicitly."""
     value = preset_data.get("differential")
     if not isinstance(value, dict) or set(value) != {key for key, _prop, _default in DIFFERENTIAL_FIELDS}:
-        raise ValueError("Differential must contain exactly the five lock and balance settings")
+        raise ValueError("Differential must contain exactly the six lock and balance settings")
     for key, number in value.items():
         if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) or not 0 <= number <= 1:
             raise ValueError(f"Differential {key} must be a finite number between 0 and 1")
@@ -2205,7 +2206,7 @@ class CarWheelPresetSettings(PropertyGroup):
     )
     toe: FloatProperty(
         name="Toe (°)",
-        description="Wheel direction viewed from above; negative points the fronts inward and positive points them outward",
+        description="Wheel direction viewed from above; positive points the fronts inward and negative points them outward",
         default=-0.15,
     )
     suspension_offset: FloatProperty(
@@ -2365,6 +2366,14 @@ class CarPresetSettings(PropertyGroup):
         name="Center Balance",
         description="Front share of AWD drive torque; zero is all rear, one is all front",
         default=0.5,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+    )
+    center_lock: FloatProperty(
+        name="Center Lock",
+        description="AWD center lock: zero is open, one enforces equal front and rear mean wheel angular speed (a rigid shaft); the handbrake releases it",
+        default=0.0,
         min=0.0,
         max=1.0,
         subtype="FACTOR",
@@ -3298,9 +3307,9 @@ def wheel_preset_config(wheel):
 def build_differential_config(preset, drive):
     values = {key: getattr(preset, prop) for key, prop, _default in DIFFERENTIAL_FIELDS}
     if drive.lower() == "fwd":
-        values.update(rearAccelLock=0.0, rearDecelLock=0.0, centerBalance=1.0)
+        values.update(rearAccelLock=0.0, rearDecelLock=0.0, centerBalance=1.0, centerLock=0.0)
     elif drive.lower() == "rwd":
-        values.update(frontAccelLock=0.0, frontDecelLock=0.0, centerBalance=0.0)
+        values.update(frontAccelLock=0.0, frontDecelLock=0.0, centerBalance=0.0, centerLock=0.0)
     return values
 
 
@@ -5663,6 +5672,7 @@ def draw_differential(layout, settings):
             draw_split_prop(layout, preset, f"{axle}_decel_lock")
     if drive == "awd":
         draw_split_prop(layout, preset, "center_balance", label="Center Balance")
+        draw_split_prop(layout, preset, "center_lock", label="Center Lock")
 
 
 def draw_cameras(layout, settings):

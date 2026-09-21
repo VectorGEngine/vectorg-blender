@@ -75,7 +75,8 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
         "frontDecelLock": 0.0,
         "rearAccelLock": 0.0,
         "rearDecelLock": 0.0,
-        "centerBalance": 0.5
+        "centerBalance": 0.5,
+        "centerLock": 0.0
       },
       "gearing": {
         "finalDriveRatio": 5.0,
@@ -118,12 +119,16 @@ applies 20% of peak engine torque at maximum RPM with zero throttle, decreasing
 toward idle or as throttle increases.
 Each preset exports its final drive and individual ratios under `gearing`.
 The separate Differential section edits the selected car preset and exposes
-acceleration and deceleration locks on driven axles, plus front torque share for
-AWD. FWD exports zero rear locks and `centerBalance: 1` (all front); RWD exports
-zero front locks and `centerBalance: 0` (all rear). Values export under `differential` as
-numbers from 0 to 1. Zero lock is open; full lock enforces equal wheel angular
-speeds. Center balance controls torque distribution, not axle speed locking.
-Every manifest preset must contain all five valid fields. The game reads its
+acceleration and deceleration locks on driven axles, plus front torque share and
+center lock for AWD. FWD exports zero rear locks, `centerBalance: 1` (all front)
+and `centerLock: 0`; RWD exports zero front locks, `centerBalance: 0` (all rear)
+and `centerLock: 0`. Values export under `differential` as numbers from 0 to 1.
+Zero lock is open; full axle lock enforces equal wheel angular speeds, and full
+center lock enforces equal front and rear mean wheel angular speeds (a rigid
+shaft, as in Rally1/Rally2 cars). Center balance sets the torque split while the
+center can slip; a fully locked center lets grip decide the split instead. The
+handbrake releases the center lock to disconnect the rear drive.
+Every manifest preset must contain all six valid fields. The game reads its
 factory differential settings from these per-car presets; it has no global
 fallback differential setup.
 The Torque Curve section exports `engine.torqueFactor`, which scales drive and
@@ -226,7 +231,8 @@ counter-rotated another 5° produce 10° suspension travel (when Mount → Joint
 follows Mount's axis), a 5° kingpin, and an upright tire. Zero preset alignment
 offsets preserve that authored pose. Caster rotates the entire wheel assembly
 around the tire center. Toe applies a neutral steering rotation about Joint,
-moving an offset tire center with it. Camber adjusts Spin at the tire center.
+moving an offset tire center with it; positive toe points both wheel fronts
+inward and negative toe points them outward. Camber adjusts Spin at the tire center.
 The game measures the resulting neutral wheel toe/camber relative to the authored
 alignment; steering can subsequently change camber around the inclined kingpin.
 
