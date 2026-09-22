@@ -2174,12 +2174,22 @@ class CarWheelSettings(PropertyGroup):
         default=0.0,
         min=0.0,
     )
+    section_height: FloatProperty(
+        name="Section Height (m)",
+        description=(
+            "Sidewall height from the rim to the tread surface. Only this much of "
+            "the wheel is rubber, so it is the depth the tire deforms over where it "
+            "meets the road; the rim inside it stays rigid"
+        ),
+        default=0.10,
+        min=0.005,
+    )
     # Retained as hidden migration sources for blend files saved with preset schema 3.
     suspension_stiffness: FloatProperty(default=80.0, options={"HIDDEN"})
     damping_relaxation: FloatProperty(default=2.6, options={"HIDDEN"})
     damping_compression: FloatProperty(default=2.0, options={"HIDDEN"})
     max_brake_force: FloatProperty(default=1000.0, min=0.0, options={"HIDDEN"})
-    pressure: FloatProperty(default=2.0, min=1.3, max=2.7, options={"HIDDEN"})
+    pressure: FloatProperty(default=2.0, min=1.0, max=3.8, options={"HIDDEN"})
     camber: FloatProperty(default=-4.0, options={"HIDDEN"})
     toe: FloatProperty(default=-0.15, options={"HIDDEN"})
     grip_factor: FloatProperty(
@@ -3324,6 +3334,7 @@ def wheel_config(wheel):
             "spinLocalAxis": BLENDER_AXIS_TO_GAME[wheel.spin_local_axis],
             "radius": wheel.radius,
             "width": wheel.width,
+            "sectionHeight": wheel.section_height,
         },
     }
 
@@ -4334,6 +4345,7 @@ def add_wheel_from_config(settings, group, key, data=None):
     wheel.damping_compression = mount.get("dampingCompression", wheel.damping_compression)
     wheel.radius = spin_data.get("radius", wheel.radius)
     wheel.width = spin_data.get("width", 0.0)
+    wheel.section_height = spin_data.get("sectionHeight", wheel.section_height)
     wheel.max_brake_force = spin_data.get("maxBrakeForce", wheel.max_brake_force)
     wheel.pressure = spin_data.get("pressure", wheel.pressure)
     wheel.camber = spin_data.get("camber", wheel.camber)
@@ -4361,6 +4373,7 @@ def ensure_default_wheels(settings):
             "damping_compression": wheel.damping_compression,
             "radius": wheel.radius,
             "width": wheel.width,
+            "section_height": wheel.section_height,
             "max_brake_force": wheel.max_brake_force,
             "pressure": wheel.pressure,
             "camber": wheel.camber,
@@ -4387,6 +4400,7 @@ def ensure_default_wheels(settings):
             wheel.damping_compression = imported["damping_compression"]
             wheel.radius = imported["radius"]
             wheel.width = imported["width"]
+            wheel.section_height = imported.get("section_height", wheel.section_height)
             wheel.max_brake_force = imported["max_brake_force"]
             wheel.pressure = imported["pressure"]
             wheel.camber = imported["camber"]
@@ -4408,6 +4422,7 @@ def ensure_default_wheels(settings):
                 "spinLocalAxis": [1, 0, 0],
                 "radius": 0.3,
                 "width": 0.0,
+                "sectionHeight": 0.10,
                 "maxBrakeForce": 1000,
                 "pressure": 2.0,
                 "camber": -4.0 if front_wheel else -3.0,
@@ -5266,7 +5281,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 if wheel_data.get("tireType") not in TIRE_TYPES:
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} tireType is invalid")
                     return {"CANCELLED"}
-                if not 1.3 <= wheel_data["pressure"] <= 2.7:
+                if not 1.0 <= wheel_data["pressure"] <= 3.8:
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} pressure is invalid")
                     return {"CANCELLED"}
                 caster = wheel_data.get("caster", 0.0)
@@ -5580,6 +5595,7 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "spin_local_axis")
         draw_split_prop(layout, wheel, "radius")
         draw_split_prop(layout, wheel, "width")
+        draw_split_prop(layout, wheel, "section_height")
 
 
 def draw_armature(layout, settings):
