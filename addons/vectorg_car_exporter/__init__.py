@@ -114,6 +114,9 @@ SOUND_SLOTS = {
 SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low"}
 
 ORIENTATION_DOT_THRESHOLD = math.cos(math.radians(1.0))
+# Minimum suspension-length change per metre of wheel travel along a pivot arm.
+# The game engine rejects arms below this, where the spring cannot move the wheel.
+MIN_SUSPENSION_ARM_MOTION_RATIO = 0.1
 STEERING_WHEEL_DOT_THRESHOLD = math.cos(math.radians(45.0))
 TORQUE_CURVE_NODE_GROUP = "_CarExporterTorqueCurve"
 TORQUE_CURVE_NODE = "Torque Curve"
@@ -1052,6 +1055,20 @@ def apply_car_hierarchy_scales(context, root_obj):
         raise RuntimeError("Scale was not applied to car hierarchy objects: " + ", ".join(unscaled))
 
 
+def suspension_arm_motion_ratio(mount_distance, arm_length, length):
+    """Spring-length change per metre of joint travel on an arm, or None when unreachable.
+
+    Mirrors the game engine: with the pivot-to-mount distance `a` and arm length `r`,
+    the spring length `L` fixes the arm angle through L^2 = a^2 + r^2 - 2ar cos(phi).
+    """
+    if length <= 0:
+        return None
+    cosine = (mount_distance ** 2 + arm_length ** 2 - length ** 2) / (2 * mount_distance * arm_length)
+    if not -1.0 < cosine < 1.0:
+        return None
+    return mount_distance * math.sqrt(1.0 - cosine * cosine) / length
+
+
 def validate_object_in_car_tree(errors, car_obj, label, obj):
     if not car_obj:
         return
@@ -1778,6 +1795,7 @@ def validate_scene(settings):
 
     wheel_positions = {}
     wheel_rest_lengths = {}
+    wheel_arms = {}
     for index, wheel in enumerate(settings.wheels, start=1):
         if not math.isfinite(wheel.width) or wheel.width <= 0:
             errors.append(f"Wheel {index} width must be set to a positive number in metres")
@@ -1797,6 +1815,20 @@ def validate_scene(settings):
             errors.append(f"Wheel {index} joint must be inside mount hierarchy")
         if joint_obj and wheel_obj and not is_object_in_tree(joint_obj, wheel_obj):
             errors.append(f"Wheel {index} spin must be inside joint hierarchy")
+        pivot_obj = wheel.pivot_ref
+        if pivot_obj:
+            validate_object_in_car_tree(errors, car_obj, f"Wheel {index} arm pivot", pivot_obj)
+            if joint_obj and is_object_in_tree(joint_obj, pivot_obj):
+                errors.append(f"Wheel {index} arm pivot must be fixed to the chassis, outside the joint hierarchy")
+            if mount_obj and joint_obj:
+                pivot = pivot_obj.matrix_world.translation
+                to_mount = mount_obj.matrix_world.translation - pivot
+                to_joint = joint_obj.matrix_world.translation - pivot
+                sine = to_mount.cross(to_joint).length
+                if sine <= 1e-6 * to_mount.length * to_joint.length or to_mount.length <= 1e-6:
+                    errors.append(f"Wheel {index} arm pivot must not lie on the line through Mount and Joint")
+                else:
+                    wheel_arms[(wheel.group, wheel.key)] = (to_mount.length, to_joint.length)
         if wheel_obj:
             wheel_positions[(wheel.group, wheel.key)] = wheel_obj.matrix_world.translation.copy()
             up_axis_world = object_axis(wheel_obj, BLENDER_AXIS_LOCAL[wheel.up_local_axis]).normalized()
@@ -1890,6 +1922,8 @@ def validate_scene(settings):
                 wheel.caster,
                 wheel.toe,
                 wheel.suspension_offset,
+                wheel.bump_travel,
+                wheel.droop_travel,
                 wheel.suspension_stiffness,
                 wheel.damping_relaxation,
                 wheel.damping_compression,
@@ -1906,14 +1940,36 @@ def validate_scene(settings):
                 wheel.max_brake_force,
             )):
                 errors.append(f"{label} {group} handling values must be non-negative")
-            if not 1.0 <= wheel.grip_factor <= 1.6:
-                errors.append(f"{label} {group} wheel grip factor must be between 1.0 and 1.6")
+            if not 0.5 <= wheel.grip_factor <= 2.0:
+                errors.append(f"{label} {group} wheel grip factor must be between 0.5 and 2.0")
+            if wheel.bump_travel <= 0 or wheel.droop_travel <= 0:
+                errors.append(f"{label} {group} bump and droop travel must be positive")
+            elif not -wheel.bump_travel <= wheel.suspension_offset <= wheel.droop_travel:
+                errors.append(
+                    f"{label} {group} suspension offset must stay between the bump stop and full droop"
+                )
             for key in ("l", "r"):
                 rest_length = wheel_rest_lengths.get((group, key))
-                if rest_length is not None and rest_length + wheel.suspension_offset <= 0:
+                if rest_length is None:
+                    continue
+                if rest_length + wheel.suspension_offset <= 0:
                     errors.append(
                         f"{label} {group} suspension offset collapses the {key.upper()} wheel rest length"
                     )
+                if rest_length - wheel.bump_travel <= 0:
+                    errors.append(
+                        f"{label} {group} bump travel reaches the {key.upper()} wheel mount"
+                    )
+                arm = wheel_arms.get((group, key))
+                if arm is not None:
+                    for length in (rest_length - wheel.bump_travel, rest_length + wheel.droop_travel):
+                        ratio = suspension_arm_motion_ratio(arm[0], arm[1], length)
+                        if ratio is None or ratio < MIN_SUSPENSION_ARM_MOTION_RATIO:
+                            errors.append(
+                                f"{label} {group} {key.upper()} wheel arm cannot follow its travel to "
+                                f"{length:.3f} m; move the pivot or reduce bump/droop travel"
+                            )
+                            break
 
     steering_obj = settings.steering_wheel_object
     if steering_obj:
@@ -2145,6 +2201,19 @@ class CarWheelSettings(PropertyGroup):
         description="Steering pivot and kingpin orientation; also receives the neutral toe rotation",
         type=bpy.types.Object,
     )
+    pivot_ref: PointerProperty(
+        name="Arm Pivot",
+        description=(
+            "Optional chassis point the suspension arm swings about. The Joint then travels on an arc "
+            "around it instead of straight along Mount to Joint"
+        ),
+        type=bpy.types.Object,
+    )
+    pivot_tilt: BoolProperty(
+        name="Tilt With Arm",
+        description="Rotate the Joint and wheel with the arm as it swings, changing camber or caster with travel",
+        default=False,
+    )
     wheel_ref: PointerProperty(
         name="Spin",
         description="Object that visually rotates with wheel speed",
@@ -2194,8 +2263,8 @@ class CarWheelSettings(PropertyGroup):
     toe: FloatProperty(default=-0.15, options={"HIDDEN"})
     grip_factor: FloatProperty(
         default=1.0,
-        min=1.0,
-        max=1.6,
+        min=0.5,
+        max=2.0,
         options={"HIDDEN"},
     )
 
@@ -2275,6 +2344,20 @@ class CarWheelPresetSettings(PropertyGroup):
         max=0.25,
         unit="LENGTH",
     )
+    bump_travel: FloatProperty(
+        name="Bump Travel (m)",
+        description="Compression from the modeled Joint position to the rigid bump stop; the wheel never moves closer to the mount",
+        default=0.1,
+        min=0.001,
+        unit="LENGTH",
+    )
+    droop_travel: FloatProperty(
+        name="Droop Travel (m)",
+        description="Extension from the modeled Joint position to full droop, where an airborne wheel hangs",
+        default=0.1,
+        min=0.001,
+        unit="LENGTH",
+    )
     suspension_stiffness: FloatProperty(
         name="Suspension Stiffness",
         description="Spring strength based on compression distance; higher values make the suspension firmer and reduce compression",
@@ -2305,8 +2388,8 @@ class CarWheelPresetSettings(PropertyGroup):
         name="Grip Factor",
         description="Multiplier for this wheel's pressure-derived grip",
         default=1.0,
-        min=1.0,
-        max=1.6,
+        min=0.5,
+        max=2.0,
     )
 
 
@@ -3320,7 +3403,7 @@ def initialize_configuration_settings(settings):
 
 
 def wheel_config(wheel):
-    return {
+    config = {
         "steering": bool(wheel.steering),
         "mount": {
             "obj": object_config_name(wheel.suspension_ref),
@@ -3337,6 +3420,12 @@ def wheel_config(wheel):
             "sectionHeight": wheel.section_height,
         },
     }
+    if wheel.pivot_ref:
+        config["pivot"] = {
+            "obj": object_config_name(wheel.pivot_ref),
+            "tilt": bool(wheel.pivot_tilt),
+        }
+    return config
 
 
 def build_wheels_config(settings):
@@ -3355,6 +3444,8 @@ def wheel_preset_config(wheel):
         "caster": wheel.caster,
         "toe": wheel.toe,
         "suspensionOffset": wheel.suspension_offset,
+        "bumpTravel": wheel.bump_travel,
+        "droopTravel": wheel.droop_travel,
         "suspensionStiffness": wheel.suspension_stiffness,
         "dampingRelaxation": wheel.damping_relaxation,
         "dampingCompression": wheel.damping_compression,
@@ -4337,6 +4428,9 @@ def add_wheel_from_config(settings, group, key, data=None):
     set_object_pointer(wheel, "suspension_ref", mount.get("obj", ""))
     set_object_pointer(wheel, "hub_ref", joint_data.get("obj", ""))
     set_object_pointer(wheel, "wheel_ref", spin_data.get("obj", ""))
+    pivot_data = data.get("pivot") or {}
+    set_object_pointer(wheel, "pivot_ref", pivot_data.get("obj", ""))
+    wheel.pivot_tilt = bool(pivot_data.get("tilt", False))
     wheel.up_local_axis = GAME_AXIS_TO_BLENDER.get(tuple(spin_data.get("upLocalAxis", [0, 1, 0])), "z")
     wheel.spin_local_axis = GAME_AXIS_TO_BLENDER.get(tuple(spin_data.get("spinLocalAxis", [1, 0, 0])), "x")
     # Populate legacy storage so schema migration can preserve version 2/3 blend data.
@@ -4366,6 +4460,8 @@ def ensure_default_wheels(settings):
             "suspension_ref": wheel.suspension_ref,
             "hub_ref": wheel.hub_ref,
             "wheel_ref": wheel.wheel_ref,
+            "pivot_ref": wheel.pivot_ref,
+            "pivot_tilt": wheel.pivot_tilt,
             "up_local_axis": wheel.up_local_axis,
             "spin_local_axis": wheel.spin_local_axis,
             "suspension_stiffness": wheel.suspension_stiffness,
@@ -4393,6 +4489,8 @@ def ensure_default_wheels(settings):
             wheel.suspension_ref = imported["suspension_ref"]
             wheel.hub_ref = imported["hub_ref"]
             wheel.wheel_ref = imported["wheel_ref"]
+            wheel.pivot_ref = imported["pivot_ref"]
+            wheel.pivot_tilt = imported["pivot_tilt"]
             wheel.up_local_axis = imported["up_local_axis"]
             wheel.spin_local_axis = imported["spin_local_axis"]
             wheel.suspension_stiffness = imported["suspension_stiffness"]
@@ -4441,6 +4539,8 @@ def default_wheel_preset_values(group):
         "caster": 6.0 if front_wheel else 0.0,
         "toe": -0.15 if front_wheel else 0.2,
         "suspension_offset": 0.0,
+        "bump_travel": 0.1,
+        "droop_travel": 0.1,
         "suspension_stiffness": 80.0,
         "damping_relaxation": 2.6,
         "damping_compression": 2.0,
@@ -4500,6 +4600,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "caster": wheel.caster,
             "toe": wheel.toe,
             "suspension_offset": wheel.suspension_offset,
+            "bump_travel": wheel.bump_travel,
+            "droop_travel": wheel.droop_travel,
             "suspension_stiffness": wheel.suspension_stiffness,
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
@@ -4516,6 +4618,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
             "caster": 0.0,
             "toe": wheel.toe,
             "suspension_offset": 0.0,
+            "bump_travel": 0.1,
+            "droop_travel": 0.1,
             "suspension_stiffness": wheel.suspension_stiffness,
             "damping_relaxation": wheel.damping_relaxation,
             "damping_compression": wheel.damping_compression,
@@ -4536,6 +4640,8 @@ def ensure_preset_wheels(preset, source_wheels=None):
         wheel.caster = values["caster"]
         wheel.toe = values["toe"]
         wheel.suspension_offset = values["suspension_offset"]
+        wheel.bump_travel = values["bump_travel"]
+        wheel.droop_travel = values["droop_travel"]
         wheel.suspension_stiffness = values["suspension_stiffness"]
         wheel.damping_relaxation = values["damping_relaxation"]
         wheel.damping_compression = values["damping_compression"]
@@ -4553,6 +4659,8 @@ def wheel_preset_values(source):
             "caster",
             "toe",
             "suspension_offset",
+            "bump_travel",
+            "droop_travel",
             "suspension_stiffness",
             "damping_relaxation",
             "damping_compression",
@@ -5298,8 +5406,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 if any(wheel_data[field] < 0 for field in non_negative_fields):
                     self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} handling values must be non-negative")
                     return {"CANCELLED"}
-                if not 1.0 <= wheel_data["gripFactor"] <= 1.6:
-                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be between 1.0 and 1.6")
+                if not 0.5 <= wheel_data["gripFactor"] <= 2.0:
+                    self.report({"ERROR"}, f"Manifest preset {preset_index} {group} {key.upper()} gripFactor must be between 0.5 and 2.0")
                     return {"CANCELLED"}
 
         try:
@@ -5439,6 +5547,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 wheel.caster = wheel_data.get("caster", 0.0)
                 wheel.toe = wheel_data.get("toe", -0.15 if group == "front" else 0.2)
                 wheel.suspension_offset = wheel_data.get("suspensionOffset", 0.0)
+                wheel.bump_travel = wheel_data.get("bumpTravel", 0.1)
+                wheel.droop_travel = wheel_data.get("droopTravel", 0.1)
                 wheel.suspension_stiffness = wheel_data.get("suspensionStiffness", 80.0)
                 wheel.damping_relaxation = wheel_data.get("dampingRelaxation", 2.6)
                 wheel.damping_compression = wheel_data.get("dampingCompression", 2.0)
@@ -5591,6 +5701,9 @@ def draw_wheels(layout, settings):
         draw_split_prop(layout, wheel, "suspension_ref")
         draw_split_prop(layout, wheel, "hub_ref")
         draw_split_prop(layout, wheel, "wheel_ref", label="Spin")
+        draw_split_prop(layout, wheel, "pivot_ref")
+        if wheel.pivot_ref:
+            draw_split_prop(layout, wheel, "pivot_tilt")
         draw_split_prop(layout, wheel, "up_local_axis")
         draw_split_prop(layout, wheel, "spin_local_axis")
         draw_split_prop(layout, wheel, "radius")
@@ -5706,6 +5819,8 @@ def draw_presets(layout, settings):
         draw_split_prop(axle_box, wheel, "caster")
         draw_split_prop(axle_box, wheel, "toe")
         draw_split_prop(axle_box, wheel, "suspension_offset")
+        draw_split_prop(axle_box, wheel, "bump_travel")
+        draw_split_prop(axle_box, wheel, "droop_travel")
         draw_split_prop(axle_box, wheel, "suspension_stiffness")
         draw_split_prop(axle_box, wheel, "damping_relaxation")
         draw_split_prop(axle_box, wheel, "damping_compression")

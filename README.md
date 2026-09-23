@@ -95,6 +95,8 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
             "caster": 6.0,
             "toe": -0.15,
             "suspensionOffset": 0.0,
+            "bumpTravel": 0.1,
+            "droopTravel": 0.1,
             "suspensionStiffness": 80.0,
             "dampingRelaxation": 2.6,
             "dampingCompression": 2.0,
@@ -195,11 +197,22 @@ runtime strength is `level / maxLevel`. New exporter configurations default
 every maximum level to 5. The current game uses the first preset. Tire type is
 `soft`, `medium`, `hard`, `wet`, or `snow`, with `medium` as the default.
 Wet tires specialize in wet roads; Snow tires represent studless winter tires
-for snow and ice. Grip tables are configured in the game. Suspension offset is
-a signed change in metres to the calculated suspension rest length. Positive
+for snow and ice. Grip tables are configured in the game.
+
+**Bump Travel** and **Droop Travel** are required, positive distances in metres
+measured from the modeled Joint position along the suspension length (the
+Mount → Joint distance). The wheel compresses by at most Bump Travel before a
+rigid bump stop and extends by at most Droop Travel to full droop, where an
+airborne wheel hangs. Both limits are fixed to the chassis. The game preloads
+each spring with its share of the car's weight, split by the center of mass,
+so the parked car sits at its rest position whatever the stiffness; stiffness
+only changes how firmly the suspension responds.
+
+Suspension offset is a signed change in metres to that rest position. Positive
 values move the wheel farther down from the mount; negative values move it
-toward the mount. The mount position and maximum suspension travel remain
-unchanged. Applying the same offset to every wheel raises or lowers the chassis.
+toward the mount. It must stay between `-bumpTravel` and `droopTravel`, so
+lowering the car uses up bump travel. Applying the same offset to every wheel
+raises or lowers the chassis.
 Each preset wheel's `gripFactor` multiplies its pressure-derived grip;
 `2.0` doubles grip and `0.5` halves it.
 
@@ -308,6 +321,28 @@ has an in-cockpit racing display.
 
 Use the hierarchy **Mount → Joint → Spin**. Additional parent nodes are supported.
 Use separate Joint and Spin objects to author the kingpin and wheel orientation independently.
+
+### Suspension arm pivot
+
+A wheel can optionally swing on a rigid arm, like a trailing arm or an off-road
+axle link, instead of sliding straight along Mount → Joint. Assign an
+**Arm Pivot** object fixed to the chassis, outside the Joint hierarchy. The Joint
+then travels on a circle around the pivot, rotating about the axis
+`cross(Mount − Pivot, Joint − Pivot)`; the pivot must not lie on the line through
+Mount and Joint. Suspension lengths, Bump Travel and Droop Travel remain
+Mount → Joint distances, so the spring still spans Mount to Joint while the arm
+keeps the Pivot → Joint distance.
+
+With **Tilt With Arm** enabled, the Joint and wheel rotate with the arm as it
+swings, so camber or caster changes with travel; otherwise the wheel only moves.
+The exporter rejects travel the arm cannot follow: every length between the bump
+stop and full droop must be reachable, with at least 0.1 m of spring length change
+per metre of wheel travel. Ghost wheels reuse the car's pivot, carried to the
+ghost Mount. The manifest records the pivot as:
+
+```json
+"pivot": { "obj": "Pivot_RL", "tilt": false }
+```
 
 ## Direction Rules
 
