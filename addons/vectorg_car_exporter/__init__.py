@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import tempfile
 import time
 import traceback
@@ -3629,6 +3630,31 @@ def apply_imported_torque_curve(settings, torque_curve):
     mapping.update()
 
 
+def shortest_float32(value):
+    """Return the shortest decimal for float32-exact values, such as Blender float properties."""
+    try:
+        single = struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return value
+    if single != value:
+        return value
+    for digits in range(1, 10):
+        candidate = float(f"{value:.{digits}g}")
+        if struct.unpack("<f", struct.pack("<f", candidate))[0] == single:
+            return candidate
+    return value
+
+
+def compact_manifest_floats(value):
+    if isinstance(value, float):
+        return shortest_float32(value)
+    if isinstance(value, dict):
+        return {key: compact_manifest_floats(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [compact_manifest_floats(item) for item in value]
+    return value
+
+
 def build_manifest(settings):
     sounds = {"pitchOffset": settings.sound_pitch_offset}
     if settings.use_custom_sounds:
@@ -3976,7 +4002,7 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             relink_export_helpers(states)
 
         yield 0.85, "Writing manifest..."
-        manifest = build_manifest(settings)
+        manifest = compact_manifest_floats(build_manifest(settings))
         (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
 
         if settings.use_custom_sounds:

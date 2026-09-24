@@ -2433,6 +2433,31 @@ def check_rebuilt_map_curve(layout, reference):
     return {"width": width_error, "tilt": tilt_error, "height": height_error, "missed": missed}
 
 
+def shortest_float32(value):
+    """Return the shortest decimal for float32-exact values, such as Blender float properties."""
+    try:
+        single = struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return value
+    if single != value:
+        return value
+    for digits in range(1, 10):
+        candidate = float(f"{value:.{digits}g}")
+        if struct.unpack("<f", struct.pack("<f", candidate))[0] == single:
+            return candidate
+    return value
+
+
+def compact_manifest_floats(value):
+    if isinstance(value, float):
+        return shortest_float32(value)
+    if isinstance(value, dict):
+        return {key: compact_manifest_floats(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [compact_manifest_floats(item) for item in value]
+    return value
+
+
 def build_manifest(settings):
     shared_collisions = object_with_role(settings.shared_root_object, ROLE_COLLISIONS)
     shared_obstacles = object_with_role(shared_collisions, ROLE_OBSTACLES)
@@ -3970,7 +3995,7 @@ def iter_track_zip_export(context, settings, filepath, report):
         validate_hdr_not_embedded(model_path, settings.hdr_image)
 
         yield 0.78, "Writing manifest..."
-        manifest = build_manifest(settings)
+        manifest = compact_manifest_floats(build_manifest(settings))
         (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
 
         map_layouts = [layout for layout in settings.layouts if layout.map_curve]
