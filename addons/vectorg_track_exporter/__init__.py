@@ -39,6 +39,16 @@ from bpy.props import (
 )
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 
+# Mirrors the canonical class registry in vectorg/vehicleClasses.js.
+VEHICLE_CLASS_ITEMS = (
+    ("K", "K Kart", "Kart class"),
+    ("C", "C Street", "Street car class"),
+    ("B", "B Sport", "Sport car class"),
+    ("A", "A GT", "GT car class"),
+    ("R", "R Rally", "Rally car class"),
+    ("F", "F Formula", "Formula car class"),
+)
+
 
 ROLE_PROPERTY = "vectorg_role"
 SURFACE_PROPERTY = "vectorg_surface"
@@ -2458,6 +2468,10 @@ def compact_manifest_floats(value):
     return value
 
 
+def layout_vehicle_classes(layout):
+    return [code for code, _label, _description in VEHICLE_CLASS_ITEMS if code in layout.vehicle_classes]
+
+
 def build_manifest(settings):
     shared_collisions = object_with_role(settings.shared_root_object, ROLE_COLLISIONS)
     shared_obstacles = object_with_role(shared_collisions, ROLE_OBSTACLES)
@@ -2482,6 +2496,7 @@ def build_manifest(settings):
             "routeType": layout.route_type,
             "length": layout.length,
             "trackTypes": track_types,
+            "vehicleClasses": layout_vehicle_classes(layout),
             "nodes": {key: object_name(value) for key, value in nodes.items()},
             "spawnPoints": sorted(
                 obj.name for obj in descendants_with_role(nodes["spawnPoints"], ROLE_SPAWN_POINT)
@@ -2997,6 +3012,8 @@ def validate_scene(settings, context):
         spawn_points = descendants_with_role(nodes["spawnPoints"], ROLE_SPAWN_POINT)
         if not spawn_points:
             errors.append(f"{label} needs at least one spawn point")
+        if not layout_vehicle_classes(layout):
+            errors.append(f"{label} needs at least one vehicle class")
 
         event_objects = [obj for obj in descendants(nodes["events"]) if obj.get(EVENT_PROPERTY)] if nodes["events"] else []
         supported_events = {"start_finish", "start", "finish", "checkpoint", "reset_zone", "track_limit"}
@@ -3146,6 +3163,13 @@ class TrackLayoutSettings(PropertyGroup):
     length: FloatProperty(name="Length (km)", description="Calculated from the configured map curve", default=0.0, min=0.0)
     track_type_tarmac: BoolProperty(name="Tarmac", description="Classify this layout as tarmac", default=True)
     track_type_offroad: BoolProperty(name="Offroad", description="Classify this layout as off-road", default=False)
+    vehicle_classes: EnumProperty(
+        name="Classes",
+        description="Vehicle classes that race on this layout; multiplayer rooms and leaderboards exist only for these",
+        items=VEHICLE_CLASS_ITEMS,
+        options={"ENUM_FLAG"},
+        default=set(),
+    )
     root_object: PointerProperty(name="Root", description="Generated root object for this layout", type=bpy.types.Object)
     map_curve: PointerProperty(
         name="Map Curve",
@@ -4258,6 +4282,9 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             tags.label(text="Track Types")
             tags.prop(current, "track_type_tarmac", text="Tarmac", toggle=True)
             tags.prop(current, "track_type_offroad", text="Offroad", toggle=True)
+            classes = box.column(align=True)
+            classes.label(text="Classes")
+            classes.prop(current, "vehicle_classes", expand=True)
             box.separator()
             box.label(text="Layout Objects")
             box.operator("track_exporter.add_spawn_point", icon="EMPTY_AXIS")

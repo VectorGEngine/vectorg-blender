@@ -129,6 +129,17 @@ NEWTONS_PER_KILOGRAM = 9.81
 BRAKE_LOCK_MARGIN = 1.15
 CENTER_OF_MASS_HELPER_PROP = "vectorg_center_of_mass_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+# Mirrors the canonical class registry in vectorg/vehicleClasses.js.
+VEHICLE_CLASS_ITEMS = (
+    ("K", "K Kart", "Kart class"),
+    ("C", "C Street", "Street car class"),
+    ("B", "B Sport", "Sport car class"),
+    ("A", "A GT", "GT car class"),
+    ("R", "R Rally", "Rally car class"),
+    ("F", "F Formula", "Formula car class"),
+)
+VEHICLE_CLASS_CODES = frozenset(code for code, _label, _description in VEHICLE_CLASS_ITEMS)
+DEFAULT_VEHICLE_CLASS = "A"
 DEFAULT_MAX_TEXTURE_SIZE = 4096
 DEFAULT_JPEG_QUALITY = 85
 TEMP_IMAGE_FILE_PROPERTY = "vectorg_temp_file"
@@ -1704,6 +1715,8 @@ def validate_scene(settings):
         return errors, warnings
     if not PACKAGE_VERSION_PATTERN.fullmatch(settings.package_version):
         errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
+    if settings.car_class not in VEHICLE_CLASS_CODES:
+        errors.append(f"Class must be one of {', '.join(code for code, _label, _description in VEHICLE_CLASS_ITEMS)}")
 
     car_obj = settings.car_root_object
     required = [
@@ -2593,10 +2606,11 @@ class CarExporterSettings(PropertyGroup):
         min=1,
         max=100,
     )
-    car_class: StringProperty(
+    car_class: EnumProperty(
         name="Class",
-        description="Player-facing vehicle class used for grouping and display",
-        default="GT",
+        description="Vehicle class used for display and multiplayer class matching",
+        items=VEHICLE_CLASS_ITEMS,
+        default=DEFAULT_VEHICLE_CLASS,
     )
     vehicle_tag_tarmac: BoolProperty(
         name="Tarmac",
@@ -3254,7 +3268,7 @@ def clear_configuration_settings(settings):
     settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
     settings.optimize_color_textures = True
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
-    settings.car_class = ""
+    settings.car_class = DEFAULT_VEHICLE_CLASS
     settings.vehicle_tag_tarmac = False
     settings.vehicle_tag_offroad = False
     settings.abs_max_level = 5
@@ -3342,7 +3356,7 @@ def initialize_configuration_settings(settings):
     settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
     settings.optimize_color_textures = True
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
-    settings.car_class = "GT"
+    settings.car_class = DEFAULT_VEHICLE_CLASS
     settings.vehicle_tag_tarmac = True
     settings.vehicle_tag_offroad = True
     settings.abs_max_level = 5
@@ -5137,6 +5151,10 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         if manifest_version != 8:
             self.report({"ERROR"}, "Only vehicle manifest version 8 can be imported")
             return {"CANCELLED"}
+        if data.get("class") not in VEHICLE_CLASS_CODES:
+            codes = ", ".join(code for code, _label, _description in VEHICLE_CLASS_ITEMS)
+            self.report({"ERROR"}, f"Vehicle manifest class must be one of {codes}")
+            return {"CANCELLED"}
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
@@ -5448,7 +5466,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.car_id = data.get("id", data.get("name", settings.car_id))
         settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
-        settings.car_class = data.get("class", settings.car_class)
+        settings.car_class = data["class"]
         settings.sound_pitch_offset = round(sound_pitch_offset)
         settings.use_custom_sounds = any(slot in sounds for slot in SOUND_SLOTS)
         for slot, meta in SOUND_SLOTS.items():

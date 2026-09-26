@@ -42,8 +42,8 @@ same evaluated geometry.
 Every shared and layout `VISUALS` root contains two behavior roots:
 
 - `PBR` uses the regular lit track-material path.
-- `FOLIAGE_CARDS` uses unlit, double-sided alpha cutouts without cast or receive
-  shadows.
+- `FOLIAGE_CARDS` uses the regular lit material path and casts shadows, but does
+  not receive shadows. Authored sidedness and alpha settings are preserved.
 
 ## Workflow
 
@@ -164,6 +164,12 @@ Choose **Route Type** per layout. Circular routes use one `start_finish` event;
 point-to-point routes use separate `start` and `finish` events. Freeform routes
 may use an open or cyclic map curve and require no race events. At least one
 spawn point remains required for every route type.
+
+Choose the supported vehicle **Classes** per layout from the class toggles
+(K Kart, C Street, B Sport, A GT, R Rally, F Formula). At least one class is
+required. The layout exports them as `vehicleClasses`; multiplayer rooms and
+leaderboards exist only for these classes, using the class cars whose track
+types match the layout's **Track Types**.
 
 Collision roots contain `tarmac`, `concrete`, `kerb`, `grass`, `gravel`,
 `dirt`, `mud`, `sand`, `snow`, `ice`, `wet_tarmac`, `wet_concrete`, `wet_kerb`,

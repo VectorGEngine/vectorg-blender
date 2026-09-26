@@ -36,6 +36,7 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
   "id": "<car_id>",
   "packageVersion": "1",
   "model": "<car_id>.glb",
+  "class": "A",
   "engine": {
     "torqueFactor": 1.0,
     "idleRPM": 1000,
@@ -109,6 +110,11 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
   ]
 }
 ```
+
+`class` is required and must be one of the vehicle class codes: `K` Kart,
+`C` Street, `B` Sport, `A` GT, `R` Rally, or `F` Formula. The exporter's
+**Class** menu mirrors the game's registry in `vectorg/vehicleClasses.js`;
+add new classes to both. Manifest import rejects missing or unknown classes.
 
 Change **Package Version** only when explicitly requested by the user; changes
 to exported contents do not authorize a version bump. Importing an existing

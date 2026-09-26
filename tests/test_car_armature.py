@@ -391,7 +391,7 @@ class ArmatureTests(unittest.TestCase):
             brake_lights_material=None, reverse_lights_material=None,
             dashboard_screen_object=None, center_of_mass_object=None, colliders=[],
             down_force_points=[], drag_per_downforce=0.2, air_drag=1, body_colors=[], car_id="test",
-            package_version="test-rig", display_name="Test", car_class="test",
+            package_version="test-rig", display_name="Test", car_class="A",
             vehicle_tag_tarmac=True, vehicle_tag_offroad=False, hp=100, drive="rwd",
             max_rpm=8000, idle_rpm=800, redline_rpm=7000, rev_limit=7500,
             engine_inertia=1, engine_braking=0.2, engine_friction_torque=1, clutch_response=1,
