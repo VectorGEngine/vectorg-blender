@@ -9,6 +9,7 @@ hdr/env.hdr or hdr/env.exr
 maps/<layout_id>.svg
 routes/<layout_id>.json
 ideal-lines/<layout_id>.json (when an Ideal Line is assigned)
+preview.jpg (when a Preview Image is assigned)
 ```
 
 Install or enable `vectorg-blender/addons/vectorg_track_exporter` the same way as the
@@ -290,6 +291,51 @@ Generated curves also carry the last explicit generation settings in `generation
 Neither speed targets nor colors are baked into this file. The MAP hierarchy,
 including the preview curve, remains excluded from the GLB. Player ribbon
 rendering is a subsequent game change.
+
+## Track preview image
+
+The **Preview** section, above **Layouts**, holds the track-selection background
+image. The thumbnail at the top shows the current **Preview Image**; its picker
+and open button accept any PNG or JPEG in place of a render.
+
+**Add Render Camera** only adds `<track_id>_preview_camera` to a `PREVIEW`
+empty outside the track root (created if missing). The 35 mm camera sits 1 m
+above the first layout's first spawn point, level and facing the spawn point's
+-Y axis (the direction a car spawned there faces); without a spawn point in the
+first layout it is placed at the 3D cursor facing the cursor's -Y axis. The X
+button deletes a camera the exporter created (and the `PREVIEW` empty once it is
+empty) and only clears a camera you assigned.
+
+**Set Up Preview Scene** is available once a Render Camera is set. It moves the
+Render Camera under the `PREVIEW` empty (keeping its placement) and adds
+`<track_id>_preview_sun` to the `PREVIEW` empty if
+it has no sun lamp yet (an existing one is kept as edited). The lamp has
+strength 6 and shadows, and points from the brightest texel in the upper half of
+the track HDR, or from 45 degrees elevation without an HDR. It enables rendering
+only for Shared and the selected layout's VISUALS, the Render Camera, and the
+`PREVIEW` empty, and disables it for every other object in the scene (MAP
+curves, ideal lines, collisions, events, other layouts), so Blender's own Render
+Image matches the preview; click it again after selecting another layout. It feeds the track
+HDR into the scene world's Background node through an Environment Texture node
+(reusing one already connected there, and creating the world, Background, and
+output nodes if missing). It then makes the Render Camera the scene camera and
+applies, each time it is clicked: EEVEE at
+1920x1080, Khronos PBR Neutral view transform at +1 exposure, 64 samples,
+screen-traced ray tracing, 2 shadow rays, overscan, and world Sun Threshold 0 so
+EEVEE does not extract a second sun from the HDR.
+These settings stay on the scene. It needs Blender 4.2 or newer.
+
+**Render Preview** starts Blender's interactive render with the scene's current
+render settings, shown wherever **Render Image** shows renders. When the render
+finishes, the result is packed into the .blend as `<track_id>_preview`,
+replacing the previous render. Only Shared, the selected layout's VISUALS, and
+the `PREVIEW` empty render; other objects' render visibility, the scene camera,
+and the output file format are restored when the render finishes or is
+cancelled. A cancelled render leaves the preview image unchanged.
+
+Export writes the image as `preview.jpg` at the package JPEG quality, scaled to
+at most 1920 px, and adds `preview: "preview.jpg"` to the manifest root.
+Validation warns when the track has no preview or one narrower than 1280 px.
 
 Validation commands from the repository root:
 

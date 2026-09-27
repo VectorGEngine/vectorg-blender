@@ -21,6 +21,7 @@ from pathlib import Path
 
 import blf
 import bpy
+import numpy as np
 import gpu
 from gpu_extras.batch import batch_for_shader
 from bpy.app.handlers import persistent
@@ -69,6 +70,8 @@ ROLE_EVENTS = "events"
 ROLE_MAP = "map"
 ROLE_SPAWN_POINT = "spawn_point"
 ROLE_SURFACE = "surface"
+ROLE_PREVIEW = "preview"
+ROLE_PREVIEW_SUN = "preview_sun"
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
@@ -92,6 +95,24 @@ MAP_ALIGNMENT_MIN_AXIS_RATIO = 1.1
 DEFAULT_MAX_TEXTURE_SIZE = 4096
 DEFAULT_JPEG_QUALITY = 85
 TEMP_IMAGE_FILE_PROPERTY = "vectorg_temp_file"
+# The game's track-selection title and layout selector are sized for these lengths.
+TRACK_DISPLAY_NAME_MAX_LENGTH = 20
+LAYOUT_DISPLAY_NAME_MAX_LENGTH = 16
+PREVIEW_CAMERA_PROPERTY = "vectorg_preview_camera"
+PREVIEW_RENDER_PROPERTY = "vectorg_preview_render"
+PREVIEW_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+PREVIEW_WIDTH = 1920
+PREVIEW_HEIGHT = 1080
+PREVIEW_MAX_SIZE = 1920
+PREVIEW_MIN_WIDTH = 1280
+PREVIEW_CAMERA_SPAWN_HEIGHT = 1.0
+PREVIEW_CAMERA_LENS = 35.0
+PREVIEW_CAMERA_CLIP_END = 5000.0
+PREVIEW_MIN_BLENDER_VERSION = (4, 2, 0)
+PREVIEW_EXPOSURE = 1.0
+PREVIEW_SUN_STRENGTH = 6.0
+PREVIEW_SUN_COLOR = (1.0, 0.955, 0.91)
+PREVIEW_DEFAULT_SUN_ELEVATION = math.radians(45.0)
 TEXTURE_SIZE_ITEMS = (
     ("2048", "2048", "Cap exported track textures to 2048 px on their longest side"),
     ("4096", "4096", "Cap exported track textures to 4096 px on their longest side"),
@@ -148,6 +169,14 @@ def curve_object_poll(_settings, obj):
 
 def ideal_line_poll(layout, obj):
     return obj.type == "CURVE" and obj != layout.map_curve
+
+
+def camera_object_poll(_settings, obj):
+    return obj.type == "CAMERA"
+
+
+def preview_image_poll(_settings, image):
+    return image.source == "FILE" and image_source_extension(image) in PREVIEW_IMAGE_EXTENSIONS
 
 
 def is_in_tree(root, obj):
@@ -2529,6 +2558,8 @@ def build_manifest(settings):
     }
     if settings.hdr_image:
         config["hdr"] = "hdr/env" + image_source_extension(settings.hdr_image)
+    if settings.preview_image:
+        config["preview"] = "preview.jpg"
     return config
 
 
@@ -2668,6 +2699,398 @@ def write_layout_map_svg(layout, filepath):
         + '\n  </g>\n</svg>\n'
     )
     filepath.write_text(svg, encoding="utf-8")
+
+
+def preview_visual_roots(settings, layout):
+    """Shared visuals and the selected layout's visuals: what the game loads for it."""
+    return [
+        visuals
+        for visuals in (
+            object_with_role(settings.shared_root_object, ROLE_VISUALS),
+            object_with_role(layout.root_object, ROLE_VISUALS) if layout else None,
+        )
+        if visuals
+    ]
+
+
+def preview_render_objects(context, settings, layout):
+    """Objects a preview render shows: the layout's game visuals, the Render Camera, and PREVIEW."""
+    rendered = {settings.preview_camera} if settings.preview_camera else set()
+    group = preview_group(context)
+    if group:
+        rendered.update([group, *descendants(group)])
+    for visuals in preview_visual_roots(settings, layout):
+        rendered.update([visuals, *descendants(visuals)])
+    return rendered
+
+
+def apply_preview_render_visibility(context, settings, layout):
+    """Enable rendering for the preview objects and disable it for everything else."""
+    scene = context.scene
+    rendered = preview_render_objects(context, settings, layout)
+    for obj in scene.objects:
+        obj.hide_render = obj not in rendered
+    for collection in {collection for obj in rendered for collection in obj.users_collection}:
+        if collection != scene.collection:
+            collection.hide_render = False
+
+
+def preview_camera_matrix(context, settings):
+    """First layout's first spawn point raised 1 m, else the 3D cursor.
+
+    The camera is level and faces the source's -Y axis, the direction a car
+    placed at the spawn point faces.
+    """
+    source = None
+    if settings.layouts:
+        spawn_root = layout_nodes(settings.layouts[0])["spawnPoints"]
+        spawns = ordered_objects(descendants_with_role(spawn_root, ROLE_SPAWN_POINT), "spawn")
+        source = spawns[0] if spawns else None
+    if source:
+        world = source.matrix_world
+        position = world.translation + Vector((0.0, 0.0, PREVIEW_CAMERA_SPAWN_HEIGHT))
+    else:
+        world = context.scene.cursor.matrix
+        position = world.translation.copy()
+    forward = world.to_3x3() @ Vector((0.0, -1.0, 0.0))
+    forward.z = 0.0
+    if forward.length_squared < 1e-12:
+        forward = Vector((0.0, -1.0, 0.0))
+    rotation = forward.normalized().to_track_quat("-Z", "Y").to_matrix().to_4x4()
+    return Matrix.Translation(position) @ rotation, source
+
+
+def hdr_sun_direction(image):
+    """Direction toward the brightest texel of the HDR's upper half, in Blender world space."""
+    ensure_image_data_loaded(image)
+    width, height = image.size
+    channels = image.channels
+    pixels = np.empty(width * height * channels, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    # Blender stores the bottom row first, so the sky is the second half.
+    sky = pixels.reshape(height, width, channels)[height // 2:, :, :3]
+    luminance = sky @ np.array((0.2126, 0.7152, 0.0722), dtype=np.float32)
+    row, column = np.unravel_index(int(np.argmax(luminance)), luminance.shape)
+    # Blender's equirectangular mapping with the default world texture coordinates.
+    elevation = ((row + height // 2 + 0.5) / height - 0.5) * math.pi
+    azimuth = (0.5 - (column + 0.5) / width) * 2.0 * math.pi
+    return Vector((
+        math.cos(elevation) * math.cos(azimuth),
+        math.cos(elevation) * math.sin(azimuth),
+        math.sin(elevation),
+    ))
+
+
+def preview_group(context):
+    """The PREVIEW empty at the scene root, outside the track hierarchy."""
+    return next(
+        (obj for obj in context.scene.objects if obj.parent is None and obj.get(ROLE_PROPERTY) == ROLE_PREVIEW),
+        None,
+    )
+
+
+def ensure_preview_group(context):
+    return preview_group(context) or create_empty(context, "PREVIEW", role=ROLE_PREVIEW)
+
+
+def create_preview_camera(context, settings, matrix):
+    data = bpy.data.cameras.new(f"{settings.track_id}_preview_camera")
+    data.lens = PREVIEW_CAMERA_LENS
+    data.sensor_fit = "HORIZONTAL"
+    data.clip_start = 0.1
+    data.clip_end = PREVIEW_CAMERA_CLIP_END
+    data.dof.use_dof = False
+    camera = bpy.data.objects.new(data.name, data)
+    context.scene.collection.objects.link(camera)
+    camera[PREVIEW_CAMERA_PROPERTY] = True
+    camera.parent = ensure_preview_group(context)
+    camera.matrix_world = matrix
+    return camera
+
+
+def remove_preview_object(obj):
+    """Delete a preview object, and the PREVIEW group once it is empty."""
+    group = obj.parent if obj.parent and obj.parent.get(ROLE_PROPERTY) == ROLE_PREVIEW else None
+    data = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if isinstance(data, bpy.types.Camera) and data.users == 0:
+        bpy.data.cameras.remove(data)
+    elif isinstance(data, bpy.types.Light) and data.users == 0:
+        bpy.data.lights.remove(data)
+    if group and not group.children:
+        bpy.data.objects.remove(group, do_unlink=True)
+
+
+def ensure_preview_sun(context, settings):
+    """Sun lamp in the PREVIEW group; an existing one is kept as edited."""
+    group = ensure_preview_group(context)
+    existing = next((obj for obj in group.children if obj.get(ROLE_PROPERTY) == ROLE_PREVIEW_SUN), None)
+    if existing:
+        return existing, False
+    data = bpy.data.lights.new(f"{settings.track_id}_preview_sun", "SUN")
+    data.energy = PREVIEW_SUN_STRENGTH
+    data.color = PREVIEW_SUN_COLOR
+    data.use_shadow = True
+    sun = bpy.data.objects.new(data.name, data)
+    context.scene.collection.objects.link(sun)
+    sun[ROLE_PROPERTY] = ROLE_PREVIEW_SUN
+    sun.parent = group
+    if settings.hdr_image:
+        toward_sun = hdr_sun_direction(settings.hdr_image)
+    else:
+        toward_sun = Vector((
+            math.cos(PREVIEW_DEFAULT_SUN_ELEVATION), 0.0, math.sin(PREVIEW_DEFAULT_SUN_ELEVATION)
+        ))
+    # A sun lamp shines along its local -Z axis.
+    sun.matrix_world = (-toward_sun).to_track_quat("-Z", "Y").to_matrix().to_4x4()
+    return sun, True
+
+
+def apply_hdr_to_world(context, hdr_image):
+    """Feed the track HDR into the scene world's Background node."""
+    scene = context.scene
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+    world = scene.world
+    world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    output = next(
+        (node for node in nodes if node.bl_idname == "ShaderNodeOutputWorld" and node.is_active_output),
+        None,
+    ) or nodes.new("ShaderNodeOutputWorld")
+    surface = output.inputs["Surface"]
+    background = next(
+        (link.from_node for link in surface.links if link.from_node.bl_idname == "ShaderNodeBackground"),
+        None,
+    )
+    if background is None:
+        background = nodes.new("ShaderNodeBackground")
+        background.location = output.location - Vector((250.0, 0.0))
+        links.new(background.outputs["Background"], surface)
+    color = background.inputs["Color"]
+    environment = next(
+        (link.from_node for link in color.links if link.from_node.bl_idname == "ShaderNodeTexEnvironment"),
+        None,
+    )
+    if environment is None:
+        environment = nodes.new("ShaderNodeTexEnvironment")
+        environment.location = background.location - Vector((300.0, 0.0))
+        links.new(environment.outputs["Color"], color)
+    environment.image = hdr_image
+
+
+def preview_eevee_engine():
+    return "BLENDER_EEVEE" if bpy.app.version >= (5, 0, 0) else "BLENDER_EEVEE_NEXT"
+
+
+def configure_preview_render(context, camera):
+    """EEVEE settings for the preview; they remain on the scene."""
+    scene = context.scene
+    render = scene.render
+    view = scene.view_settings
+    if camera:
+        scene.camera = camera
+    render.engine = preview_eevee_engine()
+    render.resolution_x = PREVIEW_WIDTH
+    render.resolution_y = PREVIEW_HEIGHT
+    render.resolution_percentage = 100
+    render.pixel_aspect_x = 1.0
+    render.pixel_aspect_y = 1.0
+    render.film_transparent = False
+    render.use_motion_blur = False
+    view.look = "None"
+    view.view_transform = "Khronos PBR Neutral"
+    view.exposure = PREVIEW_EXPOSURE
+    view.gamma = 1.0
+    view.use_curve_mapping = False
+    eevee = scene.eevee
+    eevee.taa_render_samples = 64
+    eevee.use_raytracing = True
+    eevee.ray_tracing_method = "SCREEN"
+    eevee.fast_gi_method = "GLOBAL_ILLUMINATION"
+    eevee.use_shadows = True
+    eevee.shadow_ray_count = 2
+    eevee.shadow_step_count = 12
+    eevee.shadow_resolution_scale = 1.0
+    eevee.use_overscan = True
+    eevee.ray_tracing_options.resolution_scale = "1"
+    eevee.ray_tracing_options.trace_max_roughness = 0.5
+    eevee.ray_tracing_options.use_denoise = True
+    if scene.world:
+        # The preview sun lamp replaces EEVEE's sun extracted from the HDR.
+        scene.world.sun_threshold = 0.0
+
+
+_preview_render_job = None
+
+
+def prepare_preview_render(context, settings, layout):
+    """Show only the preview content through the Render Camera; returns restore callbacks."""
+    scene = context.scene
+    image_settings = scene.render.image_settings
+    restores = []
+
+    def assign(owner, attribute, value):
+        previous = getattr(owner, attribute)
+        restores.append(lambda: setattr(owner, attribute, previous))
+        setattr(owner, attribute, value)
+
+    try:
+        # Render the layout as the game loads it, plus the PREVIEW group.
+        rendered = preview_render_objects(context, settings, layout)
+        for obj in scene.objects:
+            assign(obj, "hide_render", obj not in rendered)
+        for collection in {collection for obj in rendered for collection in obj.users_collection}:
+            if collection != scene.collection:
+                assign(collection, "hide_render", False)
+        assign(scene, "camera", settings.preview_camera)
+
+        # Blender 5.0 selects the media type before the file format.
+        format_attributes = [
+            attribute for attribute in ("media_type", "file_format", "color_mode", "color_depth")
+            if hasattr(image_settings, attribute)
+        ]
+        previous_format = [(attribute, getattr(image_settings, attribute)) for attribute in format_attributes]
+
+        def restore_format():
+            for attribute, value in previous_format:
+                setattr(image_settings, attribute, value)
+
+        restores.append(restore_format)
+        if "media_type" in format_attributes:
+            image_settings.media_type = "IMAGE"
+        image_settings.file_format = "PNG"
+        image_settings.color_mode = "RGB"
+        image_settings.color_depth = "8"
+    except Exception:
+        restore_preview_render(restores)
+        raise
+    return restores
+
+
+def restore_preview_render(restores):
+    for restore in reversed(restores):
+        try:
+            restore()
+        except ReferenceError:
+            # The object or collection was deleted while the render ran.
+            pass
+
+
+def save_preview_render_result(scene):
+    """Pack the finished Render Result as a PNG with the scene's view transform applied."""
+    render_result = next((image for image in bpy.data.images if image.type == "RENDER_RESULT"), None)
+    if render_result is None:
+        raise RuntimeError("Blender produced no render result")
+    with tempfile.TemporaryDirectory(prefix="track_preview_") as temp_dir:
+        png_path = Path(temp_dir) / "preview.png"
+        render_result.save_render(str(png_path), scene=scene)
+        image = bpy.data.images.load(str(png_path), check_existing=False)
+        image.pack()
+    image[PREVIEW_RENDER_PROPERTY] = True
+    return image
+
+
+def remove_preview_render_handlers():
+    for handlers, handler in (
+        (bpy.app.handlers.render_complete, preview_render_complete),
+        (bpy.app.handlers.render_cancel, preview_render_cancel),
+    ):
+        if handler in handlers:
+            handlers.remove(handler)
+
+
+def finish_preview_render(completed):
+    """Runs on the main thread after the render; stores the preview and restores the scene."""
+    global _preview_render_job
+    job = _preview_render_job
+    _preview_render_job = None
+    remove_preview_render_handlers()
+    if job is None:
+        return None
+    scene = bpy.data.scenes.get(job["scene"])
+    try:
+        if completed and scene:
+            set_track_preview_image(scene.track_exporter, save_preview_render_result(scene))
+    except Exception:
+        print("VectorG Track Exporter: could not store the preview render")
+        traceback.print_exc()
+    finally:
+        restore_preview_render(job["restores"])
+    return None
+
+
+def preview_render_complete(*_args):
+    # Render handlers may run off the main thread; finish from a timer.
+    bpy.app.timers.register(lambda: finish_preview_render(True), first_interval=0.0)
+
+
+def preview_render_cancel(*_args):
+    bpy.app.timers.register(lambda: finish_preview_render(False), first_interval=0.0)
+
+
+def start_preview_render(context, settings, layout):
+    """Start Blender's interactive render, shown where Render Image shows it."""
+    global _preview_render_job
+    if _preview_render_job is not None or bpy.app.is_job_running("RENDER"):
+        raise RuntimeError("A render is already running")
+    restores = prepare_preview_render(context, settings, layout)
+    _preview_render_job = {"scene": context.scene.name, "restores": restores}
+    bpy.app.handlers.render_complete.append(preview_render_complete)
+    bpy.app.handlers.render_cancel.append(preview_render_cancel)
+    try:
+        result = bpy.ops.render.render("INVOKE_DEFAULT")
+    except Exception:
+        finish_preview_render(False)
+        raise
+    if not result & {"RUNNING_MODAL", "FINISHED"}:
+        finish_preview_render(False)
+        raise RuntimeError("Blender could not start the render")
+
+
+def set_track_preview_image(settings, image):
+    """Assign a rendered preview, deleting the render it replaces."""
+    previous = settings.preview_image
+    settings.preview_image = image
+    if previous and previous != image and previous.get(PREVIEW_RENDER_PROPERTY) and previous.users == 0:
+        bpy.data.images.remove(previous)
+    name = f"{settings.track_id}_preview"
+    image.name = name
+    image.filepath_raw = f"//{name}.png"
+
+
+def validate_track_preview(errors, warnings, image):
+    if image.source != "FILE" or image_source_extension(image) not in PREVIEW_IMAGE_EXTENSIONS:
+        errors.append("Preview image must be a PNG or JPEG file")
+        return
+    if not image_source_exists(image):
+        errors.append("Preview image source does not exist")
+        return
+    try:
+        ensure_image_data_loaded(image)
+    except RuntimeError:
+        errors.append("Preview image has no readable pixel data")
+        return
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        errors.append("Preview image has no pixel data")
+    elif width < PREVIEW_MIN_WIDTH:
+        warnings.append(f"Preview image is {width}x{height}; use at least {PREVIEW_MIN_WIDTH} px wide")
+
+
+def write_preview_jpeg(image, filepath, quality):
+    copy = duplicate_image_with_data(image)
+    try:
+        width, height = copy.size
+        scale = PREVIEW_MAX_SIZE / max(width, height)
+        if scale < 1.0:
+            copy.scale(max(1, round(width * scale)), max(1, round(height * scale)))
+        copy.filepath_raw = str(filepath)
+        copy.file_format = "JPEG"
+        copy.save(quality=quality)
+    finally:
+        bpy.data.images.remove(copy)
 
 
 def validate_visual_root(errors, label, visuals):
@@ -2891,6 +3314,8 @@ def validate_scene(settings, context):
         errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
     if not settings.display_name.strip():
         errors.append("Display name is required")
+    elif len(settings.display_name.strip()) > TRACK_DISPLAY_NAME_MAX_LENGTH:
+        errors.append(f"Display name must be at most {TRACK_DISPLAY_NAME_MAX_LENGTH} characters")
     if not track_root:
         errors.append("Track root object is required")
         return errors, warnings
@@ -2949,6 +3374,8 @@ def validate_scene(settings, context):
         layout_ids.add(layout.layout_id)
         if not layout.display_name.strip():
             errors.append(f"{label} display name is required")
+        elif len(layout.display_name.strip()) > LAYOUT_DISPLAY_NAME_MAX_LENGTH:
+            errors.append(f"{label} display name must be at most {LAYOUT_DISPLAY_NAME_MAX_LENGTH} characters")
         if not layout.root_object:
             errors.append(f"{label} root object is required")
             continue
@@ -3068,6 +3495,11 @@ def validate_scene(settings, context):
         shared_collision_root = object_with_role(settings.shared_root_object, ROLE_COLLISIONS)
         validate_collision_root(errors, warnings, "Shared", shared_collision_root)
 
+    if settings.preview_image:
+        validate_track_preview(errors, warnings, settings.preview_image)
+    else:
+        warnings.append("Track has no preview image")
+
     if settings.hdr_image:
         extension = image_source_extension(settings.hdr_image)
         if extension not in {".hdr", ".exr"}:
@@ -3128,12 +3560,19 @@ def reset_settings(settings):
     settings.dynamic_colliders.clear()
     settings.active_layout_index = 0
     settings.hdr_image = None
+    settings.preview_camera = None
+    settings.preview_image = None
 
 
 class TrackLayoutSettings(PropertyGroup):
     layout_id: StringProperty(name="ID", description="Export identifier and generated-object name prefix", default="layout", update=update_layout_id)
     visible: BoolProperty(name="Visible", description="Show or hide this complete layout hierarchy", default=True, update=update_layout_visibility)
-    display_name: StringProperty(name="Name", description="Player-facing layout name", default="Layout")
+    display_name: StringProperty(
+        name="Name",
+        description=f"Player-facing layout name, at most {LAYOUT_DISPLAY_NAME_MAX_LENGTH} characters",
+        default="Layout",
+        maxlen=LAYOUT_DISPLAY_NAME_MAX_LENGTH,
+    )
     description: StringProperty(name="Description", description="Player-facing layout description", default="")
     discipline: EnumProperty(
         name="Discipline",
@@ -3221,7 +3660,12 @@ class TrackExporterSettings(PropertyGroup):
         description="Explicit asset revision; increment when package contents change",
         default="1",
     )
-    display_name: StringProperty(name="Display Name", description="Player-facing track name", default="My Track")
+    display_name: StringProperty(
+        name="Display Name",
+        description=f"Player-facing track name, at most {TRACK_DISPLAY_NAME_MAX_LENGTH} characters",
+        default="My Track",
+        maxlen=TRACK_DISPLAY_NAME_MAX_LENGTH,
+    )
     max_texture_size: EnumProperty(
         name="Maximum Texture Size",
         description="Maximum exported material-texture dimension",
@@ -3243,6 +3687,14 @@ class TrackExporterSettings(PropertyGroup):
     track_root_object: PointerProperty(name="Track Root", description="Root of all track content", type=bpy.types.Object)
     shared_root_object: PointerProperty(name="Shared Root", description="Content shared by every layout", type=bpy.types.Object)
     hdr_image: PointerProperty(name="HDR", description="Loaded HDR or EXR image exported as the track environment", type=bpy.types.Image, poll=hdr_image_poll)
+    preview_camera: PointerProperty(
+        name="Render Camera", description="Camera used to render the track-selection preview",
+        type=bpy.types.Object, poll=camera_object_poll,
+    )
+    preview_image: PointerProperty(
+        name="Preview Image", description="PNG or JPEG exported as the track-selection background",
+        type=bpy.types.Image, poll=preview_image_poll,
+    )
     layouts: CollectionProperty(type=TrackLayoutSettings)
     dynamic_colliders: CollectionProperty(type=DynamicColliderLink)
     active_layout_index: IntProperty(name="Active Layout", default=0)
@@ -3483,6 +3935,118 @@ class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
         for warning in warnings:
             self.report({"WARNING"}, warning)
         self.report({"INFO"}, "Ideal line generated; edit its control points in Edit Mode. Export preserves edits.")
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_add_preview_camera(Operator):
+    bl_idname = "track_exporter.add_preview_camera"
+    bl_label = "Add Render Camera"
+    bl_description = (
+        "Add a camera to the PREVIEW group, 1 m above the first layout's first spawn point "
+        "or at the 3D cursor without one"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT"
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if not self.poll(context):
+            self.report({"ERROR"}, "Add the Render Camera in Object Mode")
+            return {"CANCELLED"}
+        if settings.preview_camera:
+            self.report({"ERROR"}, "Render Camera already exists")
+            return {"CANCELLED"}
+        matrix, source = preview_camera_matrix(context, settings)
+        camera = create_preview_camera(context, settings, matrix)
+        settings.preview_camera = camera
+        select_only(context, camera)
+        self.report({"INFO"}, f"Render Camera placed at {source.name}" if source else "Render Camera placed at the 3D cursor")
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_remove_preview_camera(Operator):
+    bl_idname = "track_exporter.remove_preview_camera"
+    bl_label = "Remove Render Camera"
+    bl_description = "Clear the Render Camera and delete it if the exporter created it"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        camera = settings.preview_camera
+        settings.preview_camera = None
+        if camera and camera.get(PREVIEW_CAMERA_PROPERTY):
+            remove_preview_object(camera)
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_setup_preview_scene(Operator):
+    bl_idname = "track_exporter.setup_preview_scene"
+    bl_label = "Set Up Preview Scene"
+    bl_description = (
+        "Move the Render Camera under the PREVIEW group and make it the scene camera, add a sun lamp aimed "
+        "from the HDR's brightest point, render only Shared and the selected layout's visuals plus PREVIEW, "
+        "feed the track HDR into the scene world, and set EEVEE render, color management, and world sun "
+        "settings for the preview"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT" and scene_settings(context).preview_camera is not None
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if not self.poll(context):
+            self.report({"ERROR"}, "Add a Render Camera in Object Mode first")
+            return {"CANCELLED"}
+        if bpy.app.version < PREVIEW_MIN_BLENDER_VERSION:
+            self.report({"ERROR"}, "Preview rendering requires Blender 4.2 or newer")
+            return {"CANCELLED"}
+        camera = settings.preview_camera
+        group = ensure_preview_group(context)
+        if camera.parent != group:
+            context.view_layer.update()
+            matrix = camera.matrix_world.copy()
+            camera.parent = group
+            camera.matrix_world = matrix
+        _sun, created = ensure_preview_sun(context, settings)
+        apply_preview_render_visibility(context, settings, active_layout(settings))
+        if settings.hdr_image:
+            apply_hdr_to_world(context, settings.hdr_image)
+        configure_preview_render(context, settings.preview_camera)
+        if not settings.hdr_image:
+            self.report({"WARNING"}, "No HDR assigned; the world is unchanged and the sun lamp uses 45 degrees elevation")
+        self.report({"INFO"}, "Preview scene set up" + ("" if created else "; existing sun lamp kept"))
+        return {"FINISHED"}
+
+
+class TRACK_EXPORTER_OT_render_preview(Operator):
+    bl_idname = "track_exporter.render_preview"
+    bl_label = "Render Preview"
+    bl_description = (
+        "Render the Render Camera with the scene's render settings in Blender's render view, showing Shared, "
+        "the selected layout, and the PREVIEW group, and store the result as the track preview image"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = scene_settings(context)
+        return context.mode == "OBJECT" and settings.preview_camera is not None and active_layout(settings) is not None
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if not self.poll(context):
+            self.report({"ERROR"}, "Add a Render Camera and select a layout in Object Mode first")
+            return {"CANCELLED"}
+        try:
+            start_preview_render(context, settings, active_layout(settings))
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -4039,13 +4603,17 @@ def iter_track_zip_export(context, settings, filepath, report):
 
         line_layouts = [layout for layout in settings.layouts if layout.ideal_line]
         for index, layout in enumerate(line_layouts):
-            yield 0.90 + 0.04 * index / len(line_layouts), f"Writing ideal line: {layout.layout_id}"
+            yield 0.90 + 0.03 * index / len(line_layouts), f"Writing ideal line: {layout.layout_id}"
             ideal_path = temp_path / "ideal-lines"
             ideal_path.mkdir(exist_ok=True)
             line_data, _warnings = layout_ideal_line_data(layout, context)
             (ideal_path / f"{layout.layout_id}.json").write_text(
                 json.dumps(line_data, separators=(",", ":"), allow_nan=False), encoding="utf-8",
             )
+
+        if settings.preview_image:
+            yield 0.93, "Writing preview..."
+            write_preview_jpeg(settings.preview_image, temp_path / "preview.jpg", settings.jpeg_quality)
 
         if settings.hdr_image:
             yield 0.94, "Copying HDR..."
@@ -4235,6 +4803,18 @@ class TRACK_EXPORTER_PT_track_export(Panel):
         dynamic_op.scope = "SHARED"
 
         box = layout.box()
+        box.label(text="Preview")
+        box.template_ID_preview(settings, "preview_image", open="image.open", rows=4, cols=6)
+        if settings.preview_camera:
+            row = box.row(align=True)
+            row.prop(settings, "preview_camera", text="")
+            row.operator("track_exporter.remove_preview_camera", text="", icon="X")
+        else:
+            box.operator("track_exporter.add_preview_camera", icon="ADD")
+        box.operator("track_exporter.setup_preview_scene", icon="LIGHT_SUN")
+        box.operator("track_exporter.render_preview", icon="RENDER_STILL")
+
+        box = layout.box()
         row = box.row(align=True)
         row.label(text="Layouts")
         row.operator("track_exporter.add_layout", text="", icon="ADD")
@@ -4336,6 +4916,10 @@ classes = (
     TRACK_EXPORTER_OT_refresh_layout_names,
     TRACK_EXPORTER_OT_rebuild_map_curve,
     TRACK_EXPORTER_OT_generate_ideal_line,
+    TRACK_EXPORTER_OT_add_preview_camera,
+    TRACK_EXPORTER_OT_remove_preview_camera,
+    TRACK_EXPORTER_OT_setup_preview_scene,
+    TRACK_EXPORTER_OT_render_preview,
     TRACK_EXPORTER_OT_add_static_box_collider,
     TRACK_EXPORTER_OT_add_dynamic_box_collider,
     TRACK_EXPORTER_OT_add_spawn_point,
@@ -4358,6 +4942,7 @@ def register():
 
 def unregister():
     hide_export_progress()
+    remove_preview_render_handlers()
     if update_curve_lengths in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(update_curve_lengths)
     del bpy.types.Scene.track_exporter
