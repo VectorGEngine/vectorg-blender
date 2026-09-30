@@ -265,6 +265,13 @@ Changing Map Curve thickness or clearance does not alter an existing ideal line.
 Line** explicitly replaces its shape and supports Blender Undo. Export never
 regenerates the line and never modifies your control points.
 
+**Smooth Ideal Line** (shown once a line is assigned) removes kinks left by hand
+edits: it recomputes a minimum-curvature line that stays within 25 cm of the
+current path, re-snaps every point to the road surface, and refits the editable
+Bezier. Use it after moving control points so the in-game speed profile has no
+local curvature spikes (stray blue patches inside braking zones). It cannot widen
+a corner drawn too tight; regenerate for that. Supports Blender Undo.
+
 At export, samples are projected along **world Z**, choosing the nearest static
 road collision surface above or below the curve within **Surface Search (m)**
 (default 2 m in each direction). Only surface-group meshes in Shared and the

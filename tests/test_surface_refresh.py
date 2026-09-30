@@ -257,6 +257,16 @@ class IdealLineGeometryTests(unittest.TestCase):
         self.assertEqual(offsets, [0.0] * 20)
         self.assertTrue(converged)
 
+    def test_smoothing_corridor_removes_kinks_without_leaving_the_path(self):
+        tolerance = self.api.IDEAL_LINE_SMOOTH_TOLERANCE
+        centers = [(i * 6.0, 0.15 * (-1) ** i, 0.0) for i in range(30)]
+        rights = [(0, 1, 0)] * len(centers)
+        points, offsets, converged = self.api.ideal_optimize_offsets(centers, rights, False, [tolerance] * len(centers))
+        self.assertTrue(converged)
+        self.assertTrue(all(abs(offset) <= tolerance + 1e-9 for offset in offsets))
+        self.assertLess(self.api.ideal_curvature_energy_gradient(points, rights, False)[0],
+                        self.api.ideal_curvature_energy_gradient(centers, rights, False)[0] * 0.01)
+
     def test_circle_uses_wider_radius_instead_of_shorter_tighter_path(self):
         rights = [(math.cos(i * math.tau / 60), math.sin(i * math.tau / 60), 0) for i in range(60)]
         centers = [tuple(v * 50 for v in right) for right in rights]

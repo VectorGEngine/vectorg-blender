@@ -85,6 +85,7 @@ ROUTE_MAX_WIDTH_ERROR = 0.01
 CURVE_SAMPLE_SPACING = 1.0
 IDEAL_LINE_SURFACE_SPACING = 2.0
 IDEAL_LINE_FIT_TOLERANCE = 0.05
+IDEAL_LINE_SMOOTH_TOLERANCE = 0.25
 IDEAL_LINE_MAX_LENGTH_WEIGHT = 0.01
 CURVE_FIT_TOLERANCE = 0.10
 MAP_CURVE_FIT_WIDTH_TOLERANCE = 0.005
@@ -2254,6 +2255,47 @@ def generate_ideal_line(context, layout):
     points, _offsets, converged = ideal_optimize_offsets(centers, rights, closed, [max(0.0, limit - 0.15) for limit in limits],
                                                          energy_gradient=ideal_line_energy(layout.ideal_line_shortest_weight))
     tree = ideal_line_surface_tree(context, layout)
+    data, missed = build_ideal_line_curve(layout, tree, points, frames, closed)
+    warnings = []
+    if not converged:
+        warnings.append("Optimization reached its stopping limit; inspect the suggested line")
+    if missed:
+        warnings.append(f"{missed} points could not be snapped to a road surface; inspect height before export")
+    return data, warnings, converged
+
+
+def smooth_ideal_line(context, layout):
+    """Minimum-curvature line inside a thin corridor around the edited ideal line.
+
+    Returns (curve data, warnings, converged, largest lateral move). Planning
+    spacing and the surface refit match generate_ideal_line, so the result is
+    the same kind of curve the artist started from.
+    """
+    samples, closed = checked_curve_samples(layout.ideal_line, layout.route_type)
+    centers, tilts = ideal_resample([tuple(s["position"]) for s in samples], [s["tilt"] for s in samples], closed)
+    planning = [{"position": Vector(p), "tilt": tilt} for p, tilt in zip(centers, tilts)]
+    cumulative, total = route_distances(planning, closed)
+    frames = route_frames(planning, closed, cumulative, total, Vector((0, 0, 1)))
+    rights = [tuple(frame["up"].cross(frame["forward"]).normalized()) for frame in frames]
+    points, offsets, converged = ideal_optimize_offsets(centers, rights, closed,
+                                                        [IDEAL_LINE_SMOOTH_TOLERANCE] * len(centers))
+    tree = ideal_line_surface_tree(context, layout)
+    if tree is None:
+        raise ValueError("Track has no static road collision meshes to snap onto")
+    data, missed = build_ideal_line_curve(layout, tree, points, frames, closed)
+    warnings = []
+    if not converged:
+        warnings.append("Smoothing reached its stopping limit; inspect the line")
+    if missed:
+        warnings.append(f"{missed} points could not be snapped to a road surface; inspect height before export")
+    return data, warnings, converged, max(map(abs, offsets))
+
+
+def build_ideal_line_curve(layout, tree, points, frames, closed):
+    """Editable Bezier curve data through planning `points`, resampled onto the road.
+
+    Returns (curve data, count of samples that found no surface).
+    """
     planned = []
     for point, frame in zip(points, frames):
         point, _normal, _hit = snap_ideal_point(tree, Vector(point), frame["up"])
@@ -2298,12 +2340,7 @@ def generate_ideal_line(context, layout):
         bp.handle_left_type = bp.handle_right_type = "FREE"
         bp.handle_left, bp.handle_right = left, right
         bp.tilt = signed_angle_around_axis(frame["up"], projected_up(normal, frame["forward"]), frame["forward"])
-    warnings = []
-    if not converged:
-        warnings.append("Optimization reached its stopping limit; inspect the suggested line")
-    if missed:
-        warnings.append(f"{missed} points could not be snapped to a road surface; inspect height before export")
-    return data, warnings, converged
+    return data, missed
 
 
 def map_curve_densify(points, tilts, widths, closed, spacing):
@@ -3938,6 +3975,48 @@ class TRACK_EXPORTER_OT_generate_ideal_line(Operator):
         return {"FINISHED"}
 
 
+class TRACK_EXPORTER_OT_smooth_ideal_line(Operator):
+    bl_idname = "track_exporter.smooth_ideal_line"
+    bl_label = "Smooth Ideal Line"
+    bl_description = (f"Remove kinks from the edited Ideal Line while keeping it within {IDEAL_LINE_SMOOTH_TOLERANCE:g} m "
+                      "of its current path, and put it back on the road surface; replaces its control points (Undo supported)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        layout = active_layout(scene_settings(context))
+        return (context.mode == "OBJECT" and layout is not None and layout.root_object is not None
+                and layout.map_curve is not None and layout.ideal_line is not None)
+
+    def execute(self, context):
+        layout = active_layout(scene_settings(context))
+        if not self.poll(context):
+            self.report({"ERROR"}, "Select a layout with an Ideal Line in Object Mode")
+            return {"CANCELLED"}
+        curve = layout.ideal_line
+        if curve.library or curve.modifiers or curve == layout.map_curve:
+            self.report({"ERROR"}, "Ideal Line must be a local, separate curve with no modifiers")
+            return {"CANCELLED"}
+        try:
+            data, warnings, converged, moved = smooth_ideal_line(context, layout)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        # Swap the datablock so linked curve data on another object is never edited.
+        curve.data = data
+        curve.matrix_world = Matrix.Identity(4)
+        generation = json.loads(curve.get("vectorg_ideal_line_generation") or "{}")
+        generation.update({"smoothed": True, "smoothTolerance": IDEAL_LINE_SMOOTH_TOLERANCE, "smoothConverged": converged})
+        curve["vectorg_ideal_line_generation"] = json.dumps(generation)
+        update_layout_visibility(layout, context)
+        select_only(context, curve)
+        for warning in warnings:
+            self.report({"WARNING"}, warning)
+        self.report({"INFO"}, f"Ideal line smoothed with {len(data.splines[0].bezier_points)} points; "
+                              f"largest lateral move {moved * 100:.0f} cm")
+        return {"FINISHED"}
+
+
 class TRACK_EXPORTER_OT_add_preview_camera(Operator):
     bl_idname = "track_exporter.add_preview_camera"
     bl_label = "Add Render Camera"
@@ -4856,6 +4935,7 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             box.operator("track_exporter.generate_ideal_line", icon="CURVE_BEZCURVE",
                          text="Regenerate Ideal Line" if current.ideal_line else "Generate Ideal Line")
             if current.ideal_line:
+                box.operator("track_exporter.smooth_ideal_line", icon="MOD_SMOOTH")
                 box.label(text="Regenerate replaces edits (Undo available)", icon="INFO")
             box.separator()
             tags = box.row(align=True)
@@ -4916,6 +4996,7 @@ classes = (
     TRACK_EXPORTER_OT_refresh_layout_names,
     TRACK_EXPORTER_OT_rebuild_map_curve,
     TRACK_EXPORTER_OT_generate_ideal_line,
+    TRACK_EXPORTER_OT_smooth_ideal_line,
     TRACK_EXPORTER_OT_add_preview_camera,
     TRACK_EXPORTER_OT_remove_preview_camera,
     TRACK_EXPORTER_OT_setup_preview_scene,
