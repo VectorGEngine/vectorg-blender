@@ -34,6 +34,7 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    FloatVectorProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -119,6 +120,40 @@ TEXTURE_SIZE_ITEMS = (
     ("4096", "4096", "Cap exported track textures to 4096 px on their longest side"),
     ("8192", "8192", "Cap exported track textures to 8192 px on their longest side"),
 )
+LIGHTMAP_UV_NAME = "Lightmap"
+LIGHTMAP_PROPERTY = "vectorg_lightmap"
+# Exported as False on meshes whose Blender shadow visibility is off; the game skips their live shadow.
+CAST_SHADOW_PROPERTY = "vectorg_cast_shadow"
+LIGHTMAP_IMAGE_PROPERTY = "vectorg_lightmap_file"
+LIGHTMAP_DIRECTORY = "lightmaps"
+LIGHTMAP_ATLAS_SIZE_ITEMS = (
+    ("2048", "2048", "Bake 2048 x 2048 px lightmap atlases"),
+    ("4096", "4096", "Bake 4096 x 4096 px lightmap atlases"),
+)
+DEFAULT_LIGHTMAP_ATLAS_SIZE = 4096
+DEFAULT_LIGHTMAP_TEXEL_SIZE = 0.25
+DEFAULT_LIGHTMAP_SAMPLES = 256
+# Share of an atlas that packed charts fill after margins and packing gaps; measured 0.28 for
+# a track's mixed road and props, 0.5-0.7 for large terrain.
+LIGHTMAP_PACK_EFFICIENCY = 0.3
+LIGHTMAP_PACK_MARGIN_PIXELS = 8
+LIGHTMAP_MIN_ATLAS_SIZE = 512
+# Lightmap UV islands are cut into world-space cells this many texels wide before packing.
+LIGHTMAP_CHART_PIXELS = 256
+LIGHTMAP_BAKE_MARGIN_PIXELS = 4
+LIGHTMAP_AO_DISTANCE = 5.0
+# Sun strength while baking, so emissive materials add negligible direct light.
+LIGHTMAP_BAKE_SUN_STRENGTH = 1000.0
+# Texels whose surface is less opaque than this are holes (fence gaps).
+LIGHTMAP_MIN_COVERAGE = 0.05
+LIGHTMAP_SMART_PROJECT_ANGLE = math.radians(66.0)
+LIGHTMAP_SUN_TOLERANCE = math.radians(0.05)
+# three.js reads at most four UV sets; the lightmap takes the last one.
+LIGHTMAP_MAX_UV_MAPS = 4
+# Marks Preview Lightmaps materials; on a mesh, holds its material slots as they were before.
+LIGHTMAP_PREVIEW_PROPERTY = "vectorg_lightmap_preview"
+# Preview Lightmaps brightness in full baked sun shadow, so ambient occlusion stays visible there.
+LIGHTMAP_PREVIEW_SHADOW_LEVEL = 0.4
 SURFACE_IDS = (
     "tarmac",
     "concrete",
@@ -487,11 +522,11 @@ def update_curve_lengths(_scene, depsgraph):
 
 
 def update_layout_visibility(layout, _context):
+    """Viewport visibility only; each object's render visibility stays as the user set it."""
     if layout.root_object:
         hidden = not layout.visible
         for obj in [layout.root_object, *descendants(layout.root_object)]:
             obj.hide_set(hidden)
-            obj.hide_render = hidden
 
 
 def create_layout_hierarchy(context, track_root, layout_id):
@@ -672,6 +707,20 @@ def apply_dynamic_target_export_names(settings):
         restore_dynamic_target_export_names(target_names, collider_targets)
         raise
     return target_names, collider_targets
+
+
+def apply_shadow_casting_export_flags(export_objects):
+    """Tags meshes with Object > Visibility > Ray Visibility > Shadow off; returns them for restore."""
+    tagged = [obj for obj in export_objects if obj.type == "MESH" and not obj.visible_shadow]
+    for obj in tagged:
+        obj[CAST_SHADOW_PROPERTY] = False
+    return tagged
+
+
+def restore_shadow_casting_export_flags(tagged):
+    for obj in tagged:
+        if obj.name in bpy.data.objects and CAST_SHADOW_PROPERTY in obj:
+            del obj[CAST_SHADOW_PROPERTY]
 
 
 def restore_dynamic_target_export_names(target_names, collider_targets):
@@ -2597,6 +2646,9 @@ def build_manifest(settings):
         config["hdr"] = "hdr/env" + image_source_extension(settings.hdr_image)
     if settings.preview_image:
         config["preview"] = "preview.jpg"
+    if lightmaps_baked(settings):
+        config["lightmaps"] = sorted(baked_lightmap_images())
+        config["sun"] = {"direction": list(settings.lightmap_sun_direction)}
     return config
 
 
@@ -2858,10 +2910,23 @@ def remove_preview_object(obj):
         bpy.data.objects.remove(group, do_unlink=True)
 
 
+def preview_sun(context):
+    """The sun lamp in the PREVIEW group, if one exists."""
+    group = preview_group(context)
+    if not group:
+        return None
+    return next((obj for obj in group.children if obj.get(ROLE_PROPERTY) == ROLE_PREVIEW_SUN), None)
+
+
+def sun_toward_direction(sun):
+    """Unit world-space direction toward a sun lamp, which shines along its local -Z axis."""
+    return (sun.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+
+
 def ensure_preview_sun(context, settings):
     """Sun lamp in the PREVIEW group; an existing one is kept as edited."""
     group = ensure_preview_group(context)
-    existing = next((obj for obj in group.children if obj.get(ROLE_PROPERTY) == ROLE_PREVIEW_SUN), None)
+    existing = preview_sun(context)
     if existing:
         return existing, False
     data = bpy.data.lights.new(f"{settings.track_id}_preview_sun", "SUN")
@@ -3072,6 +3137,7 @@ def start_preview_render(context, settings, layout):
     global _preview_render_job
     if _preview_render_job is not None or bpy.app.is_job_running("RENDER"):
         raise RuntimeError("A render is already running")
+    turn_off_lightmap_preview(settings)
     restores = prepare_preview_render(context, settings, layout)
     _preview_render_job = {"scene": context.scene.name, "restores": restores}
     bpy.app.handlers.render_complete.append(preview_render_complete)
@@ -3128,6 +3194,1043 @@ def write_preview_jpeg(image, filepath, quality):
         copy.save(quality=quality)
     finally:
         bpy.data.images.remove(copy)
+
+
+def lightmap_scopes(settings):
+    """(file prefix, visuals root, layout) for Shared and every layout; each bakes into its own atlases."""
+    scopes = []
+    shared_visuals = object_with_role(settings.shared_root_object, ROLE_VISUALS)
+    if shared_visuals:
+        scopes.append(("shared", shared_visuals, None))
+    for layout in settings.layouts:
+        visuals = object_with_role(layout.root_object, ROLE_VISUALS) if layout.root_object else None
+        if visuals:
+            scopes.append((f"layout_{layout.layout_id}", visuals, layout))
+    return scopes
+
+
+def lightmap_receivers(context, settings):
+    """Meshes under each scope's PBR root that get a lightmap.
+
+    Returns (scopes, skipped, errors): scopes are (prefix, layout, receivers); skipped are
+    linked duplicates, whose shared mesh data cannot hold one unique lightmap UV map.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    scopes, skipped, errors = [], [], []
+    for prefix, visuals, layout in lightmap_scopes(settings):
+        pbr = direct_child_with_role(visuals, ROLE_PBR)
+        receivers = []
+        for obj in hierarchy_descendants(pbr):
+            if obj.type != "MESH" or not obj.data.polygons:
+                continue
+            if obj.data.users > 1:
+                skipped.append(obj)
+                continue
+            other_uv_maps = len([layer for layer in obj.data.uv_layers if layer.name != LIGHTMAP_UV_NAME])
+            if other_uv_maps >= LIGHTMAP_MAX_UV_MAPS:
+                errors.append(
+                    f"{obj.name} has {other_uv_maps} UV maps; remove one so the lightmap fits in the "
+                    f"{LIGHTMAP_MAX_UV_MAPS} UV sets the game reads"
+                )
+            evaluated = obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated.to_mesh()
+            try:
+                # Generated geometry would repeat the lightmap UVs of its source faces.
+                if len(evaluated_mesh.loops) != len(obj.data.loops):
+                    errors.append(f"{obj.name}: apply modifiers that add or remove geometry before baking")
+            finally:
+                evaluated.to_mesh_clear()
+            receivers.append(obj)
+        if receivers:
+            scopes.append((prefix, layout, receivers))
+    return scopes, skipped, errors
+
+
+def mesh_triangles(obj):
+    """World-space triangle corners and their loop indices."""
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    count = len(mesh.loop_triangles)
+    vertices = np.empty(count * 3, dtype=np.int32)
+    loops = np.empty(count * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", vertices)
+    mesh.loop_triangles.foreach_get("loops", loops)
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coordinates)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world = coordinates.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    return world[vertices.reshape(-1, 3)], loops.reshape(-1, 3)
+
+
+def world_surface_area(obj):
+    corners, _loops = mesh_triangles(obj)
+    edges = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    return float(0.5 * np.linalg.norm(edges, axis=1).sum())
+
+
+def uv_layer_coordinates(layer):
+    coordinates = np.empty(len(layer.uv) * 2, dtype=np.float64)
+    layer.uv.foreach_get("vector", coordinates)
+    return coordinates.reshape(-1, 2)
+
+
+def uv_surface_area(obj, layer):
+    _corners, loops = mesh_triangles(obj)
+    uv = uv_layer_coordinates(layer)[loops]
+    first, second = uv[:, 1] - uv[:, 0], uv[:, 2] - uv[:, 0]
+    return float(0.5 * np.abs(first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]).sum())
+
+
+def lightmap_atlas_capacity(size, texel_size):
+    """World area in m² one atlas holds at the texel size."""
+    return LIGHTMAP_PACK_EFFICIENCY * (size * texel_size) ** 2
+
+
+def lightmap_atlas_size_for(area, texel_size, max_size):
+    """Smallest power-of-two atlas, up to max_size, that holds the area at the texel size."""
+    size = LIGHTMAP_MIN_ATLAS_SIZE
+    while size < max_size and lightmap_atlas_capacity(size, texel_size) < area:
+        size *= 2
+    return size
+
+
+def lightmap_atlas_groups(items, texel_size, atlas_size):
+    """Split (key, world area m², center) items into (keys, atlas size px) atlases at the texel size.
+
+    An item larger than one atlas gets an atlas of its own at the finest texel size that fits.
+    The rest fill atlases in order along the wider horizontal extent, so neighbouring objects
+    share an atlas; the last, partly filled atlas shrinks to the smallest size that holds it.
+    """
+    items = [item for item in items if item[1] > 0.0]
+    capacity = lightmap_atlas_capacity(atlas_size, texel_size)
+    oversized = sorted((item for item in items if item[1] > capacity), key=lambda item: str(item[0]))
+    rest = [item for item in items if item[1] <= capacity]
+    groups = []
+    if rest:
+        spans = [
+            max(center[axis] for _key, _area, center in rest) - min(center[axis] for _key, _area, center in rest)
+            for axis in (0, 1)
+        ]
+        axis = 0 if spans[0] >= spans[1] else 1
+        keys, filled = [], 0.0
+        for key, area, _center in sorted(rest, key=lambda item: (item[2][axis], str(item[0]))):
+            if keys and filled + area > capacity:
+                groups.append((keys, lightmap_atlas_size_for(filled, texel_size, atlas_size)))
+                keys, filled = [], 0.0
+            keys.append(key)
+            filled += area
+        groups.append((keys, lightmap_atlas_size_for(filled, texel_size, atlas_size)))
+    groups.extend(([key], atlas_size) for key, _area, _center in oversized)
+    return groups
+
+
+def mesh_loop_faces(mesh):
+    """Per loop: its face and the next loop around that face."""
+    loop_count = len(mesh.loops)
+    starts = np.empty(len(mesh.polygons), dtype=np.int64)
+    totals = np.empty(len(mesh.polygons), dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    order = np.argsort(starts)
+    faces = np.repeat(order, totals[order])
+    following = np.arange(1, loop_count + 1, dtype=np.int64)
+    following[starts + totals - 1] = starts
+    return faces, following
+
+
+def uv_face_islands(mesh, uv):
+    """Face island labels of a UV layout and the total length of its island borders.
+
+    Two faces join when they share an edge with matching UVs; loose mesh parts are separate islands.
+    """
+    loop_faces, following = mesh_loop_faces(mesh)
+    edges = np.empty(len(mesh.loops), dtype=np.int64)
+    mesh.loops.foreach_get("edge_index", edges)
+    order = np.argsort(edges, kind="stable")
+    paired = np.where(edges[order][:-1] == edges[order][1:])[0]
+    first, second = order[paired], order[paired + 1]
+    # Opposite loops traverse the edge in reverse; shared UVs match crosswise.
+    shared = (
+        np.all(np.abs(uv[first] - uv[following[second]]) < 1e-5, axis=1)
+        & np.all(np.abs(uv[following[first]] - uv[second]) < 1e-5, axis=1)
+    )
+    boundary = np.ones(len(edges), dtype=bool)
+    boundary[first[shared]] = False
+    boundary[second[shared]] = False
+    length = float(np.linalg.norm(uv[following[boundary]] - uv[boundary], axis=1).sum())
+    a, b = loop_faces[first[shared]], loop_faces[second[shared]]
+    labels = np.arange(len(mesh.polygons), dtype=np.int64)
+    # Connected components: hook both roots to the smaller label, then compress paths.
+    while True:
+        low = np.minimum(labels[a], labels[b])
+        updated = labels.copy()
+        for targets in (a, b, labels[a], labels[b]):
+            np.minimum.at(updated, targets, low)
+        while True:
+            jumped = updated[updated]
+            if np.array_equal(jumped, updated):
+                break
+            updated = jumped
+        if np.array_equal(updated, labels):
+            return labels, length
+        labels = updated
+
+
+def box_projection(obj):
+    """Loop UVs in metres projected on the world plane each face's normal faces most, and face chart keys."""
+    mesh = obj.data
+    loop_faces, _following = mesh_loop_faces(mesh)
+    count = len(mesh.polygons)
+    normals = np.empty(count * 3, dtype=np.float64)
+    mesh.polygons.foreach_get("normal", normals)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world_normals = normals.reshape(-1, 3) @ np.linalg.inv(matrix[:3, :3])
+    axes = np.argmax(np.abs(world_normals), axis=1)
+    # Opposite-facing faces project onto the same plane; they are separate charts.
+    keys = axes * 2 + (world_normals[np.arange(count), axes] > 0)
+    vertices = np.empty(len(mesh.loops), dtype=np.int64)
+    mesh.loops.foreach_get("vertex_index", vertices)
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coordinates)
+    points = (coordinates.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3])[vertices]
+    planes = np.array(((1, 2), (0, 2), (0, 1)))[axes[loop_faces]]
+    rows = np.arange(len(points))
+    return np.stack((points[rows, planes[:, 0]], points[rows, planes[:, 1]]), axis=1), keys
+
+
+def face_cells(obj, chart_size):
+    """Per face: an id of the world-space cell of chart_size metres that holds its center."""
+    mesh = obj.data
+    centers = np.empty(len(mesh.polygons) * 3, dtype=np.float64)
+    mesh.polygons.foreach_get("center", centers)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world = centers.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    return np.floor(world / chart_size).astype(np.int64)
+
+
+def shelf_pack(widths, heights, size):
+    """Place rectangles, tallest first, in rows across a size x size square; None when they overflow."""
+    order = np.argsort(-heights, kind="stable")
+    positions = np.empty((len(widths), 2), dtype=np.float64)
+    x = y = row = 0.0
+    for index in order:
+        width, height = widths[index], heights[index]
+        if width > size:
+            return None
+        if x + width > size:
+            y += row
+            x = row = 0.0
+        if y + height > size:
+            return None
+        positions[index] = (x, y)
+        x += width
+        row = max(row, height)
+    return positions
+
+
+def pack_lightmap_charts(extents, atlas_size, padding):
+    """Pixels per metre and pixel positions that fit (width m, height m) charts, each padded, in the atlas.
+
+    The scale is the largest one at which the rows still fit, found by bisection.
+    """
+    low, high = 0.0, 1.0
+    while shelf_pack(extents[:, 0] * high + 2 * padding, extents[:, 1] * high + 2 * padding, atlas_size) is not None:
+        low, high = high, high * 2.0
+    for _ in range(24):
+        middle = (low + high) * 0.5
+        if shelf_pack(extents[:, 0] * middle + 2 * padding, extents[:, 1] * middle + 2 * padding, atlas_size) is None:
+            high = middle
+        else:
+            low = middle
+    if low <= 0.0:
+        raise RuntimeError("Lightmap charts do not fit their atlas")
+    positions = shelf_pack(extents[:, 0] * low + 2 * padding, extents[:, 1] * low + 2 * padding, atlas_size)
+    return low, positions
+
+
+def ensure_lightmap_uv_layer(mesh):
+    """A fresh Lightmap UV map in the last slot; glTF writes it as the mesh's last TEXCOORD set."""
+    layers = mesh.uv_layers
+    existing = layers.get(LIGHTMAP_UV_NAME)
+    if existing:
+        layers.remove(existing)
+    render_layer = next((layer.name for layer in layers if layer.active_render), None)
+    lightmap = layers.new(name=LIGHTMAP_UV_NAME, do_init=False)
+    if render_layer:
+        layers[render_layer].active_render = True
+    return lightmap
+
+
+def lightmap_image_file(prefix, index):
+    return f"{LIGHTMAP_DIRECTORY}/{prefix}_{index}.png"
+
+
+def baked_lightmap_images():
+    """Baked atlas images keyed by their package file path."""
+    return {
+        image[LIGHTMAP_IMAGE_PROPERTY]: image
+        for image in bpy.data.images
+        if isinstance(image.get(LIGHTMAP_IMAGE_PROPERTY), str)
+    }
+
+
+def lightmaps_baked(settings):
+    return any(settings.lightmap_sun_direction) and bool(baked_lightmap_images())
+
+
+def track_objects(settings):
+    track_root = settings.track_root_object
+    return [track_root, *descendants(track_root)] if track_root else []
+
+
+def remove_lightmap_uv_layer(obj):
+    if obj.type == "MESH":
+        layer = obj.data.uv_layers.get(LIGHTMAP_UV_NAME)
+        if layer:
+            obj.data.uv_layers.remove(layer)
+
+
+def clear_lightmap_results(settings):
+    """Remove baked atlases, lightmap references, and the baked sun; Lightmap UV maps stay."""
+    for image in list(baked_lightmap_images().values()):
+        bpy.data.images.remove(image)
+    for obj in track_objects(settings):
+        if LIGHTMAP_PROPERTY in obj:
+            del obj[LIGHTMAP_PROPERTY]
+    settings.lightmap_sun_direction = (0.0, 0.0, 0.0)
+
+
+def lightmap_preview_material(image):
+    """Unlit white darkened by an atlas's ambient occlusion and sun shadow; plain white without an atlas."""
+    material = bpy.data.materials.new(
+        f"vectorg_lightmap_preview_{image.name}" if image else "vectorg_lightmap_preview_white"
+    )
+    material[LIGHTMAP_PREVIEW_PROPERTY] = True
+    material.use_nodes = True
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    emission = nodes.new("ShaderNodeEmission")
+    links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    if image:
+        uv_map = nodes.new("ShaderNodeUVMap")
+        uv_map.uv_map = LIGHTMAP_UV_NAME
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = image
+        links.new(uv_map.outputs["UV"], texture.inputs["Vector"])
+        channels = nodes.new("ShaderNodeSeparateColor")
+        links.new(texture.outputs["Color"], channels.inputs["Color"])
+        sun = nodes.new("ShaderNodeMath")
+        sun.operation = "MULTIPLY_ADD"
+        links.new(channels.outputs["Green"], sun.inputs[0])
+        sun.inputs[1].default_value = 1.0 - LIGHTMAP_PREVIEW_SHADOW_LEVEL
+        sun.inputs[2].default_value = LIGHTMAP_PREVIEW_SHADOW_LEVEL
+        shade = nodes.new("ShaderNodeMath")
+        shade.operation = "MULTIPLY"
+        links.new(channels.outputs["Red"], shade.inputs[0])
+        links.new(sun.outputs["Value"], shade.inputs[1])
+        links.new(shade.outputs["Value"], emission.inputs["Color"])
+    return material
+
+
+def show_lightmap_preview_materials(scene):
+    """Show every mesh of the scene with a lightmap preview material in object-linked slots.
+
+    The mesh keeps its own materials; each slot's link and object material are stored on the object
+    and restored by restore_lightmap_preview_materials.
+    """
+    images = baked_lightmap_images()
+    materials = {}
+
+    def preview_material(image):
+        if image not in materials:
+            materials[image] = lightmap_preview_material(image)
+        return materials[image]
+
+    for obj in scene.objects:
+        if obj.type != "MESH" or not obj.material_slots or LIGHTMAP_PREVIEW_PROPERTY in obj:
+            continue
+        material = preview_material(images.get(obj.get(LIGHTMAP_PROPERTY)))
+        slots = []
+        for slot in obj.material_slots:
+            link = slot.link
+            slot.link = "OBJECT"
+            slots.append([link, slot.material.name if slot.material else None])
+            slot.material = material
+        obj[LIGHTMAP_PREVIEW_PROPERTY] = json.dumps(slots)
+
+
+def restore_lightmap_preview_materials():
+    for obj in bpy.data.objects:
+        record = obj.get(LIGHTMAP_PREVIEW_PROPERTY)
+        if record is None:
+            continue
+        for slot, (link, name) in zip(obj.material_slots, json.loads(record)):
+            slot.link = "OBJECT"
+            slot.material = bpy.data.materials.get(name) if name else None
+            slot.link = link
+        del obj[LIGHTMAP_PREVIEW_PROPERTY]
+    for material in [material for material in bpy.data.materials if material.get(LIGHTMAP_PREVIEW_PROPERTY)]:
+        bpy.data.materials.remove(material)
+
+
+def update_lightmap_preview(settings, _context):
+    if settings.lightmap_preview:
+        show_lightmap_preview_materials(settings.id_data)
+    else:
+        restore_lightmap_preview_materials()
+
+
+def turn_off_lightmap_preview(settings):
+    """Bakes, exports, and preview renders need the real materials."""
+    if settings.lightmap_preview:
+        settings.lightmap_preview = False
+
+
+def clear_lightmaps(settings):
+    """Remove the bake results and every Lightmap UV map from the track."""
+    turn_off_lightmap_preview(settings)
+    clear_lightmap_results(settings)
+    for obj in track_objects(settings):
+        remove_lightmap_uv_layer(obj)
+    settings.lightmap_unwrap_state = ""
+
+
+def lightmap_unwrap_entry(objects, areas, atlas_size, texel_size):
+    """What an atlas unwrap depends on: settings, members, and each member's topology and world area."""
+    return {
+        "atlasSize": atlas_size,
+        "texelSize": round(texel_size, 6),
+        "objects": {
+            obj.name: [len(obj.data.vertices), len(obj.data.loops), round(areas[obj], 3)]
+            for obj in objects
+        },
+    }
+
+
+def lightmap_unwrap_current(entry, stored, objects):
+    """True when an atlas's stored unwrap still matches and every member keeps its Lightmap UV map last."""
+    return (
+        stored is not None
+        and {key: value for key, value in stored.items() if key != "texel"} == entry
+        and all(obj.data.uv_layers.find(LIGHTMAP_UV_NAME) == len(obj.data.uv_layers) - 1 for obj in objects)
+    )
+
+
+def validate_lightmaps(context, settings, errors):
+    """A baked track must still match the bake: receivers, UV slots, atlases, and sun."""
+    images = baked_lightmap_images()
+    track_root = settings.track_root_object
+    tagged = {obj for obj in [track_root, *descendants(track_root)] if obj.get(LIGHTMAP_PROPERTY)} if track_root else set()
+    if not images and not tagged and not any(settings.lightmap_sun_direction):
+        return
+    scopes, _skipped, receiver_errors = lightmap_receivers(context, settings)
+    errors.extend(receiver_errors)
+    receivers = {obj for _prefix, _layout, objects in scopes for obj in objects}
+    for obj in sorted(receivers, key=lambda item: item.name):
+        layers = obj.data.uv_layers
+        if (
+            obj.get(LIGHTMAP_PROPERTY) not in images
+            or layers.find(LIGHTMAP_UV_NAME) != len(layers) - 1
+        ):
+            errors.append(f"{obj.name} has no current lightmap; click Bake Shadows")
+    for obj in sorted(tagged - receivers, key=lambda item: item.name):
+        errors.append(f"{obj.name} is no longer a lightmap receiver; click Bake Shadows")
+    sun = preview_sun(context)
+    if not any(settings.lightmap_sun_direction):
+        errors.append("Lightmaps have no baked sun direction; click Bake Shadows")
+    elif sun is None or sun.type != "LIGHT":
+        errors.append("The preview sun used by the lightmap bake is missing; click Bake Shadows")
+    else:
+        baked = Vector(settings.lightmap_sun_direction).normalized()
+        current = Vector(game_vector(sun_toward_direction(sun))).normalized()
+        if baked.dot(current) < math.cos(LIGHTMAP_SUN_TOLERANCE):
+            errors.append("The preview sun moved since the lightmap bake; click Bake Shadows")
+
+
+def write_lightmap_png(image, filepath):
+    copy = duplicate_image_with_data(image)
+    try:
+        copy.filepath_raw = str(filepath)
+        copy.file_format = "PNG"
+        copy.save()
+    finally:
+        bpy.data.images.remove(copy)
+
+
+class LightmapBakeState:
+    """Scene, object, and material changes made for a bake, restored in reverse order."""
+
+    def __init__(self):
+        self.restores = []
+        self.bake_nodes = {}
+        self.temp_material = None
+
+    def assign(self, owner, attribute, value):
+        previous = getattr(owner, attribute)
+        self.restores.append(lambda: setattr(owner, attribute, previous))
+        setattr(owner, attribute, value)
+
+    def restore(self):
+        for restore in reversed(self.restores):
+            try:
+                restore()
+            except ReferenceError:
+                pass
+        self.restores.clear()
+
+    def bake_material(self):
+        if self.temp_material is None:
+            material = bpy.data.materials.new("vectorg_lightmap_bake")
+            material.use_nodes = True
+            self.temp_material = material
+            self.restores.append(lambda: bpy.data.materials.remove(material))
+        return self.temp_material
+
+    def bake_node(self, material):
+        """An unlinked image node, active in the material, that receives the bake."""
+        node = self.bake_nodes.get(material)
+        if node:
+            return node
+        if not material.use_nodes:
+            self.assign(material, "use_nodes", True)
+        nodes = material.node_tree.nodes
+        previous_active = nodes.active
+        node = nodes.new("ShaderNodeTexImage")
+        node.name = "vectorg_lightmap_bake"
+
+        def remove_node():
+            nodes.remove(node)
+            if previous_active:
+                nodes.active = previous_active
+
+        self.restores.append(remove_node)
+        nodes.active = node
+        self.bake_nodes[material] = node
+        return node
+
+    def attach_bake_image(self, obj, image):
+        """Bake into image through every material of obj, whose slots all hold a material."""
+        for slot in obj.material_slots:
+            self.bake_node(slot.material).image = image
+
+
+def cycles_bake_device():
+    preferences = bpy.context.preferences.addons.get("cycles")
+    if preferences and preferences.preferences.has_active_device():
+        return "GPU"
+    return "CPU"
+
+
+def prepare_lightmap_scene(context, settings, state, sun):
+    scene = context.scene
+    state.assign(scene.render, "engine", "CYCLES")
+    state.assign(scene.cycles, "device", cycles_bake_device())
+    state.assign(scene.cycles, "samples", settings.lightmap_samples)
+    # A black world: the sun passes see only the sun, and the world sets the AO distance.
+    world = bpy.data.worlds.new("vectorg_lightmap_bake")
+    world.use_nodes = False
+    world.color = (0.0, 0.0, 0.0)
+    world.light_settings.distance = LIGHTMAP_AO_DISTANCE
+    state.assign(scene, "world", world)
+    state.restores.append(lambda: bpy.data.worlds.remove(world))
+    state.assign(sun.data, "energy", LIGHTMAP_BAKE_SUN_STRENGTH)
+    state.assign(sun.data, "use_shadow", True)
+    for obj in scene.objects:
+        state.assign(obj, "hide_render", obj.hide_render)
+    for collection in bpy.data.collections:
+        state.assign(collection, "hide_render", collection.hide_render)
+    selected_before = list(context.selected_objects)
+    active_before = context.view_layer.objects.active
+
+    def restore_selection():
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        for obj in selected_before:
+            if obj.name in context.view_layer.objects:
+                obj.select_set(True)
+        if active_before and active_before.name in context.view_layer.objects:
+            context.view_layer.objects.active = active_before
+
+    state.restores.append(restore_selection)
+
+
+def show_lightmap_scope(context, settings, layout, sun):
+    """Render the scope's casters lit by the preview sun alone."""
+    rendered = {
+        obj for obj in preview_render_objects(context, settings, layout)
+        if obj.type != "LIGHT" or obj == sun
+    }
+    for obj in context.scene.objects:
+        obj.hide_render = obj not in rendered
+    for collection in {collection for obj in rendered for collection in obj.users_collection}:
+        if collection != context.scene.collection:
+            collection.hide_render = False
+
+
+def select_lightmap_objects(context, state, objects):
+    for obj in objects:
+        if obj.name not in context.view_layer.objects:
+            raise RuntimeError(f"{obj.name} is excluded from the active view layer")
+        if obj.hide_get():
+            state.restores.append(lambda obj=obj: obj.hide_set(True))
+            obj.hide_set(False)
+        if obj.hide_viewport:
+            state.assign(obj, "hide_viewport", False)
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for obj in objects:
+        obj.select_set(True)
+    context.view_layer.objects.active = objects[0]
+
+
+def unwrap_lightmap_atlas(context, state, objects, areas, atlas_size, texel_size):
+    """Lightmap UVs for one atlas at equal world-space texel density; returns the achieved texel size in m."""
+    hidden_faces = {}
+    for obj in objects:
+        mesh = obj.data
+        active = mesh.uv_layers.active
+        active_name = active.name if active and active.name != LIGHTMAP_UV_NAME else None
+        mesh.uv_layers.active = ensure_lightmap_uv_layer(mesh)
+        state.restores.append(lambda mesh=mesh, name=active_name: setattr(
+            mesh.uv_layers, "active", mesh.uv_layers[name] if name else mesh.uv_layers[0],
+        ))
+        hidden = np.empty(len(mesh.polygons), dtype=bool)
+        mesh.polygons.foreach_get("hide", hidden)
+        if hidden.any():
+            hidden_faces[mesh] = hidden
+    select_lightmap_objects(context, state, objects)
+
+    def edit(operation):
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bpy.ops.mesh.reveal(select=False)
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.select_all(action="SELECT")
+            operation()
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+    edit(lambda: bpy.ops.uv.smart_project(
+        angle_limit=LIGHTMAP_SMART_PROJECT_ANGLE,
+        island_margin=0.0,
+        area_weight=0.0,
+        correct_aspect=True,
+        scale_to_bounds=False,
+    ))
+    for mesh, hidden in hidden_faces.items():
+        mesh.polygons.foreach_set("hide", hidden)
+        mesh.update()
+
+    # Charts: Smart UV Project islands cut at world-space cells, in metres. A coplanar road or
+    # kerb loop is one ring-shaped island; cells cut it into pieces that pack densely.
+    padding = LIGHTMAP_PACK_MARGIN_PIXELS * 0.5
+    layouts = []
+    chart_count = 0
+    for obj in objects:
+        mesh = obj.data
+        layer = mesh.uv_layers[LIGHTMAP_UV_NAME]
+        uv = uv_layer_coordinates(layer)
+        uv_area = uv_surface_area(obj, layer)
+        if uv_area > 0.0:
+            uv *= math.sqrt(areas[obj] / uv_area)
+        labels, boundary = uv_face_islands(mesh, uv)
+        # Curved high-poly props shred into thousands of islands, and loose parts are islands of
+        # their own; when their margins outgrow the object, six planar charts replace them.
+        if boundary * padding * texel_size > areas[obj]:
+            uv, labels = box_projection(obj)
+        keys = np.column_stack((labels, face_cells(obj, LIGHTMAP_CHART_PIXELS * texel_size)))
+        _unique, face_charts = np.unique(keys, axis=0, return_inverse=True)
+        face_charts = face_charts.ravel()
+        loop_faces, _following = mesh_loop_faces(mesh)
+        layouts.append((layer, uv, face_charts[loop_faces] + chart_count))
+        chart_count += int(face_charts.max()) + 1
+    # Turn each chart to its principal axes, so diagonal road pieces get tight rectangles.
+    sums = np.zeros((chart_count, 6))
+    for _layer, uv, charts in layouts:
+        for column, values in enumerate((np.ones(len(uv)), uv[:, 0], uv[:, 1], uv[:, 0] ** 2, uv[:, 1] ** 2, uv[:, 0] * uv[:, 1])):
+            np.add.at(sums[:, column], charts, values)
+    count = np.maximum(sums[:, 0], 1.0)
+    mean_u, mean_v = sums[:, 1] / count, sums[:, 2] / count
+    angles = 0.5 * np.arctan2(
+        2.0 * (sums[:, 5] / count - mean_u * mean_v),
+        (sums[:, 3] / count - mean_u ** 2) - (sums[:, 4] / count - mean_v ** 2),
+    )
+    # Keep the principal turn only where it gives a smaller rectangle than the chart as projected.
+    box_areas = []
+    for chart_angles in (np.zeros(chart_count), angles):
+        cosines, sines = np.cos(chart_angles), np.sin(chart_angles)
+        lows = np.full((chart_count, 2), np.inf)
+        highs = np.full((chart_count, 2), -np.inf)
+        for _layer, uv, charts in layouts:
+            u, v = uv[:, 0] - mean_u[charts], uv[:, 1] - mean_v[charts]
+            turned = np.stack((u * cosines[charts] + v * sines[charts], v * cosines[charts] - u * sines[charts]), axis=1)
+            for axis in (0, 1):
+                np.minimum.at(lows[:, axis], charts, turned[:, axis])
+                np.maximum.at(highs[:, axis], charts, turned[:, axis])
+        box_areas.append(np.prod(highs - lows, axis=1))
+    angles = np.where(box_areas[1] < box_areas[0], angles, 0.0)
+    cosines, sines = np.cos(angles), np.sin(angles)
+    for index, (layer, uv, charts) in enumerate(layouts):
+        u, v = uv[:, 0] - mean_u[charts], uv[:, 1] - mean_v[charts]
+        cosine, sine = cosines[charts], sines[charts]
+        layouts[index] = (layer, np.stack((u * cosine + v * sine, v * cosine - u * sine), axis=1), charts)
+    lows = np.full((chart_count, 2), np.inf)
+    highs = np.full((chart_count, 2), -np.inf)
+    for _layer, uv, charts in layouts:
+        for axis in (0, 1):
+            np.minimum.at(lows[:, axis], charts, uv[:, axis])
+            np.maximum.at(highs[:, axis], charts, uv[:, axis])
+    extents = highs - lows
+    # Lay every chart wide, so rows of the shelf packing stay low.
+    rotated = extents[:, 1] > extents[:, 0]
+    extents[rotated] = extents[rotated][:, ::-1]
+    scale, positions = pack_lightmap_charts(extents, atlas_size, padding)
+    for layer, uv, charts in layouts:
+        local = uv - lows[charts]
+        turned = rotated[charts]
+        local[turned] = local[turned][:, ::-1]
+        pixels = positions[charts] + padding + local * scale
+        layer.uv.foreach_set("vector", (pixels / atlas_size).ravel())
+        # Tag the mesh so its evaluated copies (the bake proxies) see the new UVs.
+        layer.id_data.update()
+    return 1.0 / scale
+
+
+def lightmap_bake_proxies(context, state, objects):
+    """Temporary meshes joining an atlas's receivers as evaluated, with their materials.
+
+    Cycles repeats its scene setup for every selected object, so baking hundreds of objects
+    one by one costs seconds each; joined objects bake the atlas in one pass. Receivers whose
+    Shadow ray visibility is off, such as skid marks and painted lines just above the road,
+    join a proxy of their own that keeps it off, so they cast nothing.
+    """
+    groups = {}
+    for obj in objects:
+        groups.setdefault(obj.visible_shadow, []).append(obj)
+    proxies = []
+    for casts_shadow, members in groups.items():
+        proxy = lightmap_bake_proxy(context, state, members)
+        proxy.visible_shadow = casts_shadow
+        proxies.append(proxy)
+    return proxies
+
+
+def lightmap_bake_proxy(context, state, objects):
+    """One temporary mesh joining receivers as evaluated, with their materials."""
+    depsgraph = context.evaluated_depsgraph_get()
+    proxies = []
+    for obj in objects:
+        mesh = bpy.data.meshes.new_from_object(
+            obj.evaluated_get(depsgraph), preserve_all_data_layers=True, depsgraph=depsgraph,
+        )
+        # Object-linked slots are not part of the mesh; bake with the materials the object shows.
+        for index, slot in enumerate(obj.material_slots[:len(mesh.materials)]):
+            mesh.materials[index] = slot.material
+        proxy = bpy.data.objects.new(f"vectorg_lightmap_bake_{obj.name}", mesh)
+        proxy.matrix_world = obj.matrix_world
+        context.scene.collection.objects.link(proxy)
+        proxies.append(proxy)
+    meshes = [proxy.data for proxy in proxies]
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for proxy in proxies:
+        proxy.select_set(True)
+    context.view_layer.objects.active = proxies[0]
+    if len(proxies) > 1:
+        bpy.ops.object.join()
+    joined = context.view_layer.objects.active
+    for mesh in meshes:
+        if mesh != joined.data and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    # Faces without a material bake with the plain bake material. The proxy is deleted after the
+    # bake, so its slots are filled here rather than through restorable state.
+    if not joined.material_slots:
+        joined.data.materials.append(state.bake_material())
+    for slot in joined.material_slots:
+        if slot.material is None:
+            slot.material = state.bake_material()
+    return joined
+
+
+def remove_lightmap_bake_proxy(proxy):
+    mesh = proxy.data
+    bpy.data.objects.remove(proxy, do_unlink=True)
+    if mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def bake_lightmap_pass(bake_type, image, pass_filter=frozenset()):
+    """One Cycles bake pass into the attached image.
+
+    Returns its first channel and a mask of the texels the bake wrote: charts plus their margin.
+    The image starts at -1, which a bake never writes, so untouched texels stay recognizable.
+    """
+    image.pixels.foreach_set(np.full(len(image.pixels), -1.0, dtype=np.float32))
+    result = bpy.ops.object.bake(
+        type=bake_type,
+        pass_filter=set(pass_filter),
+        margin=LIGHTMAP_BAKE_MARGIN_PIXELS,
+        margin_type="EXTEND",
+        use_selected_to_active=False,
+        use_clear=False,
+        target="IMAGE_TEXTURES",
+        uv_layer=LIGHTMAP_UV_NAME,
+    )
+    if "FINISHED" not in result:
+        raise RuntimeError(f"Cycles {bake_type.lower()} bake did not finish")
+    pixels = np.empty(len(image.pixels), dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    values = pixels[0::4].copy()
+    return values, values > -0.5
+
+
+def bake_lightmap_coverage(context, proxies, image):
+    """How opaque each texel's surface is (1 = solid, 0 = fully transparent), and the texels baked.
+
+    Cycles weights a surface's own ambient occlusion by its alpha. With nothing else rendered and
+    the proxies casting nothing, their ambient occlusion is that weight alone.
+    """
+    rendered = [obj for obj in context.scene.objects if not obj.hide_render and obj not in proxies]
+    casts_shadow = [(proxy, proxy.visible_shadow) for proxy in proxies]
+    for obj in rendered:
+        obj.hide_render = True
+    for proxy in proxies:
+        proxy.visible_shadow = False
+    try:
+        return bake_lightmap_pass("AO", image)
+    finally:
+        for obj in rendered:
+            obj.hide_render = False
+        for proxy, casts in casts_shadow:
+            proxy.visible_shadow = casts
+
+
+def bake_sun_visibility(sun, image):
+    """Sun visibility (1 = lit) as shadowed over unshadowed direct diffuse light, and the texels baked.
+
+    Cycles' Shadow bake type has a large per-pixel CPU cost; two direct-light passes run on the
+    GPU and their ratio cancels surface angle and sun strength. Texels facing away are 0.
+    """
+    shadowed, covered = bake_lightmap_pass("DIFFUSE", image, {"DIRECT"})
+    sun.data.use_shadow = False
+    try:
+        unshadowed, _covered = bake_lightmap_pass("DIFFUSE", image, {"DIRECT"})
+    finally:
+        sun.data.use_shadow = True
+    lit = covered & (unshadowed > unshadowed[covered].max(initial=0.0) * 1e-4)
+    visibility = np.zeros_like(unshadowed)
+    visibility[lit] = np.clip(shadowed[lit] / unshadowed[lit], 0.0, 1.0)
+    return visibility, covered
+
+
+def fill_empty_texels(values, covered, size):
+    """Give texels outside every chart the average of the nearest baked texels (push-pull).
+
+    Mipmaps average neighbouring texels; left at 0 (full shadow and occlusion), the empty
+    space between thin road and kerb charts darkens them at a distance.
+    """
+    levels = []
+    level = np.where(covered, values, 0.0).reshape(size, size)
+    weight = covered.reshape(size, size).astype(np.float32)
+    while True:
+        levels.append((level, weight))
+        if level.shape[0] == 1:
+            break
+        half = level.shape[0] // 2
+        total = (level * weight).reshape(half, 2, half, 2).sum(axis=(1, 3))
+        weight_sum = weight.reshape(half, 2, half, 2).sum(axis=(1, 3))
+        level = np.where(weight_sum > 0.0, total / np.maximum(weight_sum, 1e-12), 0.0)
+        weight = (weight_sum > 0.0).astype(np.float32)
+    filled = levels[-1][0]
+    for level, weight in reversed(levels[:-1]):
+        coarse = np.repeat(np.repeat(filled, 2, axis=0), 2, axis=1)
+        filled = np.where(weight > 0.0, level, coarse)
+    return filled.ravel().astype(np.float32)
+
+
+def dilate_into_holes(channels, valid, holes, size):
+    """Fill hole texels from their valid neighbours, one ring of texels per step.
+
+    This is a lightmapper's dilation of invalid texels: values spread only through the holes,
+    so a fence gap takes the lighting of the fence around it, never of another chart. Holes with
+    no valid texel around them stay invalid. Returns the channels and the texels now valid.
+    """
+    channels = channels.copy()
+    valid = valid.copy()
+    pending = np.flatnonzero(holes & ~valid)
+    while pending.size:
+        rows, columns = np.divmod(pending, size)
+        total = np.zeros((len(channels), pending.size))
+        count = np.zeros(pending.size)
+        for row_step, column_step in ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)):
+            row, column = rows + row_step, columns + column_step
+            inside = (row >= 0) & (row < size) & (column >= 0) & (column < size)
+            neighbours = np.where(inside, row * size + column, 0)
+            usable = inside & valid[neighbours]
+            total += np.where(usable, channels[:, neighbours], 0.0)
+            count += usable
+        grown = count > 0
+        if not grown.any():
+            break
+        filled = pending[grown]
+        channels[:, filled] = total[:, grown] / count[grown]
+        valid[filled] = True
+        pending = pending[~grown]
+    return channels, valid
+
+
+def store_lightmap_image(settings, file_path, size, ambient_occlusion, sun_shadow):
+    """Pack an 8-bit atlas: red is ambient occlusion, green is sun visibility (1 = lit)."""
+    name = f"{settings.track_id}_{Path(file_path).stem}"
+    image = bpy.data.images.new(name, size, size, alpha=False)
+    image.colorspace_settings.name = "Non-Color"
+    pixels = np.zeros((size * size, 4), dtype=np.float32)
+    pixels[:, 0] = ambient_occlusion
+    pixels[:, 1] = sun_shadow
+    pixels[:, 3] = 1.0
+    image.pixels.foreach_set(pixels.ravel())
+    image.file_format = "PNG"
+    image.pack()
+    # Nothing uses the atlas in the .blend; without a fake user, saving drops it.
+    image.use_fake_user = True
+    image[LIGHTMAP_IMAGE_PROPERTY] = file_path
+    return image
+
+
+def iter_lightmap_bake(context, settings, report):
+    """Unwrap and bake every lightmap atlas, yielding (fraction, message) before each step."""
+    turn_off_lightmap_preview(settings)
+    yield 0.0, "Checking bake inputs..."
+    errors = []
+    if context.mode != "OBJECT":
+        errors.append("Bake shadows in Object Mode")
+    if not settings.track_root_object:
+        errors.append("Track root object is required")
+    sun = preview_sun(context)
+    if sun is None or sun.type != "LIGHT" or sun.data.type != "SUN":
+        errors.append("Click Set Up Preview Scene first; the bake uses its preview sun")
+    scopes, skipped, receiver_errors = lightmap_receivers(context, settings)
+    errors.extend(receiver_errors)
+    if not scopes and not errors:
+        errors.append("No PBR meshes to bake")
+    if errors:
+        raise TrackValidationError(errors, [])
+    for obj in skipped:
+        report({"WARNING"}, f"{obj.name} shares its mesh data and keeps no lightmap")
+
+    atlas_size = int(settings.lightmap_atlas_size)
+    clear_lightmap_results(settings)
+    receivers = {obj for _prefix, _layout, objects in scopes for obj in objects}
+    for obj in track_objects(settings):
+        if obj not in receivers:
+            remove_lightmap_uv_layer(obj)
+    areas = {obj: world_surface_area(obj) for obj in receivers}
+    texel_size = settings.lightmap_texel_size
+    capacity = lightmap_atlas_capacity(atlas_size, texel_size)
+    oversized = {obj for obj in receivers if areas[obj] > capacity}
+    atlases = []
+    for prefix, layout, objects in scopes:
+        items = [
+            (obj, areas[obj], tuple(obj.matrix_world @ (sum((Vector(corner) for corner in obj.bound_box), Vector()) / 8)))
+            for obj in objects
+        ]
+        for index, (group, size) in enumerate(lightmap_atlas_groups(items, texel_size, atlas_size)):
+            atlases.append((lightmap_image_file(prefix, index), layout, group, size))
+
+    try:
+        unwrap_state = json.loads(settings.lightmap_unwrap_state or "{}")
+    except json.JSONDecodeError:
+        unwrap_state = {}
+    planned = {file_path for file_path, _layout, _objects, _size in atlases}
+    unwrap_state = {key: value for key, value in unwrap_state.items() if key in planned}
+    settings.lightmap_unwrap_state = json.dumps(unwrap_state)
+
+    state = LightmapBakeState()
+    completed = False
+    try:
+        prepare_lightmap_scene(context, settings, state, sun)
+        texel_sizes = []
+        for index, (file_path, _layout, objects, size) in enumerate(atlases):
+            entry = lightmap_unwrap_entry(objects, areas, size, texel_size)
+            stored = unwrap_state.get(file_path)
+            if lightmap_unwrap_current(entry, stored, objects):
+                yield 0.02 + 0.18 * index / len(atlases), f"Reusing lightmap UVs {file_path}"
+                entry["texel"] = stored["texel"]
+            else:
+                yield 0.02 + 0.18 * index / len(atlases), f"Unwrapping {file_path}"
+                # A cancelled unwrap must not leave a matching entry for half-written UVs.
+                unwrap_state.pop(file_path, None)
+                settings.lightmap_unwrap_state = json.dumps(unwrap_state)
+                entry["texel"] = unwrap_lightmap_atlas(context, state, objects, areas, size, texel_size)
+                unwrap_state[file_path] = entry
+                settings.lightmap_unwrap_state = json.dumps(unwrap_state)
+            texel_sizes.append(entry["texel"])
+            if objects[0] in oversized:
+                report({"WARNING"}, (
+                    f"{objects[0].name} ({areas[objects[0]]:.0f} m²) exceeds one {atlas_size} px atlas at "
+                    f"{texel_size:.2f} m; it bakes alone at {entry['texel']:.2f} m"
+                ))
+
+        images = {}
+        for index, (file_path, layout, objects, size) in enumerate(atlases):
+            image = images.get(size)
+            if image is None:
+                image = bpy.data.images.new(
+                    f"vectorg_lightmap_bake_{size}", size, size, alpha=False, float_buffer=True, is_data=True,
+                )
+                images[size] = image
+                state.restores.append(lambda image=image: bpy.data.images.remove(image))
+            show_lightmap_scope(context, settings, layout, sun)
+            proxies = lightmap_bake_proxies(context, state, objects)
+            try:
+                # The proxies cast and receive in place of the receivers they join.
+                for obj in objects:
+                    obj.hide_render = True
+                for proxy in proxies:
+                    state.attach_bake_image(proxy, image)
+                step = 0.8 / len(atlases)
+                yield 0.2 + step * index, f"Baking ambient occlusion {index + 1}/{len(atlases)}: {file_path}"
+                select_lightmap_objects(context, state, proxies)
+                coverage, _covered = bake_lightmap_coverage(context, proxies, image)
+                # Receivers with Shadow off take no ambient occlusion: only the others bake it.
+                casting = [proxy for proxy in proxies if proxy.visible_shadow]
+                ambient_occlusion = np.ones(size * size, dtype=np.float32)
+                if casting:
+                    select_lightmap_objects(context, state, casting)
+                    occluded, baked = bake_lightmap_pass("AO", image)
+                    ambient_occlusion[baked] = occluded[baked]
+                yield 0.2 + step * (index + 0.5), f"Baking sun shadow {index + 1}/{len(atlases)}: {file_path}"
+                select_lightmap_objects(context, state, proxies)
+                sun_shadow, covered = bake_sun_visibility(sun, image)
+            finally:
+                for proxy in proxies:
+                    remove_lightmap_bake_proxy(proxy)
+            # See-through surfaces (fences, painted lines) bake as solid where they are opaque: the alpha weight
+            # Cycles puts on their own ambient occlusion is divided out, and fully transparent texels,
+            # which receive no light, are dilated from the opaque texels around them. They still cast
+            # see-through shadows.
+            solid = covered & (coverage > LIGHTMAP_MIN_COVERAGE)
+            ambient_occlusion = np.where(
+                solid, np.clip(ambient_occlusion / np.maximum(coverage, LIGHTMAP_MIN_COVERAGE), 0.0, 1.0), 0.0,
+            )
+            (ambient_occlusion, sun_shadow), valid = dilate_into_holes(
+                np.stack((ambient_occlusion, sun_shadow)), solid, covered & ~solid, size,
+            )
+            store_lightmap_image(
+                settings, file_path, size,
+                fill_empty_texels(ambient_occlusion, valid, size),
+                fill_empty_texels(sun_shadow, valid, size),
+            )
+            for obj in objects:
+                obj[LIGHTMAP_PROPERTY] = file_path
+        settings.lightmap_sun_direction = game_vector(sun_toward_direction(sun))
+        completed = True
+    finally:
+        state.restore()
+        if not completed:
+            clear_lightmap_results(settings)
+    return len(atlases), min(texel_sizes), max(texel_sizes), len(skipped)
 
 
 def validate_visual_root(errors, label, visuals):
@@ -3544,6 +4647,8 @@ def validate_scene(settings, context):
         elif not settings.hdr_image.packed_file and not image_source_path(settings.hdr_image).is_file():
             errors.append("HDR texture source file does not exist")
 
+    validate_lightmaps(context, settings, errors)
+
     if track_root:
         map_roots = [
             direct_child_with_role(layout.root_object, ROLE_MAP)
@@ -3584,6 +4689,7 @@ def show_validation_popup(context, errors, warnings):
 
 
 def reset_settings(settings):
+    turn_off_lightmap_preview(settings)
     settings.is_configured = False
     settings.track_id = ""
     settings.package_version = "1"
@@ -3599,11 +4705,16 @@ def reset_settings(settings):
     settings.hdr_image = None
     settings.preview_camera = None
     settings.preview_image = None
+    settings.lightmap_texel_size = DEFAULT_LIGHTMAP_TEXEL_SIZE
+    settings.lightmap_atlas_size = str(DEFAULT_LIGHTMAP_ATLAS_SIZE)
+    settings.lightmap_samples = DEFAULT_LIGHTMAP_SAMPLES
+    settings.lightmap_sun_direction = (0.0, 0.0, 0.0)
+    settings.lightmap_unwrap_state = ""
 
 
 class TrackLayoutSettings(PropertyGroup):
     layout_id: StringProperty(name="ID", description="Export identifier and generated-object name prefix", default="layout", update=update_layout_id)
-    visible: BoolProperty(name="Visible", description="Show or hide this complete layout hierarchy", default=True, update=update_layout_visibility)
+    visible: BoolProperty(name="Visible", description="Show or hide this complete layout hierarchy in the viewport", default=True, update=update_layout_visibility)
     display_name: StringProperty(
         name="Name",
         description=f"Player-facing layout name, at most {LAYOUT_DISPLAY_NAME_MAX_LENGTH} characters",
@@ -3731,6 +4842,40 @@ class TrackExporterSettings(PropertyGroup):
     preview_image: PointerProperty(
         name="Preview Image", description="PNG or JPEG exported as the track-selection background",
         type=bpy.types.Image, poll=preview_image_poll,
+    )
+    lightmap_texel_size: FloatProperty(
+        name="Texel Size (m)",
+        description="Target world size of one lightmap pixel; smaller is sharper and needs more atlases",
+        default=DEFAULT_LIGHTMAP_TEXEL_SIZE, min=0.02, max=10.0, precision=3,
+    )
+    lightmap_atlas_size: EnumProperty(
+        name="Atlas Size (px)",
+        description="Width and height of each baked lightmap atlas",
+        items=LIGHTMAP_ATLAS_SIZE_ITEMS,
+        default=str(DEFAULT_LIGHTMAP_ATLAS_SIZE),
+    )
+    lightmap_samples: IntProperty(
+        name="Bake Samples",
+        description="Cycles samples per lightmap pixel for the ambient occlusion and sun shadow passes",
+        default=DEFAULT_LIGHTMAP_SAMPLES, min=1, max=16384,
+    )
+    lightmap_sun_direction: FloatVectorProperty(
+        name="Baked Sun Direction",
+        description="Game-space direction toward the preview sun when the lightmaps were baked",
+        size=3, default=(0.0, 0.0, 0.0), options={"HIDDEN"},
+    )
+    lightmap_unwrap_state: StringProperty(
+        name="Lightmap Unwrap State",
+        description="JSON record of each atlas's unwrapped members, so unchanged atlases keep their Lightmap UVs",
+        default="", options={"HIDDEN"},
+    )
+    lightmap_preview: BoolProperty(
+        name="Preview Lightmaps",
+        description=(
+            "Show every mesh unlit white, darkened only by its baked lightmap, in Material Preview and "
+            "Rendered view; turning it off restores the materials. Bake, export, and Render Preview turn it off"
+        ),
+        default=False, update=update_lightmap_preview,
     )
     layouts: CollectionProperty(type=TrackLayoutSettings)
     dynamic_colliders: CollectionProperty(type=DynamicColliderLink)
@@ -4372,6 +5517,7 @@ def export_track_glb(
     hdr_image=None,
     excluded_objects=(),
 ):
+    turn_off_lightmap_preview(settings)
     selected_before = list(context.selected_objects)
     active_before = context.view_layer.objects.active
     export_objects = track_export_objects(track_root, excluded_objects)
@@ -4388,8 +5534,10 @@ def export_track_glb(
     )
     target_names = []
     collider_targets = []
+    shadow_flagged = []
     try:
         target_names, collider_targets = apply_dynamic_target_export_names(settings)
+        shadow_flagged = apply_shadow_casting_export_flags(export_objects)
         for obj, _hidden, _hide_render in visibility_before:
             obj.hide_set(False)
             obj.hide_render = False
@@ -4410,6 +5558,7 @@ def export_track_glb(
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")
     finally:
+        restore_shadow_casting_export_flags(shadow_flagged)
         restore_dynamic_target_export_names(target_names, collider_targets)
         restore_export_textures(restored_nodes, temp_images)
         bpy.ops.object.select_all(action="DESELECT")
@@ -4443,7 +5592,15 @@ EXPORT_PROGRESS_TITLES = {
     "FAILED": "Export Failed",
     "CANCELLED": "Export Cancelled",
 }
-export_progress_state = {"status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": []}
+BAKE_PROGRESS_TITLES = {
+    "RUNNING": "Baking Shadows",
+    "SUCCESS": "Bake Complete",
+    "FAILED": "Bake Failed",
+    "CANCELLED": "Bake Cancelled",
+}
+export_progress_state = {
+    "status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": [], "titles": EXPORT_PROGRESS_TITLES,
+}
 
 
 class TrackValidationError(RuntimeError):
@@ -4464,7 +5621,7 @@ def redraw_all_areas():
             area.tag_redraw()
 
 
-def update_export_progress(status=None, fraction=None, message=None, detail=None):
+def update_export_progress(status=None, fraction=None, message=None, detail=None, titles=None):
     state = export_progress_state
     if not state["handlers"]:
         for space_name in EXPORT_PROGRESS_SPACES:
@@ -4472,7 +5629,9 @@ def update_export_progress(status=None, fraction=None, message=None, detail=None
             if space:
                 handler = space.draw_handler_add(draw_export_progress, (), "WINDOW", "POST_PIXEL")
                 state["handlers"].append((space, handler))
-    for key, value in (("status", status), ("fraction", fraction), ("message", message), ("detail", detail)):
+    for key, value in (
+        ("status", status), ("fraction", fraction), ("message", message), ("detail", detail), ("titles", titles),
+    ):
         if value is not None:
             state[key] = value
     redraw_all_areas()
@@ -4482,7 +5641,7 @@ def hide_export_progress():
     state = export_progress_state
     for space, handler in state["handlers"]:
         space.draw_handler_remove(handler, "WINDOW")
-    state.update(status=None, fraction=0.0, message="", detail="", handlers=[])
+    state.update(status=None, fraction=0.0, message="", detail="", handlers=[], titles=EXPORT_PROGRESS_TITLES)
     try:
         redraw_all_areas()
     except AttributeError:
@@ -4564,7 +5723,7 @@ def draw_export_progress():
 
     white, dim = (0.93, 0.93, 0.93, 1.0), (0.62, 0.62, 0.62, 1.0)
     title_y = y + height - 28 * scale
-    draw_export_text(EXPORT_PROGRESS_TITLES[state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
+    draw_export_text(state["titles"][state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
     draw_export_text(f"{round(fraction * 100)}%", x + width - padding, title_y, 14 * scale, dim, inner * 0.25, "RIGHT")
     draw_export_text(state["message"], x + padding, bar_y - 26 * scale, 13 * scale, white, inner)
     if state["detail"]:
@@ -4575,6 +5734,7 @@ def draw_export_progress():
 
 def iter_track_zip_export(context, settings, filepath, report):
     """Export the track ZIP one step at a time, yielding (fraction, message) before each step."""
+    turn_off_lightmap_preview(settings)
     yield 0.0, "Applying collision mesh scales..."
     applied_count = apply_collision_mesh_scales(context, settings)
     if applied_count:
@@ -4612,6 +5772,7 @@ def iter_track_zip_export(context, settings, filepath, report):
         visibility_before = [(obj, obj.hide_get(), obj.hide_render) for obj in export_objects]
         restored_nodes, temp_images = [], []
         target_names, collider_targets = [], []
+        shadow_flagged = []
         try:
             for index, total, name in iter_export_texture_optimization(
                 export_objects,
@@ -4626,6 +5787,7 @@ def iter_track_zip_export(context, settings, filepath, report):
 
             yield 0.35, "Exporting GLB model (this may take a while)..."
             target_names, collider_targets = apply_dynamic_target_export_names(settings)
+            shadow_flagged = apply_shadow_casting_export_flags(export_objects)
             for obj, _hidden, _hide_render in visibility_before:
                 obj.hide_set(False)
                 obj.hide_render = False
@@ -4646,6 +5808,7 @@ def iter_track_zip_export(context, settings, filepath, report):
             if "FINISHED" not in result:
                 raise RuntimeError("Blender glTF export did not finish")
         finally:
+            restore_shadow_casting_export_flags(shadow_flagged)
             restore_dynamic_target_export_names(target_names, collider_targets)
             restore_export_textures(restored_nodes, temp_images)
             bpy.ops.object.select_all(action="DESELECT")
@@ -4706,6 +5869,12 @@ def iter_track_zip_export(context, settings, filepath, report):
             else:
                 shutil.copy2(source, destination)
 
+        if "lightmaps" in manifest:
+            yield 0.95, "Writing lightmaps..."
+            (temp_path / LIGHTMAP_DIRECTORY).mkdir()
+            for file_path, image in baked_lightmap_images().items():
+                write_lightmap_png(image, temp_path / file_path)
+
         yield 0.96, f"Writing {export_zip.name}..."
         with zipfile.ZipFile(export_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in temp_path.rglob("*"):
@@ -4714,29 +5883,21 @@ def iter_track_zip_export(context, settings, filepath, report):
     return export_zip, len(warnings)
 
 
-class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
-    bl_idname = "track_exporter.export_track_zip"
-    bl_label = "Export Track Zip"
-    bl_description = "Export <track_id>.glb, manifest.json, and the optional HDR into a track zip"
-    bl_options = {"REGISTER"}
-    filename_ext = ".zip"
+class ProgressStepsOperator:
+    """Runs the self.steps generator behind the progress overlay; Esc cancels between steps.
 
-    filepath: StringProperty(name="Export Zip", description="Destination for the exported track package", subtype="FILE_PATH")
-    filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
+    Subclasses set progress_titles, start_message, and cancel_report, and implement
+    steps_finished(value), which reports and returns the (message, detail) shown on success.
+    """
 
-    @classmethod
-    def poll(cls, _context):
-        return not export_progress_active()
-
-    def execute(self, context):
-        settings = scene_settings(context)
-        self.steps = iter_track_zip_export(context, settings, self.filepath, self.report)
+    def run_steps(self, context, steps):
+        self.steps = steps
         if context.window is None or bpy.app.background:
             try:
                 while True:
                     next(self.steps)
             except StopIteration as done:
-                export_zip, _warning_count = done.value
+                self.steps_finished(done.value)
             except TrackValidationError as error:
                 for message in error.errors:
                     self.report({"ERROR"}, message)
@@ -4744,14 +5905,13 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
             except RuntimeError as error:
                 self.report({"ERROR"}, str(error))
                 return {"CANCELLED"}
-            self.report({"INFO"}, f"Exported {export_zip}")
             return {"FINISHED"}
 
         self.finished_at = None
         self.result = {"FINISHED"}
         self.timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
-        update_export_progress("RUNNING", 0.0, "Starting export...", "")
+        update_export_progress("RUNNING", 0.0, self.start_message, "", titles=self.progress_titles)
         return {"RUNNING_MODAL"}
 
     def finish_progress(self, status, fraction, message, detail):
@@ -4768,10 +5928,7 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
         try:
             fraction, message = next(self.steps)
         except StopIteration as done:
-            export_zip, warning_count = done.value
-            warnings = f" with {warning_count} warning(s)" if warning_count else ""
-            self.report({"INFO"}, f"Exported {export_zip}")
-            self.finish_progress("SUCCESS", 1.0, f"Exported {export_zip.name}{warnings}", str(export_zip))
+            self.finish_progress("SUCCESS", 1.0, *self.steps_finished(done.value))
         except TrackValidationError as error:
             for message in error.errors:
                 self.report({"ERROR"}, message)
@@ -4803,8 +5960,10 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
                 except Exception as error:
                     traceback.print_exc()
                     self.report({"ERROR"}, str(error))
-                self.report({"WARNING"}, "Track export cancelled")
-                self.finish_progress("CANCELLED", export_progress_state["fraction"], "Export cancelled", "")
+                self.report({"WARNING"}, self.cancel_report)
+                self.finish_progress(
+                    "CANCELLED", export_progress_state["fraction"], self.progress_titles["CANCELLED"].capitalize(), "",
+                )
             elif event.type == "TIMER":
                 self.step_export()
             return {"RUNNING_MODAL"}
@@ -4817,12 +5976,84 @@ class TRACK_EXPORTER_OT_export_track_zip(Operator, ExportHelper):
             return self.close_progress(context)
         return {"PASS_THROUGH"}
 
+
+class TRACK_EXPORTER_OT_export_track_zip(ProgressStepsOperator, Operator, ExportHelper):
+    bl_idname = "track_exporter.export_track_zip"
+    bl_label = "Export Track Zip"
+    bl_description = "Export <track_id>.glb, manifest.json, and the optional HDR into a track zip"
+    bl_options = {"REGISTER"}
+    filename_ext = ".zip"
+    progress_titles = EXPORT_PROGRESS_TITLES
+    start_message = "Starting export..."
+    cancel_report = "Track export cancelled"
+
+    filepath: StringProperty(name="Export Zip", description="Destination for the exported track package", subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.zip", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, _context):
+        return not export_progress_active()
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        return self.run_steps(context, iter_track_zip_export(context, settings, self.filepath, self.report))
+
+    def steps_finished(self, value):
+        export_zip, warning_count = value
+        warnings = f" with {warning_count} warning(s)" if warning_count else ""
+        self.report({"INFO"}, f"Exported {export_zip}")
+        return f"Exported {export_zip.name}{warnings}", str(export_zip)
+
     def invoke(self, context, event):
         settings = scene_settings(context)
         if not self.filepath:
             self.filepath = f"//{settings.track_id or 'track'}.zip"
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
+
+
+class TRACK_EXPORTER_OT_bake_lightmaps(ProgressStepsOperator, Operator):
+    bl_idname = "track_exporter.bake_lightmaps"
+    bl_label = "Bake Shadows"
+    bl_description = (
+        "Generate Lightmap UVs on PBR meshes and bake ambient occlusion and preview-sun shadow "
+        "into lightmap atlases with Cycles; replaces any previous bake"
+    )
+    bl_options = {"REGISTER"}
+    progress_titles = BAKE_PROGRESS_TITLES
+    start_message = "Starting bake..."
+    cancel_report = "Shadow bake cancelled; lightmaps cleared"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT" and not export_progress_active()
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        return self.run_steps(context, iter_lightmap_bake(context, settings, self.report))
+
+    def steps_finished(self, value):
+        count, smallest, largest, skipped = value
+        texel = f"{smallest:.2f} m" if abs(largest - smallest) < 0.005 else f"{smallest:.2f}-{largest:.2f} m"
+        message = f"Baked {count} lightmap atlas(es); texel size {texel}"
+        if skipped:
+            message += f"; {skipped} linked duplicate(s) skipped"
+        self.report({"INFO"}, message)
+        return message, ""
+
+
+class TRACK_EXPORTER_OT_clear_lightmaps(Operator):
+    bl_idname = "track_exporter.clear_lightmaps"
+    bl_label = "Clear Lightmaps"
+    bl_description = "Delete the baked lightmap atlases, lightmap references, and Lightmap UV maps"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        clear_lightmaps(scene_settings(context))
+        return {"FINISHED"}
 
 
 def draw_split_prop(layout, data, prop_name, label=None, **kwargs):
@@ -4892,6 +6123,23 @@ class TRACK_EXPORTER_PT_track_export(Panel):
             box.operator("track_exporter.add_preview_camera", icon="ADD")
         box.operator("track_exporter.setup_preview_scene", icon="LIGHT_SUN")
         box.operator("track_exporter.render_preview", icon="RENDER_STILL")
+
+        box = layout.box()
+        box.label(text="Lighting")
+        draw_split_prop(box, settings, "lightmap_texel_size")
+        draw_split_prop(box, settings, "lightmap_atlas_size")
+        draw_split_prop(box, settings, "lightmap_samples")
+        row = box.row(align=True)
+        row.operator("track_exporter.bake_lightmaps", icon="SHADING_RENDERED")
+        row.operator("track_exporter.clear_lightmaps", text="", icon="TRASH")
+        atlas_count = len(baked_lightmap_images())
+        if atlas_count:
+            box.label(text=f"Baked: {atlas_count} atlas(es)", icon="CHECKMARK")
+        else:
+            box.label(text="Not baked", icon="INFO")
+        row = box.row()
+        row.enabled = bool(atlas_count) or settings.lightmap_preview
+        row.prop(settings, "lightmap_preview", toggle=True, icon="HIDE_OFF" if settings.lightmap_preview else "HIDE_ON")
 
         box = layout.box()
         row = box.row(align=True)
@@ -5009,6 +6257,8 @@ classes = (
     TRACK_EXPORTER_OT_add_checkpoint,
     TRACK_EXPORTER_OT_validate_track,
     TRACK_EXPORTER_OT_export_track_zip,
+    TRACK_EXPORTER_OT_bake_lightmaps,
+    TRACK_EXPORTER_OT_clear_lightmaps,
     TRACK_EXPORTER_PT_track_export,
 )
 

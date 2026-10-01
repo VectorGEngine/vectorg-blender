@@ -10,6 +10,7 @@ maps/<layout_id>.svg
 routes/<layout_id>.json
 ideal-lines/<layout_id>.json (when an Ideal Line is assigned)
 preview.jpg (when a Preview Image is assigned)
+lightmaps/<scope>_<n>.png (after Bake Shadows)
 ```
 
 Install or enable `vectorg-blender/addons/vectorg_track_exporter` the same way as the
@@ -216,6 +217,12 @@ The exporter writes `vectorg_surface`, `vectorg_shape`, event type, checkpoint
 order, and hierarchy roles into glTF extras. Collision meshes are still present
 in the GLB and must be hidden by the runtime after physics creation.
 
+Visual meshes cast live shadows in the game unless their shadow visibility is
+off in Blender (Object Properties > Visibility > Ray Visibility > Shadow). Export
+writes `vectorg_cast_shadow: false` into those meshes' glTF extras; the property
+exists only during export. Turn it off on ground surfaces such as road, grass,
+and kerbs, which receive shadows but never cast them onto anything.
+
 Removing a layout from the addon only removes its configuration entry. It does
 not delete Blender objects.
 
@@ -344,9 +351,107 @@ Export writes the image as `preview.jpg` at the package JPEG quality, scaled to
 at most 1920 px, and adds `preview: "preview.jpg"` to the manifest root.
 Validation warns when the track has no preview or one narrower than 1280 px.
 
+## Baked shadows
+
+The **Lighting** section, between **Preview** and **Layouts**, bakes static
+shadows into lightmaps with Cycles. The game draws no live shadows from track
+geometry; baked lightmaps shade the track and only cars cast live shadows.
+
+1. Click **Set Up Preview Scene**. The bake uses its preview sun lamp: its
+   direction and its Angle (shadow softness). Edit the lamp before baking.
+2. Set **Texel Size (m)** (default 0.25 m per lightmap pixel), **Atlas Size
+   (px)** (2048 or 4096), and **Bake Samples** (default 256).
+3. Click **Bake Shadows**. Esc cancels between steps; a cancelled or failed bake
+   clears all lightmaps.
+
+Every mesh under a scope's `PBR` root receives a lightmap. Foliage cards and
+linked duplicates (meshes sharing their data) are skipped, because instances
+cannot hold unique lightmap UVs.
+
+The bake honours each object's **Object Properties › Visibility › Ray
+Visibility › Shadow**: turn it off for skid marks, painted lines, and other thin
+meshes lying just above the road. Such meshes cast neither shadow nor ambient
+occlusion and receive no ambient occlusion; they still receive sun shadows from
+every other object.
+
+Each receiver gets a fresh `Lightmap` UV map in
+its last UV slot; glTF exports UV maps in slot order, so the lightmap is the
+mesh's last `TEXCOORD_<n>` set, and the game reads the last UV set as the
+lightmap. Existing UV maps and their render/active flags are kept. The game reads
+at most four UV sets, so a receiver may have at most three other UV maps.
+Modifiers that add or remove geometry (Array, Mirror, Solidify, Boolean,
+Subdivision, and similar) must be applied first, because generated faces would
+repeat the lightmap UVs of their source faces; deforming modifiers are fine.
+
+Shared meshes bake with only Shared visuals casting shadows. A layout's meshes
+bake with Shared and that layout's visuals, so objects of one layout never
+shadow another. Each scope fills atlases with neighbouring receivers up to the
+area one atlas holds at the texel size; the last atlas shrinks to the smallest
+power of two (at least 512 px) that holds its receivers. A receiver larger than
+one atlas, such as outer terrain, gets an atlas of its own at the finest texel
+size that fits, with a warning.
+
+Unwrapping starts from Smart UV Project. Its islands are cut at world-space cells
+256 texels wide, so a road or kerb loop becomes short pieces instead of one
+track-sized ring. Objects whose island borders would need more padding than
+their own area, such as high-poly tyre stacks built from thousands of loose
+parts, are projected instead onto the world plane each face faces most: six
+charts per cell. Each chart is turned to its tightest rectangle and all charts
+are packed in rows with 8 px between them, at the finest scale that fits the
+atlas. The bake uses the GPU when Cycles has a compute device enabled in
+Preferences, otherwise the CPU; each atlas bakes as one temporary joined mesh,
+because Cycles repeats its scene setup for every selected object.
+
+Each atlas is an 8-bit PNG packed into the .blend: red is ambient occlusion
+(5 m distance), green is sun visibility (1 = lit). Sun visibility is the ratio
+of two direct-diffuse passes, with the sun's shadows on and off, lit only by the
+preview sun under a black world; texels facing away from the sun are 0.
+See-through surfaces such as fences and painted lines bake as solid where they
+are opaque: the bake measures each texel's opacity and divides it out of the
+ambient occlusion, which Cycles darkens by opacity. Fully transparent texels,
+which receive no light, are filled from the opaque texels around them, one ring
+at a time, as lightmappers dilate invalid texels. They still cast see-through
+shadows. The bake restores the scene's world, render engine, and sun settings afterwards.
+
+Bake Shadows replaces the previous atlases but keeps existing `Lightmap` UV maps.
+An atlas is unwrapped again only when its members change: an object added,
+removed, or renamed; a mesh whose vertex count, face corners, or world surface
+area changed (editing or scaling it); or a changed **Texel Size** or **Atlas
+Size**. Moving the sun or changing **Bake Samples** reuses every unwrap. The
+trash button beside Bake Shadows deletes the atlases, lightmap references, and
+`Lightmap` UV maps.
+
+**Preview Lightmaps** shows every mesh in the scene unlit white, darkened only by
+its baked lightmap: ambient occlusion, and the sun shadow at 40 % brightness.
+Meshes without a lightmap show plain white. It shows in Material Preview and
+Rendered viewport shading. It swaps in preview materials through object-linked
+material slots and keeps each mesh's own materials; turning it off restores the
+slots and deletes the preview materials. Bake Shadows, Clear Lightmaps, Render
+Preview, and export turn it off first.
+
+Export writes the atlases to `lightmaps/shared_<n>.png` and
+`lightmaps/layout_<layout_id>_<n>.png`, each receiver's atlas path as the
+`vectorg_lightmap` glTF extra, and two manifest root fields:
+
+```json
+{
+    "lightmaps": ["lightmaps/layout_gp_0.png", "lightmaps/shared_0.png"],
+    "sun": {"direction": [0.42, 0.76, -0.49]}
+}
+```
+
+`sun.direction` is the unit direction toward the baked sun in game coordinates;
+the game lights the track from it so live car shadows match the bake. An
+unbaked track exports neither field. Validation fails when a baked track no
+longer matches its bake: a receiver without a current lightmap, a lightmapped
+object that is no longer a receiver, or a moved or removed preview sun. It
+cannot detect geometry edits; bake again after changing receiver or caster
+meshes.
+
 Validation commands from the repository root:
 
 ```text
 python -m unittest discover -s tests -v
 blender --background --factory-startup --python-exit-code 1 --python tests/test_surface_refresh.py -- --blender
+blender --background --factory-startup --python-exit-code 1 --python tests/test_lightmaps.py -- --blender
 ```
