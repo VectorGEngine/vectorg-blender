@@ -61,7 +61,7 @@ def blender_tests():
     import tempfile
     import zipfile
     import numpy as np
-    from mathutils import Euler, Vector
+    from mathutils import Euler, Vector, interpolate
 
     sys.path.insert(0, str(ADDON.parent.parent))
     import vectorg_track_exporter as addon
@@ -171,8 +171,17 @@ def blender_tests():
             self.assertFalse(any(material.name.startswith("vectorg_lightmap") for material in bpy.data.materials))
             self.assertFalse(any(image.name.startswith("vectorg_lightmap_bake") for image in bpy.data.images))
 
-        def test_shadow_off_receivers_cast_nothing_and_take_no_ambient_occlusion(self):
-            # A skid mark 1 cm above the ground, away from the cube.
+        def test_shadow_off_receivers_cast_nothing_but_take_ambient_occlusion(self):
+            # Ground with Shadow off, as tracks set it: it still takes the cube's occlusion and shadow.
+            self.ground.visible_shadow = False
+            self.bake()
+            ambient_occlusion, sun = self.sample(self.ground, (0, 0, 0))
+            self.assertLess(ambient_occlusion, 0.95)
+            self.assertLess(sun, 0.2)
+            self.assertGreater(self.sample(self.ground, (9, 9, 0))[0], 0.95)
+            self.assertFalse(self.ground.visible_shadow)
+            self.ground.visible_shadow = True
+            # A mesh 1 cm above the ground, away from the cube, darkens the ground under it only while it casts.
             bpy.ops.mesh.primitive_plane_add(size=2, location=(6, 6, 0.01))
             mark = bpy.context.object
             mark.name = "skid_mark"
@@ -189,24 +198,130 @@ def blender_tests():
             self.assertEqual(mark[addon.LIGHTMAP_PROPERTY], self.ground[addon.LIGHTMAP_PROPERTY])
             self.assertGreater(self.sample(mark, (0, 0, 0))[1], 0.9)
             self.assertFalse(mark.visible_shadow)
-            # A see-through painted line under the cube: no ambient occlusion on it, the cube's shadow still falls on it.
-            bpy.ops.mesh.primitive_plane_add(size=0.5, location=(0, 0, 0.01))
-            line = bpy.context.object
-            line.parent = self.pbr
-            line.visible_shadow = False
-            paint = bpy.data.materials.new("paint")
-            paint.use_nodes = True
-            paint.node_tree.nodes["Principled BSDF"].inputs["Alpha"].default_value = 0.3
-            line.data.materials.append(paint)
-            self.bake()
-            ambient_occlusion, sun = self.sample(line, (0, 0, 0))
-            self.assertGreater(ambient_occlusion, 0.99)
-            self.assertLess(sun, 0.2)
-            # Other receivers keep their ambient occlusion and the cube's shadow: the ground under the cube.
-            ambient_occlusion, sun = self.sample(self.ground, (0, 0, 0))
-            self.assertLess(ambient_occlusion, 0.95)
-            self.assertLess(sun, 0.2)
             self.assertFalse(any(obj.name.startswith("vectorg_lightmap_bake") for obj in bpy.data.objects))
+
+        def decal(self, name, location, size=2):
+            """A subdivided plane under the shared DECALS root."""
+            bpy.ops.mesh.primitive_grid_add(x_subdivisions=5, y_subdivisions=5, size=size, location=location)
+            obj = bpy.context.object
+            obj.name = name
+            shared_visuals = addon.object_with_role(self.settings.shared_root_object, addon.ROLE_VISUALS)
+            obj.parent = addon.direct_child_with_role(shared_visuals, addon.ROLE_DECALS)
+            return obj
+
+        def test_decals_show_the_lightmap_of_the_surface_under_them_and_cast_nothing(self):
+            shaded = self.decal("shaded_decal", (0, 0, 0.01))
+            lit = self.decal("lit_decal", (6, 6, 0.01))
+            self.bake()
+            ground_uv = self.ground.data.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            for decal in (shaded, lit):
+                self.assertEqual(decal[addon.LIGHTMAP_PROPERTY], self.ground[addon.LIGHTMAP_PROPERTY])
+                layers = decal.data.uv_layers
+                self.assertEqual(layers.find(addon.LIGHTMAP_UV_NAME), len(layers) - 1)
+                # Every decal vertex samples the ground's lightmap exactly where it lies over the ground.
+                decal_uv = layers[addon.LIGHTMAP_UV_NAME].uv
+                for loop in decal.data.loops:
+                    point = self.ground.matrix_world.inverted() @ (decal.matrix_world @ decal.data.vertices[loop.vertex_index].co)
+                    _found, location, _normal, face = self.ground.closest_point_on_mesh(point)
+                    polygon = self.ground.data.polygons[face]
+                    weights = interpolate.poly_3d_calc([self.ground.data.vertices[i].co for i in polygon.vertices], location)
+                    expected = sum((ground_uv[index].vector * weight for index, weight in zip(polygon.loop_indices, weights)), Vector((0.0, 0.0)))
+                    self.assertLess((decal_uv[loop.index].vector - expected).length, 1e-4)
+            self.assertLess(self.sample(shaded, (0, 0, 0))[1], 0.2)
+            self.assertLess(self.sample(shaded, (0, 0, 0))[0], 0.95)
+            # The decal 1 cm above the ground casts neither shadow nor occlusion, though its Shadow is on.
+            self.assertTrue(lit.visible_shadow)
+            ambient_occlusion, sun = self.sample(self.ground, (6, 6, 0))
+            self.assertGreater(ambient_occlusion, 0.95)
+            self.assertGreater(sun, 0.9)
+            self.assertEqual(addon.validate_scene(self.settings, bpy.context)[0], [])
+            decals = addon.object_with_role(self.settings.shared_root_object, addon.ROLE_DECALS)
+            tagged = addon.apply_shadow_casting_export_flags([decals, shaded, lit, self.cube])
+            try:
+                self.assertEqual(set(tagged), {shaded, lit})
+            finally:
+                addon.restore_shadow_casting_export_flags(tagged)
+
+        def test_bake_fails_for_decals_without_a_surface_or_with_shared_mesh_data(self):
+            self.decal("floating_decal", (30, 30, 0.01))
+            first = self.decal("shared_decal_a", (6, 6, 0.01))
+            second = first.copy()
+            second.name = "shared_decal_b"
+            bpy.context.scene.collection.objects.link(second)
+            with self.assertRaises(addon.TrackValidationError) as raised:
+                for _step in addon.iter_lightmap_bake(bpy.context, self.settings, lambda *_args: None):
+                    pass
+            errors = raised.exception.errors
+            self.assertTrue(any("floating_decal" in error and "no lightmapped surface" in error for error in errors))
+            self.assertTrue(any("shared_decal_a" in error and "shares its mesh data" in error for error in errors))
+
+        def grass(self, name, centres):
+            """Upright 0.3 m grass cards at the centres, as one mesh under the shared GRASS group, Shadow off."""
+            vertices, faces = [], []
+            for x, y in centres:
+                base = len(vertices)
+                vertices += [(x - 0.15, y, 0.0), (x + 0.15, y, 0.0), (x + 0.15, y, 0.3), (x - 0.15, y, 0.3)]
+                faces.append((base, base + 1, base + 2, base + 3))
+            mesh = bpy.data.meshes.new(name)
+            mesh.from_pydata(vertices, [], faces)
+            mesh.uv_layers.new(name="UVMap")
+            obj = bpy.data.objects.new(name, mesh)
+            obj.visible_shadow = False
+            bpy.context.scene.collection.objects.link(obj)
+            shared_visuals = addon.object_with_role(self.settings.shared_root_object, addon.ROLE_VISUALS)
+            foliage = addon.direct_child_with_role(shared_visuals, addon.ROLE_FOLIAGE_CARDS)
+            obj.parent = addon.direct_child_with_role(foliage, addon.ROLE_FOLIAGE_GRASS)
+            return obj
+
+        def test_grass_shows_the_lightmap_of_the_ground_under_it(self):
+            shaded = self.grass("shaded_grass", [(-0.4, -0.4), (0.4, 0.4)])
+            lit = self.grass("lit_grass", [(6, 6), (-6, 6)])
+            self.bake()
+            for obj in (shaded, lit):
+                self.assertEqual(obj[addon.LIGHTMAP_PROPERTY], "lightmaps/shared_grass.png")
+                self.assertEqual(obj.data.uv_layers.find(addon.LIGHTMAP_UV_NAME), 1)
+                self.assertTrue(obj.data.uv_layers[0].active_render)
+            # Card bottoms and tops take the ground straight below them: the cube's shadow and occlusion...
+            for point in ((-0.4, -0.4, 0.0), (0.4, 0.4, 0.3)):
+                ambient_occlusion, sun = self.sample(shaded, point)
+                ground_occlusion, _ground_sun = self.sample(self.ground, (point[0], point[1], 0.0))
+                self.assertLess(sun, 0.2)
+                self.assertLess(ambient_occlusion, 0.95)
+                self.assertAlmostEqual(ambient_occlusion, ground_occlusion, delta=0.1)
+            # ...or the sun.
+            for point in ((6, 6, 0.3), (-6, 6, 0.0)):
+                self.assertGreater(self.sample(lit, point)[1], 0.9)
+            self.assertEqual(addon.validate_scene(self.settings, bpy.context)[0], [])
+            with tempfile.TemporaryDirectory() as directory:
+                output = str(Path(directory) / "track.zip")
+                self.assertEqual(bpy.ops.track_exporter.export_track_zip(filepath=output), {"FINISHED"})
+                with zipfile.ZipFile(output) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                    self.assertEqual(manifest["lightmaps"], ["lightmaps/shared_0.png", "lightmaps/shared_grass.png"])
+                    self.assertTrue(archive.read("lightmaps/shared_grass.png").startswith(b"\x89PNG"))
+                    model = glb_json(archive.read(manifest["model"]))
+            node = next(node for node in model["nodes"] if node.get("name") == "lit_grass")
+            self.assertEqual(node["extras"][addon.LIGHTMAP_PROPERTY], "lightmaps/shared_grass.png")
+            attributes = model["meshes"][node["mesh"]]["primitives"][0]["attributes"]
+            self.assertIn("TEXCOORD_1", attributes)
+            self.assertNotIn("TEXCOORD_2", attributes)
+            # Grass added after the bake needs a new one.
+            self.grass("late_grass", [(3, -3)])
+            errors, _warnings = addon.validate_scene(self.settings, bpy.context)
+            self.assertIn("late_grass has no current lightmap; click Bake Shadows", errors)
+
+        def test_bake_fails_for_grass_without_ground_or_with_shared_mesh_data(self):
+            self.grass("floating_grass", [(40, 40)])
+            first = self.grass("shared_grass_a", [(3, 3)])
+            second = first.copy()
+            second.name = "shared_grass_b"
+            bpy.context.scene.collection.objects.link(second)
+            with self.assertRaises(addon.TrackValidationError) as raised:
+                for _step in addon.iter_lightmap_bake(bpy.context, self.settings, lambda *_args: None):
+                    pass
+            errors = raised.exception.errors
+            self.assertTrue(any("floating_grass" in error and "no lightmapped surface under it" in error for error in errors))
+            self.assertTrue(any("shared_grass_a" in error and "shares its mesh data" in error for error in errors))
 
         def test_see_through_receivers_bake_as_solid_and_cast_see_through_shadows(self):
             def panel(location, alpha):
@@ -249,6 +364,144 @@ def blender_tests():
             self.assertLess(self.sample(fence, (-0.75, -0.75, 0))[1], 0.2)
             # The gap takes the fence's shadow, not the lit ground's lighting beside it in the atlas.
             self.assertLess(self.sample(fence, (0.75, 0.75, 0))[1], 0.2)
+
+        def shared_texels(self, obj):
+            """Texels of obj's lightmap whose centre two or more of its triangles cover."""
+            size = addon.baked_lightmap_images()[obj[addon.LIGHTMAP_PROPERTY]].size[0]
+            mesh = obj.data
+            uv = mesh.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            mesh.calc_loop_triangles()
+            count = np.zeros((size, size), dtype=np.int32)
+            for triangle in mesh.loop_triangles:
+                a, b, c = (np.array(uv[loop].vector) * size for loop in triangle.loops)
+                low = np.floor(np.minimum(np.minimum(a, b), c)).astype(int)
+                high = np.ceil(np.maximum(np.maximum(a, b), c)).astype(int)
+                xs, ys = np.meshgrid(np.arange(low[0], high[0]) + 0.5, np.arange(low[1], high[1]) + 0.5)
+                determinant = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+                if abs(determinant) < 1e-12:
+                    continue
+                w0 = ((b[1] - c[1]) * (xs - c[0]) + (c[0] - b[0]) * (ys - c[1])) / determinant
+                w1 = ((c[1] - a[1]) * (xs - c[0]) + (a[0] - c[0]) * (ys - c[1])) / determinant
+                inside = (w0 > 1e-9) & (w1 > 1e-9) & (1 - w0 - w1 > 1e-9)
+                np.add.at(count, (ys[inside].astype(int), xs[inside].astype(int)), 1)
+            return int((count > 1).sum())
+
+        def test_box_projected_props_keep_faces_behind_one_another_off_each_others_texels(self):
+            # A wall with a hidden board behind it and many small planks in front: loose parts enough
+            # for the box projection, where every face pointing one way shares one flat chart.
+            bpy.ops.mesh.primitive_plane_add(size=1, location=(-6, -6, 1.5), rotation=(math.pi / 2, 0, 0))
+            prop = bpy.context.object
+            prop.scale = (4, 3, 1)
+            bpy.ops.object.transform_apply(scale=True)
+            parts = [prop]
+            bpy.ops.mesh.primitive_plane_add(size=1, location=(-6, -5.8, 1.5), rotation=(math.pi / 2, 0, 0))
+            hidden = bpy.context.object
+            hidden.scale = (3, 2, 1)
+            bpy.ops.object.transform_apply(scale=True)
+            parts.append(hidden)
+            for index in range(60):
+                bpy.ops.mesh.primitive_cube_add(size=0.12, location=(-7.8 + (index % 12) * 0.3, -6.1, 0.4 + (index // 12) * 0.5))
+                parts.append(bpy.context.object)
+            bpy.ops.object.select_all(action="DESELECT")
+            for part in parts:
+                part.select_set(True)
+            bpy.context.view_layer.objects.active = prop
+            bpy.ops.object.join()
+            prop.name = "house_prop"
+            prop.parent = self.pbr
+            self.bake()
+            self.assertEqual(self.shared_texels(prop), 0)
+
+        def ambient_occlusion_texels(self, obj, facing=None):
+            """Ambient occlusion of every texel whose centre one of obj's lightmap triangles covers,
+            of the triangles facing a world direction only when one is given."""
+            image = addon.baked_lightmap_images()[obj[addon.LIGHTMAP_PROPERTY]]
+            size = image.size[0]
+            pixels = np.empty(len(image.pixels), dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            red = pixels.reshape(size, size, 4)[..., 0]
+            mesh = obj.data
+            uv = mesh.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            mesh.calc_loop_triangles()
+            values = []
+            for triangle in mesh.loop_triangles:
+                if facing and (obj.matrix_world.to_3x3() @ triangle.normal).normalized().dot(Vector(facing)) < 0.9:
+                    continue
+                a, b, c = (np.array(uv[loop].vector) * size for loop in triangle.loops)
+                low = np.floor(np.minimum(np.minimum(a, b), c)).astype(int)
+                high = np.ceil(np.maximum(np.maximum(a, b), c)).astype(int)
+                xs, ys = np.meshgrid(np.arange(low[0], high[0]), np.arange(low[1], high[1]))
+                determinant = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+                if abs(determinant) < 1e-12:
+                    continue
+                w0 = ((b[1] - c[1]) * (xs + 0.5 - c[0]) + (c[0] - b[0]) * (ys + 0.5 - c[1])) / determinant
+                w1 = ((c[1] - a[1]) * (xs + 0.5 - c[0]) + (a[0] - c[0]) * (ys + 0.5 - c[1])) / determinant
+                inside = (w0 >= 0) & (w1 >= 0) & (1 - w0 - w1 >= 0)
+                values.extend(red[ys[inside], xs[inside]].tolist())
+            return np.array(values)
+
+        def test_texels_buried_inside_intersecting_parts_take_their_neighbours_light(self):
+            # A wall with a plank sunk halfway into it: the wall's texels under the plank lie inside
+            # the plank and would bake black, spreading over the visible wall around it.
+            bpy.ops.mesh.primitive_cube_add(size=1, location=(-6, -6, 1.5))
+            wall = bpy.context.object
+            wall.scale = (4, 0.2, 3)
+            bpy.ops.mesh.primitive_cube_add(size=1, location=(-6, -6.1, 1.5))
+            plank = bpy.context.object
+            plank.scale = (3, 0.3, 0.4)
+            for obj in (wall, plank):
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.transform_apply(scale=True)
+                obj.parent = self.pbr
+            # A low roof over open ground: real occlusion that must stay dark.
+            bpy.ops.mesh.primitive_plane_add(size=4, location=(6, -6, 0.15))
+            roof = bpy.context.object
+            roof.parent = self.pbr
+            self.bake()
+            # The wall's face the plank is sunk into, and the plank's faces standing out of the wall.
+            for obj, facing in ((wall, (0, -1, 0)), (plank, (0, -1, 0)), (plank, (0, 0, 1)), (plank, (1, 0, 0))):
+                self.assertGreater(self.ambient_occlusion_texels(obj, facing).min(), 0.1, f"{obj.name} facing {facing}")
+            self.assertLess(self.sample(self.ground, (6, -6, 0))[0], 0.2)
+
+        def test_bake_softens_the_sun_and_restores_it(self):
+            scene = bpy.context.scene
+            angle, bounces = self.sun.data.angle, scene.cycles.transparent_max_bounces
+            state = addon.LightmapBakeState()
+            addon.prepare_lightmap_scene(bpy.context, self.settings, state, self.sun)
+            try:
+                self.assertAlmostEqual(self.sun.data.angle, addon.LIGHTMAP_BAKE_SUN_ANGLE, places=6)
+                self.assertEqual(scene.cycles.transparent_max_bounces, addon.LIGHTMAP_TRANSPARENT_BOUNCES)
+            finally:
+                state.restore()
+            self.assertAlmostEqual(self.sun.data.angle, angle, places=6)
+            self.assertEqual(scene.cycles.transparent_max_bounces, bounces)
+
+        def test_deep_stacks_of_cut_out_cards_cast_see_through_shadows(self):
+            # Twelve stacked cards, each opaque only in its left half: more cut-out surfaces than
+            # Cycles' default limit of eight, as along a ray through a tree crown.
+            mask = bpy.data.images.new("card_mask", 2, 1, alpha=True)
+            mask.pixels = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+            material = bpy.data.materials.new("card_mask")
+            material.use_nodes = True
+            nodes = material.node_tree.nodes
+            texture = nodes.new("ShaderNodeTexImage")
+            texture.image = mask
+            texture.interpolation = "Closest"
+            material.node_tree.links.new(texture.outputs["Alpha"], nodes["Principled BSDF"].inputs["Alpha"])
+            foliage = addon.object_with_role(self.settings.shared_root_object, addon.ROLE_FOLIAGE_CARDS)
+            trees = addon.direct_child_with_role(foliage, addon.ROLE_FOLIAGE_TREES)
+            for index in range(12):
+                bpy.ops.mesh.primitive_plane_add(size=4, location=(6, -6, 1 + 0.1 * index))
+                card = bpy.context.object
+                card.parent = trees
+                card.data.materials.append(material)
+            bounces = bpy.context.scene.cycles.transparent_max_bounces
+            self.bake()
+            self.assertEqual(bpy.context.scene.cycles.transparent_max_bounces, bounces)
+            self.assertLess(self.sample(self.ground, (5, -6, 0))[1], 0.2)
+            self.assertGreater(self.sample(self.ground, (7, -6, 0))[1], 0.9)
 
         def test_preview_lightmaps_shows_atlases_and_restores_materials(self):
             road = bpy.data.materials.new("road")

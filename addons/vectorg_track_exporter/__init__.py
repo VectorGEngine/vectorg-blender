@@ -64,6 +64,9 @@ ROLE_LAYOUTS = "layouts"
 ROLE_VISUALS = "visuals"
 ROLE_PBR = "pbr"
 ROLE_FOLIAGE_CARDS = "foliage_cards"
+ROLE_FOLIAGE_TREES = "foliage_trees"
+ROLE_FOLIAGE_GRASS = "foliage_grass"
+ROLE_DECALS = "decals"
 ROLE_COLLISIONS = "collisions"
 ROLE_OBSTACLES = "obstacles"
 ROLE_SPAWN_POINTS = "spawn_points"
@@ -73,6 +76,8 @@ ROLE_SPAWN_POINT = "spawn_point"
 ROLE_SURFACE = "surface"
 ROLE_PREVIEW = "preview"
 ROLE_PREVIEW_SUN = "preview_sun"
+# The groups every FOLIAGE_CARDS root holds, with the suffix of their object names.
+FOLIAGE_GROUPS = {ROLE_FOLIAGE_TREES: "TREES", ROLE_FOLIAGE_GRASS: "GRASS"}
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
@@ -144,8 +149,29 @@ LIGHTMAP_BAKE_MARGIN_PIXELS = 4
 LIGHTMAP_AO_DISTANCE = 5.0
 # Sun strength while baking, so emissive materials add negligible direct light.
 LIGHTMAP_BAKE_SUN_STRENGTH = 1000.0
+# Angular size of the sun while baking. Shadows from high occluders such as tree crowns get a soft
+# edge wider than a lightmap texel (0.35 m from 10 m up), so the baked edge shows no texel steps.
+LIGHTMAP_BAKE_SUN_ANGLE = math.radians(2.0)
 # Texels whose surface is less opaque than this are holes (fence gaps).
 LIGHTMAP_MIN_COVERAGE = 0.05
+# A decal takes the lightmap of the receiver surface within this distance along its normal, in metres.
+DECAL_PROJECTION_DISTANCE = 0.5
+# Grass takes the baked ground under it from one top-down map per GRASS group: at most this many metres
+# per texel, from at least this many pixels up to the atlas size, with a border of texels around the grass
+# for the game's 4 x 4 texel lightmap filter.
+LIGHTMAP_GRASS_TEXEL_SIZE = 0.5
+LIGHTMAP_GRASS_MIN_SIZE = 64
+LIGHTMAP_GRASS_BORDER_TEXELS = 3
+# The rays finding the ground under grass start this far above the highest grass around a texel, in metres.
+LIGHTMAP_GRASS_RAY_START = 1.0
+# Texels darker than this ambient occlusion are tested for lying inside another solid part; those that
+# do (most of LIGHTMAP_BURIED_RAYS hemisphere rays hit back faces) are refilled from their neighbours.
+LIGHTMAP_BURIED_AO = 0.1
+LIGHTMAP_BURIED_RAYS = 16
+LIGHTMAP_BURIED_SHARE = 0.5
+# Cut-out surfaces a bake ray passes through before Cycles treats the next one as solid. Its default
+# of 8 turns the cards deep in a tree crown into solid rectangles in the baked shadow.
+LIGHTMAP_TRANSPARENT_BOUNCES = 128
 LIGHTMAP_SMART_PROJECT_ANGLE = math.radians(66.0)
 LIGHTMAP_SUN_TOLERANCE = math.radians(0.05)
 # three.js reads at most four UV sets; the lightmap takes the last one.
@@ -309,7 +335,10 @@ def create_collision_hierarchy(context, parent, name_prefix):
 def create_visual_hierarchy(context, parent, name_prefix):
     visuals = create_empty(context, f"{name_prefix}_VISUALS", parent, ROLE_VISUALS)
     create_empty(context, f"{name_prefix}_PBR", visuals, ROLE_PBR)
-    create_empty(context, f"{name_prefix}_FOLIAGE_CARDS", visuals, ROLE_FOLIAGE_CARDS)
+    foliage = create_empty(context, f"{name_prefix}_FOLIAGE_CARDS", visuals, ROLE_FOLIAGE_CARDS)
+    for role, suffix in FOLIAGE_GROUPS.items():
+        create_empty(context, f"{name_prefix}_{suffix}", foliage, role)
+    create_empty(context, f"{name_prefix}_DECALS", visuals, ROLE_DECALS)
     return visuals
 
 
@@ -414,6 +443,12 @@ def sync_layout_node_names(layout, validate_only=False):
                 name_map[child] = f"{layout_id}_PBR"
             elif child.get(ROLE_PROPERTY) == ROLE_FOLIAGE_CARDS:
                 name_map[child] = f"{layout_id}_FOLIAGE_CARDS"
+                for group in child.children:
+                    suffix = FOLIAGE_GROUPS.get(group.get(ROLE_PROPERTY))
+                    if suffix:
+                        name_map[group] = f"{layout_id}_{suffix}"
+            elif child.get(ROLE_PROPERTY) == ROLE_DECALS:
+                name_map[child] = f"{layout_id}_DECALS"
 
     collisions = direct_child_with_role(root, ROLE_COLLISIONS)
     if collisions:
@@ -546,6 +581,7 @@ def layout_generated_node_names(layout_id):
         f"{layout_id}_VISUALS",
         f"{layout_id}_PBR",
         f"{layout_id}_FOLIAGE_CARDS",
+        f"{layout_id}_DECALS",
         f"{layout_id}_COLLISIONS",
         f"{layout_id}_SPAWN_POINTS",
         f"{layout_id}_EVENTS",
@@ -553,6 +589,7 @@ def layout_generated_node_names(layout_id):
         f"{layout_id}_OBSTACLES",
     }
     names.update(f"{layout_id}_COLLISIONS_{surface_id}" for surface_id in SURFACE_IDS)
+    names.update(f"{layout_id}_{suffix}" for suffix in FOLIAGE_GROUPS.values())
     return names
 
 
@@ -710,8 +747,13 @@ def apply_dynamic_target_export_names(settings):
 
 
 def apply_shadow_casting_export_flags(export_objects):
-    """Tags meshes with Object > Visibility > Ray Visibility > Shadow off; returns them for restore."""
-    tagged = [obj for obj in export_objects if obj.type == "MESH" and not obj.visible_shadow]
+    """Tags meshes that cast no shadow, returned for restore: those with Object > Visibility > Ray
+    Visibility > Shadow off, and every decal."""
+    decals = {
+        obj for root in export_objects if root.get(ROLE_PROPERTY) == ROLE_DECALS
+        for obj in descendants(root)
+    }
+    tagged = [obj for obj in export_objects if obj.type == "MESH" and (not obj.visible_shadow or obj in decals)]
     for obj in tagged:
         obj[CAST_SHADOW_PROPERTY] = False
     return tagged
@@ -781,6 +823,8 @@ def refresh_track_structure(context):
     scopes = [("Shared", settings.shared_root_object, None)]
     scopes.extend((layout.layout_id, layout.root_object, layout) for layout in settings.layouts)
     collision_roots = []
+    foliage_roots = []
+    missing_decal_roots = []
     surface_migrations = []
     reserved_names = set()
     seen_roots = set()
@@ -814,17 +858,63 @@ def refresh_track_structure(context):
             reserved_names.add(name)
         collision_roots.append(collisions)
 
+        visuals = direct_child_with_role(root, ROLE_VISUALS)
+        if visuals and not direct_child_with_role(visuals, ROLE_DECALS):
+            name = f"{layout.layout_id if layout else visuals.name.removesuffix('_VISUALS')}_DECALS"
+            if name in reserved_names or bpy.data.objects.get(name):
+                return False, f"Cannot create DECALS root; name already in use: {name}"
+            reserved_names.add(name)
+            missing_decal_roots.append((visuals, name))
+        foliage = direct_child_with_role(visuals, ROLE_FOLIAGE_CARDS)
+        if foliage:
+            group_prefix = layout.layout_id if layout else foliage.name.removesuffix("_FOLIAGE_CARDS")
+            for role, suffix in FOLIAGE_GROUPS.items():
+                if direct_child_with_role(foliage, role):
+                    continue
+                name = f"{group_prefix}_{suffix}"
+                if name in reserved_names or bpy.data.objects.get(name):
+                    return False, f"Cannot create foliage group; name already in use: {name}"
+                reserved_names.add(name)
+            foliage_roots.append((foliage, group_prefix))
+
     for group, name in surface_migrations:
         migrate_renamed_surface_group(group, name)
     for collisions in collision_roots:
         for surface_id in SURFACE_IDS:
             ensure_surface_group(context, collisions, surface_id)
+    for visuals, name in missing_decal_roots:
+        create_empty(context, name, visuals, ROLE_DECALS)
+    created_foliage_groups = 0
+    loose_foliage = []
+    for foliage, group_prefix in foliage_roots:
+        for role, suffix in FOLIAGE_GROUPS.items():
+            if not direct_child_with_role(foliage, role):
+                create_empty(context, f"{group_prefix}_{suffix}", foliage, role)
+                created_foliage_groups += 1
+        trees = direct_child_with_role(foliage, ROLE_FOLIAGE_TREES)
+        loose_foliage.extend(
+            (child, trees) for child in foliage.children
+            if child.get(ROLE_PROPERTY) not in FOLIAGE_GROUPS
+        )
+    if loose_foliage:
+        # Objects keep their world placement, which needs the new groups' world matrices.
+        context.view_layer.update()
+        for child, trees in loose_foliage:
+            matrix_world = child.matrix_world.copy()
+            child.parent = trees
+            child.matrix_world = matrix_world
     for layout in settings.layouts:
         if not sync_layout_node_names(layout):
             return False, f"{layout.layout_id}: generated object names already in use"
     message = "Track surface groups and layout object names refreshed"
     if surface_migrations:
         message += f"; migrated {len(surface_migrations)} renamed surface group(s)"
+    if missing_decal_roots:
+        message += f"; created {len(missing_decal_roots)} DECALS root(s)"
+    if created_foliage_groups:
+        message += f"; created {created_foliage_groups} foliage group(s)"
+    if loose_foliage:
+        message += f"; moved {len(loose_foliage)} foliage object(s) into TREES"
     return True, message
 
 
@@ -3246,6 +3336,385 @@ def lightmap_receivers(context, settings):
     return scopes, skipped, errors
 
 
+def lightmap_decals(settings):
+    """(prefix, layout, decal meshes) for Shared and every layout: the meshes under each DECALS root."""
+    scopes = []
+    for prefix, visuals, layout in lightmap_scopes(settings):
+        decals = [
+            obj for obj in hierarchy_descendants(direct_child_with_role(visuals, ROLE_DECALS))
+            if obj.type == "MESH"
+        ]
+        if decals:
+            scopes.append((prefix, layout, decals))
+    return scopes
+
+
+def plan_decal_lightmaps(receiver_scopes, decal_scopes, atlas_of):
+    """Where each decal vertex lands on the receivers, found before the bake so a bad decal fails early.
+
+    A decal reuses the lightmap of the surface under it. Each vertex is projected along its normal onto
+    the receivers of its own scope and of Shared, within DECAL_PROJECTION_DISTANCE. A mesh samples one
+    atlas, so the decal takes the atlas most of its vertices land on; vertices over another atlas take
+    the nearest point of that atlas's surfaces. Returns (plans, errors); a plan is (decal, atlas file,
+    {vertex index: (receiver, triangle loop indices, barycentric weights)}).
+    """
+    receivers_by_layout = {}
+    for _prefix, layout, receivers in receiver_scopes:
+        receivers_by_layout.setdefault(layout, []).extend(receivers)
+    trees = {}
+
+    def atlas_trees(layout):
+        """BVH trees of the receivers a decal of this layout may land on, one per atlas file."""
+        if layout not in trees:
+            objects = receivers_by_layout.get(None, []) + (receivers_by_layout.get(layout, []) if layout else [])
+            by_file = {}
+            for obj in objects:
+                by_file.setdefault(atlas_of[obj], []).append(obj)
+            trees[layout] = {}
+            for file_path, members in by_file.items():
+                corners, loops, owners = [], [], []
+                for obj in members:
+                    obj_corners, obj_loops = mesh_triangles(obj)
+                    corners.append(obj_corners)
+                    loops.append(obj_loops)
+                    owners.extend([obj] * len(obj_corners))
+                corners = np.concatenate(corners)
+                vertices = [tuple(point) for point in corners.reshape(-1, 3)]
+                polygons = [(3 * index, 3 * index + 1, 3 * index + 2) for index in range(len(corners))]
+                trees[layout][file_path] = (BVHTree.FromPolygons(vertices, polygons), corners, np.concatenate(loops), owners)
+        return trees[layout]
+
+    def landing(tree_data, index, location):
+        _tree, corners, loops, owners = tree_data
+        a, b, c = (Vector(point) for point in corners[index])
+        weights = barycentric_weights(location, a, b, c)
+        return owners[index], tuple(int(loop) for loop in loops[index]), weights
+
+    plans, errors = [], []
+    for _prefix, layout, decals in decal_scopes:
+        candidates = atlas_trees(layout)
+        for decal in decals:
+            if decal.data.users > 1:
+                errors.append(f"Decal {decal.name} shares its mesh data; make it single-user so it holds its own lightmap UVs")
+                continue
+            matrix = decal.matrix_world
+            normal_matrix = matrix.inverted_safe().transposed().to_3x3()
+            rays = []
+            for vertex in decal.data.vertices:
+                normal = normal_matrix @ vertex.normal
+                normal = normal.normalized() if normal.length > 1e-9 else Vector((0.0, 0.0, 1.0))
+                rays.append((vertex.index, matrix @ vertex.co, normal))
+            hits = {}
+            for vertex_index, position, normal in rays:
+                origin = position + normal * DECAL_PROJECTION_DISTANCE
+                best = None
+                for file_path, tree_data in candidates.items():
+                    location, _normal, index, distance = tree_data[0].ray_cast(origin, -normal, 2 * DECAL_PROJECTION_DISTANCE)
+                    if location is not None and (best is None or distance < best[0]):
+                        best = (distance, file_path, index, location)
+                if best:
+                    hits[vertex_index] = best[1:]
+            if not hits:
+                errors.append(
+                    f"Decal {decal.name} has no lightmapped surface within {DECAL_PROJECTION_DISTANCE} m under it"
+                )
+                continue
+            files = [file_path for file_path, _index, _location in hits.values()]
+            chosen = max(set(files), key=files.count)
+            tree_data = candidates[chosen]
+            landings = {}
+            for vertex_index, position, normal in rays:
+                hit = hits.get(vertex_index)
+                if hit and hit[0] == chosen:
+                    landings[vertex_index] = landing(tree_data, hit[1], hit[2])
+                    continue
+                origin = position + normal * DECAL_PROJECTION_DISTANCE
+                location, _normal, index, _distance = tree_data[0].ray_cast(origin, -normal, 2 * DECAL_PROJECTION_DISTANCE)
+                if location is None:
+                    location, _normal, index, _distance = tree_data[0].find_nearest(position)
+                landings[vertex_index] = landing(tree_data, index, location)
+            plans.append((decal, chosen, landings))
+    return plans, errors
+
+
+def barycentric_weights(point, a, b, c):
+    """Weights of a triangle's corners at a point on it."""
+    v0, v1, v2 = b - a, c - a, point - a
+    d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
+    d20, d21 = v2.dot(v0), v2.dot(v1)
+    denominator = d00 * d11 - d01 * d01
+    if abs(denominator) < 1e-18:
+        return (1.0, 0.0, 0.0)
+    v = (d11 * d20 - d01 * d21) / denominator
+    w = (d00 * d21 - d01 * d20) / denominator
+    return (1.0 - v - w, v, w)
+
+
+def apply_decal_lightmaps(plans):
+    """Give each decal the baked Lightmap UVs of the receiver points under its vertices."""
+    for decal, file_path, landings in plans:
+        mesh = decal.data
+        coordinates = {}
+        for vertex_index, (receiver, loops, weights) in landings.items():
+            uv = receiver.data.uv_layers[LIGHTMAP_UV_NAME].uv
+            coordinates[vertex_index] = sum(
+                (uv[loop].vector * weight for loop, weight in zip(loops, weights)), Vector((0.0, 0.0)),
+            )
+        layer = ensure_lightmap_uv_layer(mesh)
+        for loop in mesh.loops:
+            layer.uv[loop.index].vector = coordinates[loop.vertex_index]
+        decal[LIGHTMAP_PROPERTY] = file_path
+
+
+def lightmap_grass(settings):
+    """(prefix, layout, grass meshes) for Shared and every layout: the meshes under each GRASS group."""
+    scopes = []
+    for prefix, visuals, layout in lightmap_scopes(settings):
+        group = direct_child_with_role(direct_child_with_role(visuals, ROLE_FOLIAGE_CARDS), ROLE_FOLIAGE_GRASS)
+        meshes = [obj for obj in hierarchy_descendants(group) if obj.type == "MESH" and obj.data.polygons]
+        if meshes:
+            scopes.append((prefix, layout, meshes))
+    return scopes
+
+
+def grass_lightmap_file(prefix):
+    return f"{LIGHTMAP_DIRECTORY}/{prefix}_grass.png"
+
+
+def evaluated_corner_positions(obj, depsgraph):
+    """World position of every face corner and the corners of every triangle, with modifiers applied.
+
+    None when modifiers add or remove geometry: the mesh's own UV maps cannot address generated corners.
+    """
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        if len(mesh.loops) != len(obj.data.loops):
+            return None
+        coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", coordinates)
+        corners = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", corners)
+        mesh.calc_loop_triangles()
+        triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("loops", triangles)
+    finally:
+        evaluated.to_mesh_clear()
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world = coordinates.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    return world[corners], triangles.reshape(-1, 3)
+
+
+def grow_heights(heights, steps):
+    """Each texel takes the highest value within `steps` texels of it."""
+    size = heights.shape[0]
+    for _step in range(steps):
+        padded = np.pad(heights, 1, constant_values=-np.inf)
+        grown = heights.copy()
+        for row_step in (0, 1, 2):
+            for column_step in (0, 1, 2):
+                np.maximum(grown, padded[row_step:row_step + size, column_step:column_step + size], out=grown)
+        heights = grown
+    return heights
+
+
+def barycentric_weight_rows(points, corners):
+    """barycentric_weights for many points, each on its own triangle (corners: n x 3 x 3)."""
+    a, b, c = corners[:, 0], corners[:, 1], corners[:, 2]
+    v0, v1, v2 = b - a, c - a, points - a
+    d00, d01, d11 = (v0 * v0).sum(axis=1), (v0 * v1).sum(axis=1), (v1 * v1).sum(axis=1)
+    d20, d21 = (v2 * v0).sum(axis=1), (v2 * v1).sum(axis=1)
+    denominator = d00 * d11 - d01 * d01
+    degenerate = np.abs(denominator) < 1e-18
+    denominator = np.where(degenerate, 1.0, denominator)
+    v = np.where(degenerate, 0.0, (d11 * d20 - d01 * d21) / denominator)
+    w = np.where(degenerate, 0.0, (d00 * d21 - d01 * d20) / denominator)
+    return np.stack((1.0 - v - w, v, w), axis=1)
+
+
+def plan_grass_lightmaps(context, receiver_scopes, grass_scopes, max_size):
+    """Where the ground lies under each scope's grass, found before the bake so bad grass fails early.
+
+    A scope's grass gets one square top-down map centred on its meshes, at most LIGHTMAP_GRASS_TEXEL_SIZE
+    per texel, up to max_size pixels. Every texel within LIGHTMAP_GRASS_BORDER_TEXELS of grass casts a ray
+    straight down from LIGHTMAP_GRASS_RAY_START above the highest grass around it onto the receivers of its
+    own scope and of Shared: the first surface it meets is the ground the grass stands on, under trees,
+    houses, and arches alike. Returns (plans, errors); a plan holds the map's file, size, placement, the
+    grass meshes with their corner positions, and each hit texel's receiver triangle and weights.
+    """
+    receivers_by_layout = {}
+    for _prefix, layout, receivers in receiver_scopes:
+        receivers_by_layout.setdefault(layout, []).extend(receivers)
+    depsgraph = context.evaluated_depsgraph_get()
+    plans, errors = [], []
+    for prefix, layout, meshes in grass_scopes:
+        members = []
+        for obj in meshes:
+            other_uv_maps = len([layer for layer in obj.data.uv_layers if layer.name != LIGHTMAP_UV_NAME])
+            if obj.data.users > 1:
+                errors.append(f"Grass {obj.name} shares its mesh data; make it single-user so it holds its own lightmap UVs")
+                continue
+            if other_uv_maps >= LIGHTMAP_MAX_UV_MAPS:
+                errors.append(
+                    f"{obj.name} has {other_uv_maps} UV maps; remove one so the lightmap fits in the "
+                    f"{LIGHTMAP_MAX_UV_MAPS} UV sets the game reads"
+                )
+                continue
+            evaluated = evaluated_corner_positions(obj, depsgraph)
+            if evaluated is None:
+                errors.append(f"{obj.name}: apply modifiers that add or remove geometry before baking")
+                continue
+            members.append((obj, *evaluated))
+        if not members:
+            continue
+
+        points = np.concatenate([positions[:, :2] for _obj, positions, _triangles in members])
+        low, high = points.min(axis=0), points.max(axis=0)
+        extent = max(float((high - low).max()), LIGHTMAP_GRASS_TEXEL_SIZE)
+        border = LIGHTMAP_GRASS_BORDER_TEXELS
+        size = LIGHTMAP_GRASS_MIN_SIZE
+        while size < max_size and extent / (size - 2 * border) > LIGHTMAP_GRASS_TEXEL_SIZE:
+            size *= 2
+        texel_size = extent / (size - 2 * border)
+        origin = (low + high) / 2.0 - size * texel_size / 2.0
+
+        # Highest grass over each texel, from every triangle's bounds, then grown by the border.
+        heights = np.full((size, size), -np.inf)
+        for _obj, positions, triangles in members:
+            corners = positions[triangles]
+            cells = (corners[..., :2] - origin) / texel_size
+            first = np.clip(np.floor(cells.min(axis=1)).astype(np.int64), 0, size - 1)
+            last = np.clip(np.floor(cells.max(axis=1)).astype(np.int64), 0, size - 1)
+            tops = corners[..., 2].max(axis=1)
+            spans = last - first + 1
+            # Grass cards cover a few texels: those fill by offset, larger triangles block by block.
+            small = (spans <= 8).all(axis=1)
+            for row_step in range(int(spans[small, 1].max(initial=0))):
+                for column_step in range(int(spans[small, 0].max(initial=0))):
+                    inside = small & (spans[:, 0] > column_step) & (spans[:, 1] > row_step)
+                    np.maximum.at(heights, (first[inside, 1] + row_step, first[inside, 0] + column_step), tops[inside])
+            for triangle in np.flatnonzero(~small):
+                block = heights[first[triangle, 1]:last[triangle, 1] + 1, first[triangle, 0]:last[triangle, 0] + 1]
+                np.maximum(block, tops[triangle], out=block)
+        heights = grow_heights(heights, border).ravel()
+
+        candidates = receivers_by_layout.get(None, []) + (receivers_by_layout.get(layout, []) if layout else [])
+        hit = np.zeros(size * size, dtype=bool)
+        texels = np.zeros(0, dtype=np.int64)
+        owners = np.zeros(0, dtype=np.int64)
+        loops = np.zeros((0, 3), dtype=np.int64)
+        weights = np.zeros((0, 3))
+        if candidates:
+            corners, triangle_loops, triangle_owners = [], [], []
+            for number, receiver in enumerate(candidates):
+                receiver_corners, receiver_loops = mesh_triangles(receiver)
+                corners.append(receiver_corners)
+                triangle_loops.append(receiver_loops)
+                triangle_owners.append(np.full(len(receiver_corners), number, dtype=np.int64))
+            corners = np.concatenate(corners)
+            triangle_loops, triangle_owners = np.concatenate(triangle_loops), np.concatenate(triangle_owners)
+            tree = BVHTree.FromPolygons(
+                [tuple(point) for point in corners.reshape(-1, 3)],
+                [(3 * index, 3 * index + 1, 3 * index + 2) for index in range(len(corners))],
+            )
+            searched = np.flatnonzero(np.isfinite(heights))
+            rows, columns = np.divmod(searched, size)
+            xs = origin[0] + (columns + 0.5) * texel_size
+            ys = origin[1] + (rows + 0.5) * texel_size
+            zs = heights[searched] + LIGHTMAP_GRASS_RAY_START
+            down = Vector((0.0, 0.0, -1.0))
+            found, triangles, locations = [], [], []
+            for texel, x, y, z in zip(searched.tolist(), xs.tolist(), ys.tolist(), zs.tolist()):
+                location, _normal, index, _distance = tree.ray_cast(Vector((x, y, z)), down)
+                if location is not None:
+                    found.append(texel)
+                    triangles.append(index)
+                    locations.append(tuple(location))
+            texels = np.array(found, dtype=np.int64)
+            triangles = np.array(triangles, dtype=np.int64)
+            owners, loops = triangle_owners[triangles], triangle_loops[triangles]
+            weights = barycentric_weight_rows(np.array(locations).reshape(-1, 3), corners[triangles])
+            hit[texels] = True
+
+        for obj, positions, _triangles in members:
+            cells = np.clip(np.floor((positions[:, :2] - origin) / texel_size).astype(np.int64), 0, size - 1)
+            if not hit[cells[:, 1] * size + cells[:, 0]].any():
+                errors.append(f"Grass {obj.name} has no lightmapped surface under it")
+        plans.append({
+            "file": grass_lightmap_file(prefix),
+            "size": size,
+            "origin": origin,
+            "texel": texel_size,
+            "members": [(obj, positions) for obj, positions, _triangles in members],
+            "receivers": candidates,
+            "texels": texels,
+            "owners": owners,
+            "loops": loops,
+            "weights": weights,
+        })
+    return plans, errors
+
+
+def sample_lightmap_channel(channel, coordinates):
+    """Bilinear samples of one atlas channel (rows from v = 0) at lightmap UV coordinates."""
+    size = channel.shape[0]
+    x = np.clip(coordinates[:, 0] * size - 0.5, 0.0, size - 1.0)
+    y = np.clip(coordinates[:, 1] * size - 0.5, 0.0, size - 1.0)
+    x0 = np.minimum(np.floor(x).astype(np.int64), size - 2)
+    y0 = np.minimum(np.floor(y).astype(np.int64), size - 2)
+    fx, fy = x - x0, y - y0
+    return (
+        channel[y0, x0] * (1.0 - fx) * (1.0 - fy) + channel[y0, x0 + 1] * fx * (1.0 - fy)
+        + channel[y0 + 1, x0] * (1.0 - fx) * fy + channel[y0 + 1, x0 + 1] * fx * fy
+    )
+
+
+def apply_grass_lightmaps(settings, plans):
+    """Fill each grass map from the baked receiver atlases under it and point the grass at the map.
+
+    Texels with no receiver under them take the nearest baked texels. Every grass corner maps straight
+    down onto the map, so grass shows the ambient occlusion and sun shadow of the ground it stands on.
+    """
+    images = baked_lightmap_images()
+    for plan in plans:
+        size, texels, owners = plan["size"], plan["texels"], plan["owners"]
+        coordinates = np.zeros((len(texels), 2))
+        for number, receiver in enumerate(plan["receivers"]):
+            chosen = owners == number
+            if chosen.any():
+                uv = uv_layer_coordinates(receiver.data.uv_layers[LIGHTMAP_UV_NAME])
+                coordinates[chosen] = (uv[plan["loops"][chosen]] * plan["weights"][chosen, :, None]).sum(axis=1)
+        files = [receiver[LIGHTMAP_PROPERTY] for receiver in plan["receivers"]]
+        file_numbers = {file_path: number for number, file_path in enumerate(dict.fromkeys(files))}
+        hit_files = np.array([file_numbers[file_path] for file_path in files], dtype=np.int64)[owners]
+        values = np.zeros((2, size * size), dtype=np.float32)
+        for file_path, number in file_numbers.items():
+            chosen = hit_files == number
+            if not chosen.any():
+                continue
+            image = images[file_path]
+            atlas_size = image.size[0]
+            pixels = np.empty(len(image.pixels), dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            pixels = pixels.reshape(atlas_size, atlas_size, 4)
+            for channel in (0, 1):
+                values[channel, texels[chosen]] = sample_lightmap_channel(pixels[..., channel], coordinates[chosen])
+            del pixels
+        valid = np.zeros(size * size, dtype=bool)
+        valid[texels] = True
+        store_lightmap_image(
+            settings, plan["file"], size,
+            fill_empty_texels(values[0], valid, size),
+            fill_empty_texels(values[1], valid, size),
+        )
+        span = size * plan["texel"]
+        for obj, positions in plan["members"]:
+            layer = ensure_lightmap_uv_layer(obj.data)
+            layer.uv.foreach_set("vector", ((positions[:, :2] - plan["origin"]) / span).ravel())
+            obj.data.update()
+            obj[LIGHTMAP_PROPERTY] = plan["file"]
+
+
 def mesh_triangles(obj):
     """World-space triangle corners and their loop indices."""
     mesh = obj.data
@@ -3396,6 +3865,68 @@ def box_projection(obj):
     planes = np.array(((1, 2), (0, 2), (0, 1)))[axes[loop_faces]]
     rows = np.arange(len(points))
     return np.stack((points[rows, planes[:, 0]], points[rows, planes[:, 1]]), axis=1), keys
+
+
+def box_projection_layers(obj, uv, keys, cells, texel_size):
+    """Per face: a layer index that keeps faces of one box chart from sharing a texel.
+
+    A box chart flattens every face that points one way, so faces behind one another, such as a wall
+    behind its trim or hidden faces behind both, would land on the same texels and take each other's
+    baked light. Faces are placed front-most first; one that would cover a texel already taken in
+    every existing layer opens a new layer, which becomes a chart of its own.
+    """
+    mesh = obj.data
+    count = len(mesh.polygons)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    centers = np.empty(count * 3, dtype=np.float64)
+    mesh.polygons.foreach_get("center", centers)
+    centers = centers.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    axes, positive = keys // 2, keys % 2 == 1
+    # Larger is nearer the side the faces point to.
+    fronts = np.where(positive, 1.0, -1.0) * centers[np.arange(count), axes]
+    mesh.calc_loop_triangles()
+    triangle_loops = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+    mesh.loop_triangles.foreach_get("loops", triangle_loops)
+    triangle_faces = np.empty(len(mesh.loop_triangles), dtype=np.int64)
+    mesh.loop_triangles.foreach_get("polygon_index", triangle_faces)
+    corners = (uv / texel_size)[triangle_loops].reshape(-1, 3, 2)
+    triangles_of = [[] for _ in range(count)]
+    for triangle, face in enumerate(triangle_faces):
+        triangles_of[face].append(triangle)
+
+    def texels(face):
+        """Texels whose centre the face covers; the texel under its middle when it covers none."""
+        covered = set()
+        for a, b, c in corners[triangles_of[face]]:
+            low = np.floor(np.minimum(np.minimum(a, b), c)).astype(np.int64)
+            high = np.ceil(np.maximum(np.maximum(a, b), c)).astype(np.int64)
+            xs, ys = np.meshgrid(np.arange(low[0], high[0]) + 0.5, np.arange(low[1], high[1]) + 0.5)
+            determinant = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(determinant) < 1e-12:
+                continue
+            w0 = ((b[1] - c[1]) * (xs - c[0]) + (c[0] - b[0]) * (ys - c[1])) / determinant
+            w1 = ((c[1] - a[1]) * (xs - c[0]) + (a[0] - c[0]) * (ys - c[1])) / determinant
+            inside = (w0 > 1e-9) & (w1 > 1e-9) & (1.0 - w0 - w1 > 1e-9)
+            covered.update(zip(np.floor(xs[inside]).astype(np.int64).tolist(), np.floor(ys[inside]).astype(np.int64).tolist()))
+        if not covered and triangles_of[face]:
+            middle = corners[triangles_of[face]].reshape(-1, 2).mean(axis=0)
+            covered.add((int(np.floor(middle[0])), int(np.floor(middle[1]))))
+        return covered
+
+    layers = np.zeros(count, dtype=np.int64)
+    groups = {}
+    for face in range(count):
+        groups.setdefault((int(keys[face]), *cells[face].tolist()), []).append(face)
+    for faces in groups.values():
+        taken = []
+        for face in sorted(faces, key=lambda index: -fronts[index]):
+            footprint = texels(face)
+            layer = next((index for index, used in enumerate(taken) if not footprint & used), len(taken))
+            if layer == len(taken):
+                taken.append(set())
+            taken[layer] |= footprint
+            layers[face] = layer
+    return layers
 
 
 def face_cells(obj, chart_size):
@@ -3627,14 +4158,20 @@ def validate_lightmaps(context, settings, errors):
     scopes, _skipped, receiver_errors = lightmap_receivers(context, settings)
     errors.extend(receiver_errors)
     receivers = {obj for _prefix, _layout, objects in scopes for obj in objects}
-    for obj in sorted(receivers, key=lambda item: item.name):
+    decals = {obj for _prefix, _layout, objects in lightmap_decals(settings) for obj in objects}
+    grass = {obj for _prefix, _layout, objects in lightmap_grass(settings) for obj in objects}
+    for obj in sorted(receivers | decals | grass, key=lambda item: item.name):
         layers = obj.data.uv_layers
-        if (
+        if obj in decals and obj.data.users > 1:
+            errors.append(f"Decal {obj.name} shares its mesh data; make it single-user so it holds its own lightmap UVs")
+        elif obj in grass and obj.data.users > 1:
+            errors.append(f"Grass {obj.name} shares its mesh data; make it single-user so it holds its own lightmap UVs")
+        elif (
             obj.get(LIGHTMAP_PROPERTY) not in images
             or layers.find(LIGHTMAP_UV_NAME) != len(layers) - 1
         ):
             errors.append(f"{obj.name} has no current lightmap; click Bake Shadows")
-    for obj in sorted(tagged - receivers, key=lambda item: item.name):
+    for obj in sorted(tagged - receivers - decals - grass, key=lambda item: item.name):
         errors.append(f"{obj.name} is no longer a lightmap receiver; click Bake Shadows")
     sun = preview_sun(context)
     if not any(settings.lightmap_sun_direction):
@@ -3727,6 +4264,7 @@ def prepare_lightmap_scene(context, settings, state, sun):
     state.assign(scene.render, "engine", "CYCLES")
     state.assign(scene.cycles, "device", cycles_bake_device())
     state.assign(scene.cycles, "samples", settings.lightmap_samples)
+    state.assign(scene.cycles, "transparent_max_bounces", LIGHTMAP_TRANSPARENT_BOUNCES)
     # A black world: the sun passes see only the sun, and the world sets the AO distance.
     world = bpy.data.worlds.new("vectorg_lightmap_bake")
     world.use_nodes = False
@@ -3735,6 +4273,7 @@ def prepare_lightmap_scene(context, settings, state, sun):
     state.assign(scene, "world", world)
     state.restores.append(lambda: bpy.data.worlds.remove(world))
     state.assign(sun.data, "energy", LIGHTMAP_BAKE_SUN_STRENGTH)
+    state.assign(sun.data, "angle", LIGHTMAP_BAKE_SUN_ANGLE)
     state.assign(sun.data, "use_shadow", True)
     for obj in scene.objects:
         state.assign(obj, "hide_render", obj.hide_render)
@@ -3757,9 +4296,11 @@ def prepare_lightmap_scene(context, settings, state, sun):
 
 def show_lightmap_scope(context, settings, layout, sun):
     """Render the scope's casters lit by the preview sun alone."""
+    # Decals neither cast nor receive in the bake; they reuse the lightmap under them.
+    decals = {obj for _prefix, _layout, objects in lightmap_decals(settings) for obj in objects}
     rendered = {
         obj for obj in preview_render_objects(context, settings, layout)
-        if obj.type != "LIGHT" or obj == sun
+        if (obj.type != "LIGHT" or obj == sun) and obj not in decals
     }
     for obj in context.scene.objects:
         obj.hide_render = obj not in rendered
@@ -3835,11 +4376,14 @@ def unwrap_lightmap_atlas(context, state, objects, areas, atlas_size, texel_size
         if uv_area > 0.0:
             uv *= math.sqrt(areas[obj] / uv_area)
         labels, boundary = uv_face_islands(mesh, uv)
+        cells = face_cells(obj, LIGHTMAP_CHART_PIXELS * texel_size)
         # Curved high-poly props shred into thousands of islands, and loose parts are islands of
-        # their own; when their margins outgrow the object, six planar charts replace them.
+        # their own; when their margins outgrow the object, planar charts per side replace them,
+        # layered so faces behind one another never share texels.
         if boundary * padding * texel_size > areas[obj]:
-            uv, labels = box_projection(obj)
-        keys = np.column_stack((labels, face_cells(obj, LIGHTMAP_CHART_PIXELS * texel_size)))
+            uv, sides = box_projection(obj)
+            labels = np.column_stack((sides, box_projection_layers(obj, uv, sides, cells, texel_size)))
+        keys = np.column_stack((labels, cells))
         _unique, face_charts = np.unique(keys, axis=0, return_inverse=True)
         face_charts = face_charts.ravel()
         loop_faces, _following = mesh_loop_faces(mesh)
@@ -3960,7 +4504,7 @@ def remove_lightmap_bake_proxy(proxy):
         bpy.data.meshes.remove(mesh)
 
 
-def bake_lightmap_pass(bake_type, image, pass_filter=frozenset()):
+def bake_lightmap_pass(bake_type, image, pass_filter=frozenset(), margin=LIGHTMAP_BAKE_MARGIN_PIXELS):
     """One Cycles bake pass into the attached image.
 
     Returns its first channel and a mask of the texels the bake wrote: charts plus their margin.
@@ -3970,7 +4514,7 @@ def bake_lightmap_pass(bake_type, image, pass_filter=frozenset()):
     result = bpy.ops.object.bake(
         type=bake_type,
         pass_filter=set(pass_filter),
-        margin=LIGHTMAP_BAKE_MARGIN_PIXELS,
+        margin=margin,
         margin_type="EXTEND",
         use_selected_to_active=False,
         use_clear=False,
@@ -3989,7 +4533,9 @@ def bake_lightmap_coverage(context, proxies, image):
     """How opaque each texel's surface is (1 = solid, 0 = fully transparent), and the texels baked.
 
     Cycles weights a surface's own ambient occlusion by its alpha. With nothing else rendered and
-    the proxies casting nothing, their ambient occlusion is that weight alone.
+    the proxies casting nothing, their ambient occlusion is that weight alone. It bakes without a
+    margin: margin texels copy their chart's edge before buried and see-through texels are refilled,
+    so they are rebuilt from the refilled chart instead.
     """
     rendered = [obj for obj in context.scene.objects if not obj.hide_render and obj not in proxies]
     casts_shadow = [(proxy, proxy.visible_shadow) for proxy in proxies]
@@ -3998,7 +4544,7 @@ def bake_lightmap_coverage(context, proxies, image):
     for proxy in proxies:
         proxy.visible_shadow = False
     try:
-        return bake_lightmap_pass("AO", image)
+        return bake_lightmap_pass("AO", image, margin=0)
     finally:
         for obj in rendered:
             obj.hide_render = False
@@ -4047,6 +4593,149 @@ def fill_empty_texels(values, covered, size):
         coarse = np.repeat(np.repeat(filled, 2, axis=0), 2, axis=1)
         filled = np.where(weight > 0.0, level, coarse)
     return filled.ravel().astype(np.float32)
+
+
+def hemisphere_directions(count):
+    """Evenly spread unit directions over the +Z hemisphere, denser toward the pole like cosine sampling."""
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    directions = []
+    for index in range(count):
+        z = math.sqrt(1.0 - (index + 0.5) / count)
+        radius = math.sqrt(max(0.0, 1.0 - z * z))
+        directions.append((math.cos(golden * index) * radius, math.sin(golden * index) * radius, z))
+    return np.array(directions)
+
+
+def lightmap_solids(context, settings, layout):
+    """Meshes that bound solid volumes in a scope's bake: what it renders as casters, without foliage cards and decals."""
+    decals = {obj for _prefix, _layout, objects in lightmap_decals(settings) for obj in objects}
+    foliage = {
+        obj for root in track_objects(settings) if root.get(ROLE_PROPERTY) == ROLE_FOLIAGE_CARDS
+        for obj in descendants(root)
+    }
+    return [
+        obj for obj in preview_render_objects(context, settings, layout)
+        if obj.type == "MESH" and obj.visible_shadow and obj not in decals and obj not in foliage and obj.data.polygons
+    ]
+
+
+def buried_texels(context, solids, receivers, size, candidates):
+    """Texels whose bake point lies inside another solid part: most of their hemisphere rays hit back faces.
+
+    Where parts intersect, such as trim sunk into a wall or a dormer through a roof, part of a texel
+    lies inside the other part. Cycles bakes it fully occluded, and its black spreads over the visible
+    surface around it. Only candidate texels (dark ones) are tested; the solids tested for one texel are
+    those whose bounds hold its bake point, since a point can only be inside a part within its bounds.
+    """
+    buried = np.zeros(size * size, dtype=bool)
+    if not candidates.any():
+        return buried
+    # Bake point and normal of every candidate texel, from the receivers' Lightmap UV triangles.
+    table = np.zeros((size + 1, size + 1), dtype=np.int64)
+    table[1:, 1:] = candidates.reshape(size, size).cumsum(0).cumsum(1)
+    points, normals, texels = [], [], []
+    for obj in receivers:
+        # A mirrored object's winding turns its triangles' normals inward.
+        outward = -1.0 if obj.matrix_world.determinant() < 0.0 else 1.0
+        corners, loops = mesh_triangles(obj)
+        uv = uv_layer_coordinates(obj.data.uv_layers[LIGHTMAP_UV_NAME])[loops] * size
+        low = np.clip(np.floor(uv.min(axis=1)).astype(np.int64), 0, size)
+        high = np.clip(np.ceil(uv.max(axis=1)).astype(np.int64), 0, size)
+        holding = (
+            table[high[:, 1], high[:, 0]] - table[low[:, 1], high[:, 0]]
+            - table[high[:, 1], low[:, 0]] + table[low[:, 1], low[:, 0]]
+        ) > 0
+        for triangle in np.flatnonzero(holding):
+            a, b, c = uv[triangle]
+            xs, ys = np.meshgrid(np.arange(low[triangle, 0], high[triangle, 0]), np.arange(low[triangle, 1], high[triangle, 1]))
+            px, py = xs + 0.5, ys + 0.5
+            determinant = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(determinant) < 1e-12:
+                continue
+            w0 = ((b[1] - c[1]) * (px - c[0]) + (c[0] - b[0]) * (py - c[1])) / determinant
+            w1 = ((c[1] - a[1]) * (px - c[0]) + (a[0] - c[0]) * (py - c[1])) / determinant
+            w2 = 1.0 - w0 - w1
+            index = ys * size + xs
+            inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0) & candidates[index]
+            if not inside.any():
+                continue
+            world = corners[triangle]
+            normal = outward * np.cross(world[1] - world[0], world[2] - world[0])
+            length = np.linalg.norm(normal)
+            if length < 1e-12:
+                continue
+            points.append(w0[inside, None] * world[0] + w1[inside, None] * world[1] + w2[inside, None] * world[2])
+            normals.append(np.repeat((normal / length)[None], inside.sum(), axis=0))
+            texels.append(index[inside])
+    if not points:
+        return buried
+    points, normals, texels = np.concatenate(points), np.concatenate(normals), np.concatenate(texels)
+
+    # Solids by grid cell of their world bounds, so each texel tests only the parts around it.
+    depsgraph = context.evaluated_depsgraph_get()
+    bounds = []
+    for obj in solids:
+        corners = np.array([obj.matrix_world @ Vector(corner) for corner in obj.bound_box])
+        bounds.append((corners.min(axis=0) - 0.01, corners.max(axis=0) + 0.01))
+    cell = 8.0
+    grid = {}
+    for number, (low, high) in enumerate(bounds):
+        first, last = np.floor(low / cell).astype(int), np.floor(high / cell).astype(int)
+        if np.prod(last - first + 1) > 4096:
+            grid.setdefault("large", []).append(number)
+            continue
+        for x in range(first[0], last[0] + 1):
+            for y in range(first[1], last[1] + 1):
+                for z in range(first[2], last[2] + 1):
+                    grid.setdefault((x, y, z), []).append(number)
+    trees = {}
+    inverses = [obj.matrix_world.inverted_safe() for obj in solids]
+
+    def tree_of(obj):
+        key = obj.data if not obj.modifiers else obj
+        if key not in trees:
+            evaluated = obj.evaluated_get(depsgraph)
+            mesh = evaluated.to_mesh()
+            try:
+                trees[key] = BVHTree.FromPolygons([vertex.co.copy() for vertex in mesh.vertices], [tuple(polygon.vertices) for polygon in mesh.polygons])
+            finally:
+                evaluated.to_mesh_clear()
+        return trees[key]
+
+    hemisphere = hemisphere_directions(LIGHTMAP_BURIED_RAYS)
+    for number, (point, normal, texel) in enumerate(zip(points, normals, texels)):
+        key = tuple(np.floor(point / cell).astype(int))
+        nearby = [
+            index for index in grid.get(key, []) + grid.get("large", [])
+            if np.all(point >= bounds[index][0]) and np.all(point <= bounds[index][1])
+        ]
+        if not nearby:
+            continue
+        helper = (1.0, 0.0, 0.0) if abs(normal[0]) < 0.9 else (0.0, 1.0, 0.0)
+        tangent = np.cross(normal, helper)
+        tangent /= np.linalg.norm(tangent)
+        bitangent = np.cross(normal, tangent)
+        origin = Vector(point + normal * 1e-4)
+        back = 0
+        for local in hemisphere:
+            direction = Vector(tangent * local[0] + bitangent * local[1] + normal * local[2])
+            nearest, facing_away = LIGHTMAP_AO_DISTANCE, False
+            for index in nearby:
+                obj = solids[index]
+                inverse = inverses[index]
+                local_origin = inverse @ origin
+                local_direction = (inverse.to_3x3() @ direction)
+                location, hit_normal, _face, _distance = tree_of(obj).ray_cast(local_origin, local_direction.normalized())
+                if location is None:
+                    continue
+                distance = (obj.matrix_world @ location - origin).length
+                if distance < nearest:
+                    # The sign of the face's normal against the ray survives the object's transform.
+                    nearest, facing_away = distance, hit_normal.dot(local_direction) > 0.0
+            back += facing_away
+        if back > LIGHTMAP_BURIED_SHARE * len(hemisphere):
+            buried[texel] = True
+    return buried
 
 
 def dilate_into_holes(channels, valid, holes, size):
@@ -4137,6 +4826,14 @@ def iter_lightmap_bake(context, settings, report):
         ]
         for index, (group, size) in enumerate(lightmap_atlas_groups(items, texel_size, atlas_size)):
             atlases.append((lightmap_image_file(prefix, index), layout, group, size))
+    atlas_of = {obj: file_path for file_path, _layout, objects, _size in atlases for obj in objects}
+    decal_plans, decal_errors = plan_decal_lightmaps(scopes, lightmap_decals(settings), atlas_of)
+    grass_scopes = lightmap_grass(settings)
+    if grass_scopes:
+        yield 0.01, "Finding the ground under the grass..."
+    grass_plans, grass_errors = plan_grass_lightmaps(context, scopes, grass_scopes, atlas_size)
+    if decal_errors or grass_errors:
+        raise TrackValidationError(decal_errors + grass_errors, [])
 
     try:
         unwrap_state = json.loads(settings.lightmap_unwrap_state or "{}")
@@ -4193,13 +4890,10 @@ def iter_lightmap_bake(context, settings, report):
                 yield 0.2 + step * index, f"Baking ambient occlusion {index + 1}/{len(atlases)}: {file_path}"
                 select_lightmap_objects(context, state, proxies)
                 coverage, _covered = bake_lightmap_coverage(context, proxies, image)
-                # Receivers with Shadow off take no ambient occlusion: only the others bake it.
-                casting = [proxy for proxy in proxies if proxy.visible_shadow]
-                ambient_occlusion = np.ones(size * size, dtype=np.float32)
-                if casting:
-                    select_lightmap_objects(context, state, casting)
-                    occluded, baked = bake_lightmap_pass("AO", image)
-                    ambient_occlusion[baked] = occluded[baked]
+                # Every receiver takes ambient occlusion; one with Shadow off darkens no other surface.
+                select_lightmap_objects(context, state, proxies)
+                occluded, baked = bake_lightmap_pass("AO", image)
+                ambient_occlusion = np.where(baked, occluded, 1.0).astype(np.float32)
                 yield 0.2 + step * (index + 0.5), f"Baking sun shadow {index + 1}/{len(atlases)}: {file_path}"
                 select_lightmap_objects(context, state, proxies)
                 sun_shadow, covered = bake_sun_visibility(sun, image)
@@ -4214,8 +4908,16 @@ def iter_lightmap_bake(context, settings, report):
             ambient_occlusion = np.where(
                 solid, np.clip(ambient_occlusion / np.maximum(coverage, LIGHTMAP_MIN_COVERAGE), 0.0, 1.0), 0.0,
             )
+            # Texels inside another solid part are no surface anyone sees; they take their neighbours'
+            # lighting like holes do, instead of spreading black over the visible surface beside them.
+            yield 0.2 + step * (index + 0.9), f"Finding buried texels {index + 1}/{len(atlases)}: {file_path}"
+            buried = buried_texels(
+                context, lightmap_solids(context, settings, layout), objects, size,
+                solid & (ambient_occlusion < LIGHTMAP_BURIED_AO),
+            )
+            usable = solid & ~buried
             (ambient_occlusion, sun_shadow), valid = dilate_into_holes(
-                np.stack((ambient_occlusion, sun_shadow)), solid, covered & ~solid, size,
+                np.stack((ambient_occlusion, sun_shadow)), usable, covered & ~usable, size,
             )
             store_lightmap_image(
                 settings, file_path, size,
@@ -4224,13 +4926,19 @@ def iter_lightmap_bake(context, settings, report):
             )
             for obj in objects:
                 obj[LIGHTMAP_PROPERTY] = file_path
+        if decal_plans:
+            yield 0.99, f"Projecting {len(decal_plans)} decal(s) onto their lightmaps"
+            apply_decal_lightmaps(decal_plans)
+        if grass_plans:
+            yield 0.99, f"Copying the ground's lightmap onto {len(grass_plans)} grass group(s)"
+            apply_grass_lightmaps(settings, grass_plans)
         settings.lightmap_sun_direction = game_vector(sun_toward_direction(sun))
         completed = True
     finally:
         state.restore()
         if not completed:
             clear_lightmap_results(settings)
-    return len(atlases), min(texel_sizes), max(texel_sizes), len(skipped)
+    return len(atlases), min(texel_sizes), max(texel_sizes), len(skipped), len(grass_plans)
 
 
 def validate_visual_root(errors, label, visuals):
@@ -4249,11 +4957,23 @@ def validate_visual_root(errors, label, visuals):
         errors.append(f"{label} visuals need exactly one PBR root")
     if len(foliage_roots) != 1:
         errors.append(f"{label} visuals need exactly one FOLIAGE_CARDS root")
+    decal_roots = [child for child in visuals.children if child.get(ROLE_PROPERTY) == ROLE_DECALS]
+    if len(decal_roots) != 1:
+        errors.append(f"{label} visuals need exactly one DECALS root; run Refresh Track Structure")
 
-    behavior_roots = set(pbr_roots + foliage_roots)
+    behavior_roots = set(pbr_roots + foliage_roots + decal_roots)
     for child in visuals.children:
         if child not in behavior_roots:
-            errors.append(f"{child.name} must be inside the {label} PBR or FOLIAGE_CARDS root")
+            errors.append(f"{child.name} must be inside the {label} PBR, FOLIAGE_CARDS, or DECALS root")
+    for foliage in foliage_roots:
+        for role, suffix in FOLIAGE_GROUPS.items():
+            if sum(child.get(ROLE_PROPERTY) == role for child in foliage.children) != 1:
+                errors.append(
+                    f"{label} FOLIAGE_CARDS needs exactly one {suffix} group; run Refresh Track Structure"
+                )
+        for child in foliage.children:
+            if child.get(ROLE_PROPERTY) not in FOLIAGE_GROUPS:
+                errors.append(f"{child.name} must be inside the {label} TREES or GRASS group")
 
 
 def collision_meshes_with_unapplied_scale(settings):
@@ -5002,8 +5722,9 @@ class TRACK_EXPORTER_OT_refresh_layout_names(Operator):
     bl_idname = "track_exporter.refresh_layout_names"
     bl_label = "Refresh Track Structure"
     bl_description = (
-        "Create missing surface groups in Shared and every layout, move renamed surface groups "
-        "to their current IDs, and refresh layout object names"
+        "Create missing surface groups, DECALS roots, and foliage TREES and GRASS groups in Shared and every layout, "
+        "move renamed surface groups to their current IDs, move foliage placed directly under "
+        "FOLIAGE_CARDS into TREES, and refresh layout object names"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -6033,9 +6754,11 @@ class TRACK_EXPORTER_OT_bake_lightmaps(ProgressStepsOperator, Operator):
         return self.run_steps(context, iter_lightmap_bake(context, settings, self.report))
 
     def steps_finished(self, value):
-        count, smallest, largest, skipped = value
+        count, smallest, largest, skipped, grass = value
         texel = f"{smallest:.2f} m" if abs(largest - smallest) < 0.005 else f"{smallest:.2f}-{largest:.2f} m"
         message = f"Baked {count} lightmap atlas(es); texel size {texel}"
+        if grass:
+            message += f"; {grass} grass map(s) from the ground under them"
         if skipped:
             message += f"; {skipped} linked duplicate(s) skipped"
         self.report({"INFO"}, message)

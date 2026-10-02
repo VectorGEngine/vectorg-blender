@@ -11,6 +11,7 @@ routes/<layout_id>.json
 ideal-lines/<layout_id>.json (when an Ideal Line is assigned)
 preview.jpg (when a Preview Image is assigned)
 lightmaps/<scope>_<n>.png (after Bake Shadows)
+lightmaps/<scope>_grass.png (after Bake Shadows, for a scope with grass)
 ```
 
 Install or enable `vectorg-blender/addons/vectorg_track_exporter` the same way as the
@@ -37,15 +38,39 @@ intentionally whenever package contents change. It is written as
 The exporter enables glTF GPU instancing when the installed Blender glTF
 exporter supports it. For repeated props such as trees, create linked duplicates
 with `Alt+D`, give them identical materials, and parent them directly to the
-scope's `FOLIAGE_CARDS` Empty. Instances must be meshes without children. Apply
+scope's `TREES` Empty. Instances must be meshes without children. Apply
 modifiers before creating the linked duplicates when every instance uses the
 same evaluated geometry.
 
-Every shared and layout `VISUALS` root contains two behavior roots:
+Every shared and layout `VISUALS` root contains three behavior roots:
 
 - `PBR` uses the regular lit track-material path.
 - `FOLIAGE_CARDS` uses the regular lit material path and casts shadows, but does
   not receive shadows. Authored sidedness and alpha settings are preserved.
+- `DECALS` holds skid marks, painted lines, and other meshes lying just above a
+  surface. They use the regular lit material path, never cast shadows, and are
+  not baked: each takes the baked lighting of the surface under it (see
+  Lightmaps).
+
+Every `FOLIAGE_CARDS` root contains two groups, and every foliage object goes
+in one of them:
+
+- `TREES` holds trees, bushes and any other plant (role `foliage_trees`). The
+  game shades everything in it with one tree shader: parts whose base color
+  texture has cut-out holes are leaf cards lit by their normal map, solid
+  parts are bark lit by their real surface. Each model's crown outline is
+  measured from its geometry, and every part darkens toward the trunk and
+  brightens toward the branch tips; this inner shade is full at the crown's
+  bottom and fades out toward its top, and the sun reaching the crown falls
+  off toward its bottom. A leaf card without a
+  normal map gets ambient light only. Leaf textures put each twig's base at
+  the image's bottom and its outer end at the top; the normal map's green
+  tilt toward the top lights the card, read in the texture's own frame, so
+  the same map lights a card the same way whether it stands, slants or hangs.
+- `GRASS` holds grass (role `foliage_grass`). Grass is not baked: it takes the
+  baked lighting of the ground under it (see Baked shadows).
+
+Validation fails for an object placed directly under `FOLIAGE_CARDS`.
 
 ## Workflow
 
@@ -53,8 +78,8 @@ Every shared and layout `VISUALS` root contains two behavior roots:
 2. Set the track ID and name.
 3. Add one or more layouts.
 4. Draw or assign an optional Bezier or Poly map curve for each layout.
-5. Move regular visual objects under `PBR` and foliage cards under
-   `FOLIAGE_CARDS`.
+5. Move regular visual objects under `PBR`, decals under `DECALS`, trees and
+   bushes under `FOLIAGE_CARDS/TREES`, and grass under `FOLIAGE_CARDS/GRASS`.
 6. Parent driving collision meshes under the appropriate generated surface.
 7. Parent walls, barriers, fences, and props under `OBSTACLES`.
 8. Add at least one spawn point. For racing layouts, also add the required
@@ -157,7 +182,11 @@ the add-on to add the new surface groups to an older track. Refresh also moves
 surface groups that carry a renamed surface ID (`curb` → `kerb`, `wet_curb` →
 `wet_kerb`) onto the current ID: the group is relabeled and renamed, or, when a
 group for the current ID already exists, its contents move into that group with
-their world transforms preserved and the old group is removed. Missing collision
+their world transforms preserved and the old group is removed. Refresh creates
+any missing `DECALS` root under every `VISUALS` root, and any missing `TREES`
+and `GRASS` group under every `FOLIAGE_CARDS` root and moves
+objects placed directly under `FOLIAGE_CARDS` into `TREES` with their world
+transforms preserved; move the grass into `GRASS` afterwards. Missing collision
 roots and naming conflicts must be corrected before refreshing.
 Changing its display **Name**
 only changes player-facing metadata.
@@ -221,7 +250,8 @@ Visual meshes cast live shadows in the game unless their shadow visibility is
 off in Blender (Object Properties > Visibility > Ray Visibility > Shadow). Export
 writes `vectorg_cast_shadow: false` into those meshes' glTF extras; the property
 exists only during export. Turn it off on ground surfaces such as road, grass,
-and kerbs, which receive shadows but never cast them onto anything.
+and kerbs, which receive shadows but never cast them onto anything. Meshes
+under `DECALS` always export with `vectorg_cast_shadow: false`.
 
 Removing a layout from the addon only removes its configuration entry. It does
 not delete Blender objects.
@@ -364,15 +394,37 @@ geometry; baked lightmaps shade the track and only cars cast live shadows.
 3. Click **Bake Shadows**. Esc cancels between steps; a cancelled or failed bake
    clears all lightmaps.
 
-Every mesh under a scope's `PBR` root receives a lightmap. Foliage cards and
-linked duplicates (meshes sharing their data) are skipped, because instances
+Every mesh under a scope's `PBR` root receives a lightmap. Meshes under `TREES`
+and linked duplicates (meshes sharing their data) are skipped, because instances
 cannot hold unique lightmap UVs.
 
 The bake honours each object's **Object Properties › Visibility › Ray
-Visibility › Shadow**: turn it off for skid marks, painted lines, and other thin
-meshes lying just above the road. Such meshes cast neither shadow nor ambient
-occlusion and receive no ambient occlusion; they still receive sun shadows from
-every other object.
+Visibility › Shadow**: a receiver with it off casts neither shadow nor ambient
+occlusion onto anything, and still receives both from every other object.
+
+Meshes under `DECALS` are not baked and cast nothing in the bake. After the
+bake, each decal vertex is projected along its normal onto the receivers of its
+own scope and of Shared, within 0.5 m, and the decal gets a `Lightmap` UV map
+pointing at the receiver's lightmap under it: it shows exactly the ambient
+occlusion and sun shadow of that surface. A mesh samples one atlas, so a decal
+takes the atlas most of its vertices land on; vertices over another atlas use
+the nearest point of that atlas's surfaces. The bake fails, naming the decal,
+when a decal shares its mesh data or has no receiver under it.
+
+Meshes under `GRASS` are not baked either. After the bake, each scope's grass
+gets one top-down map, `lightmaps/<scope>_grass.png`: a square centred on its
+grass at up to 0.5 m per texel, 64 px or larger, capped at the atlas size. Every
+texel within 3 texels of grass casts a ray straight down from 1 m above the
+highest grass around it onto the receivers of its own scope and of Shared, and
+copies the ambient occlusion and sun shadow of the receiver's lightmap where it
+lands; texels with no receiver under them take the nearest copied texels. Each
+grass mesh gets a `Lightmap` UV map that maps every corner straight down onto
+that map, so grass shows the baked shade of the ground it stands on: tree,
+house, and rock shadows included. The bake fails, naming the mesh, when a grass
+mesh shares its mesh data, has four other UV maps, has modifiers that add or
+remove geometry, or has no receiver under it. Grass with Shadow ray visibility
+on casts into the bake like any other object, onto the ground and so onto
+itself; turn it off on grass.
 
 Each receiver gets a fresh `Lightmap` UV map in
 its last UV slot; glTF exports UV maps in slot order, so the lightmap is the
@@ -405,13 +457,26 @@ because Cycles repeats its scene setup for every selected object.
 Each atlas is an 8-bit PNG packed into the .blend: red is ambient occlusion
 (5 m distance), green is sun visibility (1 = lit). Sun visibility is the ratio
 of two direct-diffuse passes, with the sun's shadows on and off, lit only by the
-preview sun under a black world; texels facing away from the sun are 0.
+preview sun under a black world; texels facing away from the sun are 0. The
+bake gives the sun a 2° angular size, so shadows of high occluders such as tree
+crowns get soft edges wider than a texel, and lets a ray pass through up to 128
+cut-out surfaces, so leaf cards deep in a crown stay see-through.
 See-through surfaces such as fences and painted lines bake as solid where they
 are opaque: the bake measures each texel's opacity and divides it out of the
 ambient occlusion, which Cycles darkens by opacity. Fully transparent texels,
 which receive no light, are filled from the opaque texels around them, one ring
 at a time, as lightmappers dilate invalid texels. They still cast see-through
-shadows. The bake restores the scene's world, render engine, and sun settings afterwards.
+shadows. Texels buried inside another solid part, where parts intersect such
+as trim sunk into a wall, are refilled the same way: every texel darker than
+0.1 ambient occlusion casts 16 hemisphere rays against the solid meshes around
+it (foliage cards and decals excluded), and one whose rays mostly hit back faces
+counts as buried. Chart margins are rebuilt from the refilled texels, so no
+black spreads from buried texels onto the visible surface. The bake restores the
+scene's world, render engine, transparency limit, and sun settings afterwards.
+
+Props that Smart UV Project would shred into thousands of islands are unwrapped
+by box projection, one chart per side. Faces pointing the same way are layered
+front to back so that faces behind one another never share a texel.
 
 Bake Shadows replaces the previous atlases but keeps existing `Lightmap` UV maps.
 An atlas is unwrapped again only when its members change: an object added,
@@ -430,7 +495,8 @@ slots and deletes the preview materials. Bake Shadows, Clear Lightmaps, Render
 Preview, and export turn it off first.
 
 Export writes the atlases to `lightmaps/shared_<n>.png` and
-`lightmaps/layout_<layout_id>_<n>.png`, each receiver's atlas path as the
+`lightmaps/layout_<layout_id>_<n>.png`, the grass maps to
+`lightmaps/<scope>_grass.png`, each lightmapped mesh's atlas path as the
 `vectorg_lightmap` glTF extra, and two manifest root fields:
 
 ```json
@@ -443,10 +509,10 @@ Export writes the atlases to `lightmaps/shared_<n>.png` and
 `sun.direction` is the unit direction toward the baked sun in game coordinates;
 the game lights the track from it so live car shadows match the bake. An
 unbaked track exports neither field. Validation fails when a baked track no
-longer matches its bake: a receiver without a current lightmap, a lightmapped
-object that is no longer a receiver, or a moved or removed preview sun. It
-cannot detect geometry edits; bake again after changing receiver or caster
-meshes.
+longer matches its bake: a receiver, decal, or grass mesh without a current
+lightmap, a lightmapped object that is no longer a receiver, or a moved or
+removed preview sun. It cannot detect geometry edits; bake again after changing
+receiver, caster, or grass meshes.
 
 Validation commands from the repository root:
 

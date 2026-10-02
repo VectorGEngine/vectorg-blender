@@ -16,6 +16,7 @@ FUNCTIONS = {
     "layout_named_objects", "layout_nodes", "apply_generated_names", "sync_layout_node_names",
     "create_layout_hierarchy", "find_surface_group", "ensure_surface_group",
     "renamed_surface_groups", "migrate_renamed_surface_group", "refresh_track_structure", "valid_id",
+    "validate_visual_root",
 }
 
 
@@ -78,7 +79,7 @@ class SurfaceRefreshTests(unittest.TestCase):
                 name = node.targets[0].id
                 if name.startswith("ROLE_") or name in {
                     "SURFACE_IDS", "RENAMED_SURFACE_IDS", "SURFACE_PROPERTY", "SHAPE_PROPERTY",
-                    "EVENT_PROPERTY", "ORDER_PROPERTY", "ID_PATTERN",
+                    "EVENT_PROPERTY", "ORDER_PROPERTY", "ID_PATTERN", "FOLIAGE_GROUPS",
                 }:
                     selected.append(node)
         exec(compile(ast.Module(body=selected, type_ignores=[]), str(ADDON), "exec"), namespace)
@@ -226,6 +227,120 @@ class SurfaceRefreshTests(unittest.TestCase):
         before = list(self.objects)
         self.assertFalse(self.api.refresh_track_structure(self.context)[0])
         self.assertEqual(self.objects, before)
+
+    def foliage_root(self, layout_index):
+        visuals = self.api.direct_child_with_role(self.settings.layouts[layout_index].root_object, "visuals")
+        return self.api.direct_child_with_role(visuals, "foliage_cards")
+
+    def test_layouts_are_created_with_trees_and_grass_groups(self):
+        self.assertEqual(
+            [(child.name, child["vectorg_role"]) for child in self.foliage_root(0).children],
+            [("gp_TREES", "foliage_trees"), ("gp_GRASS", "foliage_grass")],
+        )
+
+    def test_refresh_adds_foliage_groups_to_old_scenes_and_moves_loose_foliage_into_trees(self):
+        self.context.view_layer = SimpleNamespace(update=lambda: None)
+        foliage = self.foliage_root(1)
+        for group in list(foliage.children):
+            self.objects.remove(group)
+        loose = [self.child(f"old_tree_{index}", foliage, (index, 2, 0)) for index in range(2)]
+
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertTrue(success)
+        self.assertIn("created 2 foliage group(s)", message)
+        self.assertIn("moved 2 foliage object(s) into TREES", message)
+        trees = self.api.direct_child_with_role(foliage, "foliage_trees")
+        grass = self.api.direct_child_with_role(foliage, "foliage_grass")
+        self.assertEqual((trees.name, grass.name), ("sprint_TREES", "sprint_GRASS"))
+        self.assertEqual(trees.children, loose)
+        self.assertEqual(grass.children, [])
+        self.assertEqual([obj.matrix_world for obj in loose], [(0, 2, 0), (1, 2, 0)])
+
+        after = list(self.objects)
+        self.assertEqual(self.api.refresh_track_structure(self.context), (
+            True, "Track surface groups and layout object names refreshed",
+        ))
+        self.assertEqual(self.objects, after)
+
+    def test_refresh_names_shared_foliage_groups_after_its_foliage_root(self):
+        visuals = self.api.create_visual_hierarchy(self.context, self.settings.shared_root_object, "SHARED")
+        foliage = self.api.direct_child_with_role(visuals, "foliage_cards")
+        for group in list(foliage.children):
+            self.objects.remove(group)
+        self.assertTrue(self.api.refresh_track_structure(self.context)[0])
+        self.assertEqual(sorted(child.name for child in foliage.children), ["SHARED_GRASS", "SHARED_TREES"])
+
+    def test_conflicting_foliage_group_name_fails_before_changing_structure(self):
+        foliage = self.foliage_root(0)
+        self.objects.remove(self.api.direct_child_with_role(foliage, "foliage_grass"))
+        conflict = self.objects.new("gp_GRASS", None)
+        loose = self.child("old_tree", foliage, (0, 0, 0))
+        before = list(self.objects)
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertFalse(success)
+        self.assertIn(conflict.name, message)
+        self.assertEqual(self.objects, before)
+        self.assertIs(loose.parent, foliage)
+
+    def test_layout_rename_renames_its_foliage_groups(self):
+        self.settings.layouts[0].layout_id = "club"
+        self.assertTrue(self.api.refresh_track_structure(self.context)[0])
+        self.assertEqual(sorted(child.name for child in self.foliage_root(0).children), ["club_GRASS", "club_TREES"])
+
+    def visuals_root(self, layout_index):
+        return self.api.direct_child_with_role(self.settings.layouts[layout_index].root_object, "visuals")
+
+    def test_layouts_are_created_with_a_decals_root(self):
+        decals = self.api.direct_child_with_role(self.visuals_root(0), "decals")
+        self.assertEqual(decals.name, "gp_DECALS")
+
+    def test_refresh_adds_decals_roots_to_old_scenes_and_renames_them_with_the_layout(self):
+        visuals = self.visuals_root(1)
+        self.objects.remove(self.api.direct_child_with_role(visuals, "decals"))
+        shared_visuals = self.api.create_visual_hierarchy(self.context, self.settings.shared_root_object, "SHARED")
+        self.objects.remove(self.api.direct_child_with_role(shared_visuals, "decals"))
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertTrue(success)
+        self.assertIn("created 2 DECALS root(s)", message)
+        self.assertEqual(self.api.direct_child_with_role(visuals, "decals").name, "sprint_DECALS")
+        self.assertEqual(self.api.direct_child_with_role(shared_visuals, "decals").name, "SHARED_DECALS")
+        after = list(self.objects)
+        self.assertTrue(self.api.refresh_track_structure(self.context)[0])
+        self.assertEqual(self.objects, after)
+        self.settings.layouts[1].layout_id = "club"
+        self.assertTrue(self.api.refresh_track_structure(self.context)[0])
+        self.assertEqual(self.api.direct_child_with_role(visuals, "decals").name, "club_DECALS")
+
+    def test_conflicting_decals_root_name_fails_before_changing_structure(self):
+        visuals = self.visuals_root(0)
+        self.objects.remove(self.api.direct_child_with_role(visuals, "decals"))
+        conflict = self.objects.new("gp_DECALS", None)
+        before = list(self.objects)
+        success, message = self.api.refresh_track_structure(self.context)
+        self.assertFalse(success)
+        self.assertIn(conflict.name, message)
+        self.assertEqual(self.objects, before)
+
+    def test_validation_requires_a_decals_root(self):
+        visuals = self.visuals_root(0)
+        self.objects.remove(self.api.direct_child_with_role(visuals, "decals"))
+        errors = []
+        self.api.validate_visual_root(errors, "gp", visuals)
+        self.assertEqual(errors, ["gp visuals need exactly one DECALS root; run Refresh Track Structure"])
+
+    def test_validation_requires_both_foliage_groups_and_nothing_directly_under_foliage_cards(self):
+        visuals = self.api.direct_child_with_role(self.settings.layouts[0].root_object, "visuals")
+        errors = []
+        self.api.validate_visual_root(errors, "gp", visuals)
+        self.assertEqual(errors, [])
+        foliage = self.foliage_root(0)
+        self.objects.remove(self.api.direct_child_with_role(foliage, "foliage_grass"))
+        self.child("loose_tree", foliage, (0, 0, 0))
+        self.api.validate_visual_root(errors, "gp", visuals)
+        self.assertEqual(errors, [
+            "gp FOLIAGE_CARDS needs exactly one GRASS group; run Refresh Track Structure",
+            "loose_tree must be inside the gp TREES or GRASS group",
+        ])
 
     def test_ideal_line_is_renamed_with_layout_and_stays_under_map(self):
         layout = self.settings.layouts[0]

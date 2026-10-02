@@ -65,6 +65,7 @@ bpy.context.scene.collection.objects.link(root)
 visuals = track.create_visual_hierarchy(bpy.context, root, "TEST")
 pbr = track.direct_child_with_role(visuals, track.ROLE_PBR)
 foliage_cards = track.direct_child_with_role(visuals, track.ROLE_FOLIAGE_CARDS)
+trees_group = track.direct_child_with_role(foliage_cards, track.ROLE_FOLIAGE_TREES)
 visual_errors = []
 track.validate_visual_root(visual_errors, "Test", visuals)
 assert visual_errors == []
@@ -86,7 +87,7 @@ make_cube("normal_cube", pbr, normal_material, 3)
 for index in range(3):
     tree = bpy.data.objects.new(f"TREE_{index + 1}", opaque_cube.data)
     tree.location = (index * 2, 3, 0)
-    tree.parent = foliage_cards
+    tree.parent = trees_group
     bpy.context.scene.collection.objects.link(tree)
 
 export_objects = [root, *track.descendants(root)]
@@ -131,6 +132,8 @@ with tempfile.TemporaryDirectory(prefix="vectorg_exporter_smoke_") as directory:
     }
     assert track.ROLE_PBR in exported_roles
     assert track.ROLE_FOLIAGE_CARDS in exported_roles
+    assert track.ROLE_FOLIAGE_TREES in exported_roles
+    assert track.ROLE_FOLIAGE_GRASS in exported_roles
     if track.gltf_mesh_instance_export_options():
         assert "EXT_mesh_gpu_instancing" in track_json.get("extensionsUsed", [])
         assert any(
