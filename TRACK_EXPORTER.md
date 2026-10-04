@@ -402,14 +402,17 @@ The bake honours each object's **Object Properties › Visibility › Ray
 Visibility › Shadow**: a receiver with it off casts neither shadow nor ambient
 occlusion onto anything, and still receives both from every other object.
 
-Meshes under `DECALS` are not baked and cast nothing in the bake. After the
-bake, each decal vertex is projected along its normal onto the receivers of its
-own scope and of Shared, within 0.5 m, and the decal gets a `Lightmap` UV map
-pointing at the receiver's lightmap under it: it shows exactly the ambient
-occlusion and sun shadow of that surface. A mesh samples one atlas, so a decal
-takes the atlas most of its vertices land on; vertices over another atlas use
-the nearest point of that atlas's surfaces. The bake fails, naming the decal,
-when a decal shares its mesh data or has no receiver under it.
+Meshes under `DECALS` are not baked and cast nothing in the bake. Each scope's
+decals get their own `Lightmap` UV map, unwrapped like a receiver's, in decal
+atlases `lightmaps/<scope>_decals_<n>.png`. Those take the finest texel size of
+the receiver atlases the decals sit on, at the smallest atlas size that holds
+them. After the bake, every decal texel copies the ambient occlusion and sun
+shadow of the receiver surface behind it: the nearest receiver of its own scope
+or of Shared along the decal face's normal, within 0.5 m either side. Lines and
+skid marks copy the road under them, and a window decal copies the wall it is
+on. Texels off the decals take the nearest copied texels. The bake fails, naming
+the decal, when a decal shares its mesh data, has four other UV maps, has
+modifiers that add or remove geometry, or has no receiver behind it.
 
 Meshes under `GRASS` are not baked either. After the bake, each scope's grass
 gets one top-down map, `lightmaps/<scope>_grass.png`: a square centred on its

@@ -209,26 +209,82 @@ def blender_tests():
             obj.parent = addon.direct_child_with_role(shared_visuals, addon.ROLE_DECALS)
             return obj
 
-        def test_decals_show_the_lightmap_of_the_surface_under_them_and_cast_nothing(self):
+        def lightmap_value(self, obj, uv, atlases):
+            """Bilinear (ambient occlusion, sun) of the object's atlas at a lightmap UV."""
+            file_path = obj[addon.LIGHTMAP_PROPERTY]
+            if file_path not in atlases:
+                image = addon.baked_lightmap_images()[file_path]
+                pixels = np.empty(len(image.pixels), dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+                atlases[file_path] = pixels.reshape(image.size[1], image.size[0], 4)
+            pixels = atlases[file_path]
+            return [float(addon.sample_lightmap_channel(pixels[..., channel], np.array([tuple(uv)]))[0]) for channel in (0, 1)]
+
+        def surface_uv(self, obj, world_point):
+            """Lightmap UV of a receiver at its surface point nearest a world point."""
+            _found, location, _normal, face = obj.closest_point_on_mesh(obj.matrix_world.inverted() @ world_point)
+            polygon = obj.data.polygons[face]
+            weights = interpolate.poly_3d_calc([obj.data.vertices[i].co for i in polygon.vertices], location)
+            layer = obj.data.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            return sum((layer[index].vector * weight for index, weight in zip(polygon.loop_indices, weights)), Vector((0.0, 0.0)))
+
+        def decal_differences(self, decal, surface, points):
+            """Per (world point, decal lightmap UV): the largest channel difference from the surface behind it."""
+            atlases = {}
+            return [
+                max(abs(own - behind) for own, behind in zip(
+                    self.lightmap_value(decal, uv, atlases),
+                    self.lightmap_value(surface, self.surface_uv(surface, point), atlases),
+                ))
+                for point, uv in points
+            ]
+
+        def face_centres(self, decal):
+            layer = decal.data.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            return [
+                (decal.matrix_world @ polygon.center,
+                 sum((layer[index].vector for index in polygon.loop_indices), Vector((0.0, 0.0))) / polygon.loop_total)
+                for polygon in decal.data.polygons
+            ]
+
+        def test_decals_copy_the_lightmap_of_the_surface_behind_them_and_cast_nothing(self):
             shaded = self.decal("shaded_decal", (0, 0, 0.01))
             lit = self.decal("lit_decal", (6, 6, 0.01))
-            self.bake()
-            ground_uv = self.ground.data.uv_layers[addon.LIGHTMAP_UV_NAME].uv
-            for decal in (shaded, lit):
-                self.assertEqual(decal[addon.LIGHTMAP_PROPERTY], self.ground[addon.LIGHTMAP_PROPERTY])
+            # A window on the cube's +X side faces away from the ground: it copies the wall behind it.
+            bpy.ops.mesh.primitive_grid_add(
+                x_subdivisions=3, y_subdivisions=3, size=0.8, location=(1.01, 0, 3), rotation=(0, math.pi / 2, 0),
+            )
+            window = bpy.context.object
+            window.name = "window_decal"
+            window.parent = shaded.parent
+            unwraps = []
+            original = addon.unwrap_lightmap_atlas
+
+            def counted(context, state, objects, areas, atlas_size, texel_size):
+                unwraps.append(sorted(obj.name for obj in objects))
+                return original(context, state, objects, areas, atlas_size, texel_size)
+
+            addon.unwrap_lightmap_atlas = counted
+            try:
+                self.bake()
+                self.assertEqual(
+                    [names for names in unwraps if "shaded_decal" in names][-1:],
+                    [["lit_decal", "shaded_decal", "window_decal"]],
+                )
+                decal_unwraps = len([names for names in unwraps if "shaded_decal" in names])
+                # A rebake reuses the decals' unwrap like the receivers'.
+                self.bake()
+                self.assertEqual(len([names for names in unwraps if "shaded_decal" in names]), decal_unwraps)
+            finally:
+                addon.unwrap_lightmap_atlas = original
+            for decal, surface in ((shaded, self.ground), (lit, self.ground), (window, self.cube)):
+                self.assertEqual(decal[addon.LIGHTMAP_PROPERTY], "lightmaps/shared_decals_0.png")
                 layers = decal.data.uv_layers
                 self.assertEqual(layers.find(addon.LIGHTMAP_UV_NAME), len(layers) - 1)
-                # Every decal vertex samples the ground's lightmap exactly where it lies over the ground.
-                decal_uv = layers[addon.LIGHTMAP_UV_NAME].uv
-                for loop in decal.data.loops:
-                    point = self.ground.matrix_world.inverted() @ (decal.matrix_world @ decal.data.vertices[loop.vertex_index].co)
-                    _found, location, _normal, face = self.ground.closest_point_on_mesh(point)
-                    polygon = self.ground.data.polygons[face]
-                    weights = interpolate.poly_3d_calc([self.ground.data.vertices[i].co for i in polygon.vertices], location)
-                    expected = sum((ground_uv[index].vector * weight for index, weight in zip(polygon.loop_indices, weights)), Vector((0.0, 0.0)))
-                    self.assertLess((decal_uv[loop.index].vector - expected).length, 1e-4)
-            self.assertLess(self.sample(shaded, (0, 0, 0))[1], 0.2)
-            self.assertLess(self.sample(shaded, (0, 0, 0))[0], 0.95)
+                self.assertLess(max(self.decal_differences(decal, surface, self.face_centres(decal))), 0.1)
+            atlases = {}
+            self.assertLess(self.lightmap_value(shaded, self.face_centres(shaded)[12][1], atlases)[1], 0.2)
+            self.assertGreater(self.lightmap_value(lit, self.face_centres(lit)[12][1], atlases)[1], 0.9)
             # The decal 1 cm above the ground casts neither shadow nor occlusion, though its Shadow is on.
             self.assertTrue(lit.visible_shadow)
             ambient_occlusion, sun = self.sample(self.ground, (6, 6, 0))
@@ -241,6 +297,41 @@ def blender_tests():
                 self.assertEqual(set(tagged), {shaded, lit})
             finally:
                 addon.restore_shadow_casting_export_flags(tagged)
+            with tempfile.TemporaryDirectory() as directory:
+                output = str(Path(directory) / "track.zip")
+                self.assertEqual(bpy.ops.track_exporter.export_track_zip(filepath=output), {"FINISHED"})
+                with zipfile.ZipFile(output) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                    self.assertIn("lightmaps/shared_decals_0.png", manifest["lightmaps"])
+                    self.assertTrue(archive.read("lightmaps/shared_decals_0.png").startswith(b"\x89PNG"))
+
+        def test_a_long_decal_face_across_the_ground_charts_copies_the_ground_all_along(self):
+            # At 0.05 m texels the ground's charts are cut every 12.8 m, at x = 0 among others. One 18 m
+            # quad crosses that cut through the cube's shadow; its corners lie over different charts.
+            self.settings.lightmap_texel_size = 0.05
+            mesh = bpy.data.meshes.new("strip")
+            mesh.from_pydata([(-9, 0.4, 0.01), (9, 0.4, 0.01), (9, 0.6, 0.01), (-9, 0.6, 0.01)], [], [(0, 1, 2, 3)])
+            strip = bpy.data.objects.new("strip_decal", mesh)
+            bpy.context.scene.collection.objects.link(strip)
+            strip.parent = addon.direct_child_with_role(
+                addon.object_with_role(self.settings.shared_root_object, addon.ROLE_VISUALS), addon.ROLE_DECALS,
+            )
+            self.bake()
+            layer = mesh.uv_layers[addon.LIGHTMAP_UV_NAME].uv
+            corners = [layer[loop].vector.copy() for loop in range(4)]
+            points = []
+            for step in range(1, 36):
+                t = step / 36
+                points.append((
+                    Vector((-9 + 18 * t, 0.5, 0.01)),
+                    ((corners[0] + corners[3]) * (1 - t) + (corners[1] + corners[2]) * t) / 2,
+                ))
+            self.assertLess(max(self.decal_differences(strip, self.ground, points)), 0.15)
+            atlases = {}
+            suns = [self.lightmap_value(strip, uv, atlases)[1] for _point, uv in points]
+            self.assertLess(suns[17], 0.2)
+            self.assertGreater(suns[2], 0.9)
+            self.assertGreater(suns[-3], 0.9)
 
         def test_bake_fails_for_decals_without_a_surface_or_with_shared_mesh_data(self):
             self.decal("floating_decal", (30, 30, 0.01))

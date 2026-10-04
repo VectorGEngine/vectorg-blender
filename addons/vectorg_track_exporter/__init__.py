@@ -156,6 +156,8 @@ LIGHTMAP_BAKE_SUN_ANGLE = math.radians(2.0)
 LIGHTMAP_MIN_COVERAGE = 0.05
 # A decal takes the lightmap of the receiver surface within this distance along its normal, in metres.
 DECAL_PROJECTION_DISTANCE = 0.5
+# Packing seldom lands exactly on a texel size: a decal atlas this much coarser than its target counts as on it.
+LIGHTMAP_DECAL_TEXEL_SLACK = 1.05
 # Grass takes the baked ground under it from one top-down map per GRASS group: at most this many metres
 # per texel, from at least this many pixels up to the atlas size, with a border of texels around the grass
 # for the game's 4 x 4 texel lightmap filter.
@@ -3349,120 +3351,201 @@ def lightmap_decals(settings):
     return scopes
 
 
-def plan_decal_lightmaps(receiver_scopes, decal_scopes, atlas_of):
-    """Where each decal vertex lands on the receivers, found before the bake so a bad decal fails early.
+def decal_lightmap_file(prefix, index):
+    return f"{decal_lightmap_file_start(prefix)}{index}.png"
 
-    A decal reuses the lightmap of the surface under it. Each vertex is projected along its normal onto
-    the receivers of its own scope and of Shared, within DECAL_PROJECTION_DISTANCE. A mesh samples one
-    atlas, so the decal takes the atlas most of its vertices land on; vertices over another atlas take
-    the nearest point of that atlas's surfaces. Returns (plans, errors); a plan is (decal, atlas file,
-    {vertex index: (receiver, triangle loop indices, barycentric weights)}).
+
+def decal_lightmap_file_start(prefix):
+    return f"{LIGHTMAP_DIRECTORY}/{prefix}_decals_"
+
+
+def receiver_triangle_tree(receivers):
+    """BVH tree of the receivers' world triangles, with each triangle's corners, loop indices, and receiver number."""
+    corners, loops, owners = [], [], []
+    for number, receiver in enumerate(receivers):
+        receiver_corners, receiver_loops = mesh_triangles(receiver)
+        corners.append(receiver_corners)
+        loops.append(receiver_loops)
+        owners.append(np.full(len(receiver_corners), number, dtype=np.int64))
+    corners = np.concatenate(corners)
+    tree = BVHTree.FromPolygons(
+        [tuple(point) for point in corners.reshape(-1, 3)],
+        [(3 * index, 3 * index + 1, 3 * index + 2) for index in range(len(corners))],
+    )
+    return tree, corners, np.concatenate(loops), np.concatenate(owners)
+
+
+def surface_behind_decal(tree, point, normal):
+    """(location, triangle) of the receiver surface nearest a decal point along its normal, within
+    DECAL_PROJECTION_DISTANCE either side; None when there is none."""
+    behind, _normal, behind_index, behind_distance = tree.ray_cast(point, -normal, DECAL_PROJECTION_DISTANCE)
+    reach = behind_distance if behind is not None else DECAL_PROJECTION_DISTANCE
+    front, _normal, front_index, _distance = tree.ray_cast(point, normal, reach)
+    if front is not None:
+        return front, front_index
+    if behind is not None:
+        return behind, behind_index
+    return None
+
+
+def mesh_boundary_length(obj):
+    """World length of the mesh's open edges, the ones with a single face."""
+    mesh = obj.data
+    edges = np.empty(len(mesh.loops), dtype=np.int64)
+    mesh.loops.foreach_get("edge_index", edges)
+    open_edges = np.flatnonzero(np.bincount(edges, minlength=len(mesh.edges)) == 1)
+    if not len(open_edges):
+        return 0.0
+    vertices = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", vertices)
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coordinates)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    world = coordinates.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    ends = world[vertices.reshape(-1, 2)[open_edges]]
+    return float(np.linalg.norm(ends[:, 1] - ends[:, 0], axis=1).sum())
+
+
+def plan_decal_lightmaps(context, receiver_scopes, decal_scopes):
+    """Each scope's decals and the receivers they copy from, checked before the bake so a bad decal fails early.
+
+    A decal gets its own Lightmap UV map in decal atlases of its scope, and every texel copies the baked
+    ambient occlusion and sun shadow of the receiver surface behind it: the nearest receiver of its own
+    scope or of Shared along the decal face's normal, within DECAL_PROJECTION_DISTANCE either side. Lines
+    and skid marks copy the road, a window decal copies its wall. Returns (plans, errors); a plan holds the
+    scope's prefix and layout, its decals as (decal, area m², open edge length m, centre), the receivers,
+    and their triangle tree.
     """
     receivers_by_layout = {}
     for _prefix, layout, receivers in receiver_scopes:
         receivers_by_layout.setdefault(layout, []).extend(receivers)
-    trees = {}
-
-    def atlas_trees(layout):
-        """BVH trees of the receivers a decal of this layout may land on, one per atlas file."""
-        if layout not in trees:
-            objects = receivers_by_layout.get(None, []) + (receivers_by_layout.get(layout, []) if layout else [])
-            by_file = {}
-            for obj in objects:
-                by_file.setdefault(atlas_of[obj], []).append(obj)
-            trees[layout] = {}
-            for file_path, members in by_file.items():
-                corners, loops, owners = [], [], []
-                for obj in members:
-                    obj_corners, obj_loops = mesh_triangles(obj)
-                    corners.append(obj_corners)
-                    loops.append(obj_loops)
-                    owners.extend([obj] * len(obj_corners))
-                corners = np.concatenate(corners)
-                vertices = [tuple(point) for point in corners.reshape(-1, 3)]
-                polygons = [(3 * index, 3 * index + 1, 3 * index + 2) for index in range(len(corners))]
-                trees[layout][file_path] = (BVHTree.FromPolygons(vertices, polygons), corners, np.concatenate(loops), owners)
-        return trees[layout]
-
-    def landing(tree_data, index, location):
-        _tree, corners, loops, owners = tree_data
-        a, b, c = (Vector(point) for point in corners[index])
-        weights = barycentric_weights(location, a, b, c)
-        return owners[index], tuple(int(loop) for loop in loops[index]), weights
-
+    depsgraph = context.evaluated_depsgraph_get()
     plans, errors = [], []
-    for _prefix, layout, decals in decal_scopes:
-        candidates = atlas_trees(layout)
+    for prefix, layout, decals in decal_scopes:
+        receivers = receivers_by_layout.get(None, []) + (receivers_by_layout.get(layout, []) if layout else [])
+        triangles = receiver_triangle_tree(receivers) if receivers else None
+        items = []
         for decal in decals:
             if decal.data.users > 1:
                 errors.append(f"Decal {decal.name} shares its mesh data; make it single-user so it holds its own lightmap UVs")
                 continue
-            matrix = decal.matrix_world
-            normal_matrix = matrix.inverted_safe().transposed().to_3x3()
-            rays = []
-            for vertex in decal.data.vertices:
-                normal = normal_matrix @ vertex.normal
-                normal = normal.normalized() if normal.length > 1e-9 else Vector((0.0, 0.0, 1.0))
-                rays.append((vertex.index, matrix @ vertex.co, normal))
-            hits = {}
-            for vertex_index, position, normal in rays:
-                origin = position + normal * DECAL_PROJECTION_DISTANCE
-                best = None
-                for file_path, tree_data in candidates.items():
-                    location, _normal, index, distance = tree_data[0].ray_cast(origin, -normal, 2 * DECAL_PROJECTION_DISTANCE)
-                    if location is not None and (best is None or distance < best[0]):
-                        best = (distance, file_path, index, location)
-                if best:
-                    hits[vertex_index] = best[1:]
-            if not hits:
+            other_uv_maps = len([layer for layer in decal.data.uv_layers if layer.name != LIGHTMAP_UV_NAME])
+            if other_uv_maps >= LIGHTMAP_MAX_UV_MAPS:
+                errors.append(
+                    f"{decal.name} has {other_uv_maps} UV maps; remove one so the lightmap fits in the "
+                    f"{LIGHTMAP_MAX_UV_MAPS} UV sets the game reads"
+                )
+                continue
+            if evaluated_corner_positions(decal, depsgraph) is None:
+                errors.append(f"{decal.name}: apply modifiers that add or remove geometry before baking")
+                continue
+            corners, _loops = mesh_triangles(decal)
+            normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            lengths = np.linalg.norm(normals, axis=1)
+            faces = np.flatnonzero(lengths > 1e-12)
+            centres = corners[faces].mean(axis=1)
+            normals = normals[faces] / lengths[faces, None]
+            if triangles is None or not any(
+                surface_behind_decal(triangles[0], Vector(centre), Vector(normal))
+                for centre, normal in zip(centres, normals)
+            ):
                 errors.append(
                     f"Decal {decal.name} has no lightmapped surface within {DECAL_PROJECTION_DISTANCE} m under it"
                 )
                 continue
-            files = [file_path for file_path, _index, _location in hits.values()]
-            chosen = max(set(files), key=files.count)
-            tree_data = candidates[chosen]
-            landings = {}
-            for vertex_index, position, normal in rays:
-                hit = hits.get(vertex_index)
-                if hit and hit[0] == chosen:
-                    landings[vertex_index] = landing(tree_data, hit[1], hit[2])
-                    continue
-                origin = position + normal * DECAL_PROJECTION_DISTANCE
-                location, _normal, index, _distance = tree_data[0].ray_cast(origin, -normal, 2 * DECAL_PROJECTION_DISTANCE)
-                if location is None:
-                    location, _normal, index, _distance = tree_data[0].find_nearest(position)
-                landings[vertex_index] = landing(tree_data, index, location)
-            plans.append((decal, chosen, landings))
+            centre = tuple(decal.matrix_world @ (sum((Vector(corner) for corner in decal.bound_box), Vector()) / 8))
+            items.append((decal, world_surface_area(decal), mesh_boundary_length(decal), centre))
+        if items:
+            plans.append({
+                "prefix": prefix,
+                "layout": layout,
+                "decals": items,
+                "receivers": receivers,
+                "triangles": triangles,
+            })
     return plans, errors
 
 
-def barycentric_weights(point, a, b, c):
-    """Weights of a triangle's corners at a point on it."""
-    v0, v1, v2 = b - a, c - a, point - a
-    d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
-    d20, d21 = v2.dot(v0), v2.dot(v1)
-    denominator = d00 * d11 - d01 * d01
-    if abs(denominator) < 1e-18:
-        return (1.0, 0.0, 0.0)
-    v = (d11 * d20 - d01 * d21) / denominator
-    w = (d00 * d21 - d01 * d20) / denominator
-    return (1.0 - v - w, v, w)
-
-
-def apply_decal_lightmaps(plans):
-    """Give each decal the baked Lightmap UVs of the receiver points under its vertices."""
-    for decal, file_path, landings in plans:
-        mesh = decal.data
-        coordinates = {}
-        for vertex_index, (receiver, loops, weights) in landings.items():
-            uv = receiver.data.uv_layers[LIGHTMAP_UV_NAME].uv
-            coordinates[vertex_index] = sum(
-                (uv[loop].vector * weight for loop, weight in zip(loops, weights)), Vector((0.0, 0.0)),
+def lightmap_texel_points(objects, size):
+    """The atlas texels whose centres lie on the meshes: texel indices, world points, and face normals."""
+    texels, points, normals = [], [], []
+    for obj in objects:
+        corners, loops = mesh_triangles(obj)
+        uv = uv_layer_coordinates(obj.data.uv_layers[LIGHTMAP_UV_NAME])[loops] * size
+        face_normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        lengths = np.linalg.norm(face_normals, axis=1)
+        first = np.clip(np.ceil(uv.min(axis=1) - 0.5).astype(np.int64), 0, size - 1)
+        last = np.clip(np.floor(uv.max(axis=1) - 0.5).astype(np.int64), 0, size - 1)
+        for triangle in np.flatnonzero((lengths > 1e-12) & (last >= first).all(axis=1)):
+            a, b, c = uv[triangle]
+            columns, rows = np.meshgrid(
+                np.arange(first[triangle, 0], last[triangle, 0] + 1), np.arange(first[triangle, 1], last[triangle, 1] + 1),
             )
-        layer = ensure_lightmap_uv_layer(mesh)
-        for loop in mesh.loops:
-            layer.uv[loop.index].vector = coordinates[loop.vertex_index]
+            columns, rows = columns.ravel(), rows.ravel()
+            x, y = columns + 0.5, rows + 0.5
+            denominator = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(denominator) < 1e-12:
+                continue
+            first_weight = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / denominator
+            second_weight = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / denominator
+            weights = np.stack((first_weight, second_weight, 1.0 - first_weight - second_weight), axis=1)
+            inside = (weights >= -1e-9).all(axis=1)
+            if not inside.any():
+                continue
+            texels.append(rows[inside] * size + columns[inside])
+            points.append(weights[inside] @ corners[triangle])
+            normals.append(np.repeat((face_normals[triangle] / lengths[triangle])[None], int(inside.sum()), axis=0))
+    if not texels:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 3)), np.zeros((0, 3))
+    return np.concatenate(texels), np.concatenate(points), np.concatenate(normals)
+
+
+def apply_decal_lightmap(settings, plan, file_path, decals, size):
+    """Fill a decal atlas from the baked receivers behind its texels and point the decals at it.
+
+    Each texel copies the receiver lightmap where the surface behind it lies, so a decal shows exactly
+    the ambient occlusion and sun shadow of that surface; texels off the decals take the nearest copied ones.
+    """
+    tree, corners, loops, owners = plan["triangles"]
+    texels, points, normals = lightmap_texel_points(decals, size)
+    found, triangles, locations = [], [], []
+    for texel, point, normal in zip(texels.tolist(), points.tolist(), normals.tolist()):
+        hit = surface_behind_decal(tree, Vector(point), Vector(normal))
+        if hit:
+            found.append(texel)
+            locations.append(tuple(hit[0]))
+            triangles.append(hit[1])
+    found = np.array(found, dtype=np.int64)
+    triangles = np.array(triangles, dtype=np.int64)
+    weights = barycentric_weight_rows(np.array(locations).reshape(-1, 3), corners[triangles])
+    hit_owners, hit_loops = owners[triangles], loops[triangles]
+    coordinates = np.zeros((len(found), 2))
+    for number, receiver in enumerate(plan["receivers"]):
+        chosen = hit_owners == number
+        if chosen.any():
+            uv = uv_layer_coordinates(receiver.data.uv_layers[LIGHTMAP_UV_NAME])
+            coordinates[chosen] = (uv[hit_loops[chosen]] * weights[chosen, :, None]).sum(axis=1)
+    files = np.array([receiver[LIGHTMAP_PROPERTY] for receiver in plan["receivers"]], dtype=object)[hit_owners]
+    images = baked_lightmap_images()
+    values = np.zeros((2, size * size), dtype=np.float32)
+    for receiver_file in sorted(set(files.tolist())):
+        chosen = files == receiver_file
+        image = images[receiver_file]
+        atlas_size = image.size[0]
+        pixels = np.empty(len(image.pixels), dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(atlas_size, atlas_size, 4)
+        for channel in (0, 1):
+            values[channel, found[chosen]] = sample_lightmap_channel(pixels[..., channel], coordinates[chosen])
+        del pixels
+    valid = np.zeros(size * size, dtype=bool)
+    valid[found] = True
+    store_lightmap_image(
+        settings, file_path, size,
+        fill_empty_texels(values[0], valid, size),
+        fill_empty_texels(values[1], valid, size),
+    )
+    for decal in decals:
         decal[LIGHTMAP_PROPERTY] = file_path
 
 
@@ -3519,7 +3602,7 @@ def grow_heights(heights, steps):
 
 
 def barycentric_weight_rows(points, corners):
-    """barycentric_weights for many points, each on its own triangle (corners: n x 3 x 3)."""
+    """Barycentric weights of many points, each on its own triangle (corners: n x 3 x 3)."""
     a, b, c = corners[:, 0], corners[:, 1], corners[:, 2]
     v0, v1, v2 = b - a, c - a, points - a
     d00, d01, d11 = (v0 * v0).sum(axis=1), (v0 * v1).sum(axis=1), (v1 * v1).sum(axis=1)
@@ -4296,7 +4379,7 @@ def prepare_lightmap_scene(context, settings, state, sun):
 
 def show_lightmap_scope(context, settings, layout, sun):
     """Render the scope's casters lit by the preview sun alone."""
-    # Decals neither cast nor receive in the bake; they reuse the lightmap under them.
+    # Decals neither cast nor receive in the bake; they copy the lightmap of the surface behind them.
     decals = {obj for _prefix, _layout, objects in lightmap_decals(settings) for obj in objects}
     rendered = {
         obj for obj in preview_render_objects(context, settings, layout)
@@ -4811,10 +4894,12 @@ def iter_lightmap_bake(context, settings, report):
     atlas_size = int(settings.lightmap_atlas_size)
     clear_lightmap_results(settings)
     receivers = {obj for _prefix, _layout, objects in scopes for obj in objects}
+    decal_scopes = lightmap_decals(settings)
+    decals = {obj for _prefix, _layout, objects in decal_scopes for obj in objects}
     for obj in track_objects(settings):
-        if obj not in receivers:
+        if obj not in receivers and obj not in decals:
             remove_lightmap_uv_layer(obj)
-    areas = {obj: world_surface_area(obj) for obj in receivers}
+    areas = {obj: world_surface_area(obj) for obj in receivers | decals}
     texel_size = settings.lightmap_texel_size
     capacity = lightmap_atlas_capacity(atlas_size, texel_size)
     oversized = {obj for obj in receivers if areas[obj] > capacity}
@@ -4826,8 +4911,9 @@ def iter_lightmap_bake(context, settings, report):
         ]
         for index, (group, size) in enumerate(lightmap_atlas_groups(items, texel_size, atlas_size)):
             atlases.append((lightmap_image_file(prefix, index), layout, group, size))
-    atlas_of = {obj: file_path for file_path, _layout, objects, _size in atlases for obj in objects}
-    decal_plans, decal_errors = plan_decal_lightmaps(scopes, lightmap_decals(settings), atlas_of)
+    if decal_scopes:
+        yield 0.01, "Finding the surfaces behind the decals..."
+    decal_plans, decal_errors = plan_decal_lightmaps(context, scopes, decal_scopes)
     grass_scopes = lightmap_grass(settings)
     if grass_scopes:
         yield 0.01, "Finding the ground under the grass..."
@@ -4839,7 +4925,11 @@ def iter_lightmap_bake(context, settings, report):
         unwrap_state = json.loads(settings.lightmap_unwrap_state or "{}")
     except json.JSONDecodeError:
         unwrap_state = {}
-    planned = {file_path for file_path, _layout, _objects, _size in atlases}
+    # Decal atlases are planned once the receivers are unwrapped; their scopes' stored unwraps stay.
+    decal_files = tuple(decal_lightmap_file_start(plan["prefix"]) for plan in decal_plans)
+    planned = {file_path for file_path, _layout, _objects, _size in atlases} | {
+        file_path for file_path in unwrap_state if file_path.startswith(decal_files)
+    }
     unwrap_state = {key: value for key, value in unwrap_state.items() if key in planned}
     settings.lightmap_unwrap_state = json.dumps(unwrap_state)
 
@@ -4868,6 +4958,43 @@ def iter_lightmap_bake(context, settings, report):
                     f"{objects[0].name} ({areas[objects[0]]:.0f} m²) exceeds one {atlas_size} px atlas at "
                     f"{texel_size:.2f} m; it bakes alone at {entry['texel']:.2f} m"
                 ))
+        # Decal atlases take the finest texel size of the receivers their decals may copy from, so a
+        # decal is as sharp as the surface behind it, at the smallest atlas that holds it. Grouping counts
+        # each decal's chart margins, since thin strips are mostly margin.
+        receiver_texels = {}
+        for (_file_path, layout, _objects, _size), texel in zip(atlases, texel_sizes):
+            receiver_texels.setdefault(layout, []).append(texel)
+        decal_atlases = []
+        for plan in decal_plans:
+            layout = plan["layout"]
+            target = min(receiver_texels.get(None, []) + (receiver_texels.get(layout, []) if layout else []))
+            margin = LIGHTMAP_PACK_MARGIN_PIXELS * 0.5 * target
+            items = [(decal, area + boundary * margin, centre) for decal, area, boundary, centre in plan["decals"]]
+            for group_index, (objects, _size) in enumerate(lightmap_atlas_groups(items, target, atlas_size)):
+                file_path = decal_lightmap_file(plan["prefix"], group_index)
+                yield 0.2, f"Unwrapping {file_path}"
+                stored = unwrap_state.get(file_path)
+                size = stored["atlasSize"] if stored else LIGHTMAP_MIN_ATLAS_SIZE
+                while True:
+                    entry = lightmap_unwrap_entry(objects, areas, size, target)
+                    if lightmap_unwrap_current(entry, stored, objects):
+                        entry["texel"] = stored["texel"]
+                        break
+                    unwrap_state.pop(file_path, None)
+                    settings.lightmap_unwrap_state = json.dumps(unwrap_state)
+                    entry["texel"] = unwrap_lightmap_atlas(context, state, objects, areas, size, target)
+                    stored = None
+                    if entry["texel"] <= target * LIGHTMAP_DECAL_TEXEL_SLACK or size >= atlas_size:
+                        unwrap_state[file_path] = entry
+                        settings.lightmap_unwrap_state = json.dumps(unwrap_state)
+                        break
+                    size *= 2
+                if entry["texel"] > target * LIGHTMAP_DECAL_TEXEL_SLACK:
+                    report({"WARNING"}, (
+                        f"The decals of {file_path} need more than one {atlas_size} px atlas at {target:.2f} m; "
+                        f"they copy their surfaces at {entry['texel']:.2f} m"
+                    ))
+                decal_atlases.append((plan, file_path, objects, size))
 
         images = {}
         for index, (file_path, layout, objects, size) in enumerate(atlases):
@@ -4926,9 +5053,9 @@ def iter_lightmap_bake(context, settings, report):
             )
             for obj in objects:
                 obj[LIGHTMAP_PROPERTY] = file_path
-        if decal_plans:
-            yield 0.99, f"Projecting {len(decal_plans)} decal(s) onto their lightmaps"
-            apply_decal_lightmaps(decal_plans)
+        for index, (plan, file_path, objects, size) in enumerate(decal_atlases):
+            yield 0.99, f"Copying the surfaces behind the decals {index + 1}/{len(decal_atlases)}: {file_path}"
+            apply_decal_lightmap(settings, plan, file_path, objects, size)
         if grass_plans:
             yield 0.99, f"Copying the ground's lightmap onto {len(grass_plans)} grass group(s)"
             apply_grass_lightmaps(settings, grass_plans)
@@ -4938,7 +5065,7 @@ def iter_lightmap_bake(context, settings, report):
         state.restore()
         if not completed:
             clear_lightmap_results(settings)
-    return len(atlases), min(texel_sizes), max(texel_sizes), len(skipped), len(grass_plans)
+    return len(atlases), min(texel_sizes), max(texel_sizes), len(skipped), len(grass_plans), len(decal_atlases)
 
 
 def validate_visual_root(errors, label, visuals):
@@ -6754,9 +6881,11 @@ class TRACK_EXPORTER_OT_bake_lightmaps(ProgressStepsOperator, Operator):
         return self.run_steps(context, iter_lightmap_bake(context, settings, self.report))
 
     def steps_finished(self, value):
-        count, smallest, largest, skipped, grass = value
+        count, smallest, largest, skipped, grass, decals = value
         texel = f"{smallest:.2f} m" if abs(largest - smallest) < 0.005 else f"{smallest:.2f}-{largest:.2f} m"
         message = f"Baked {count} lightmap atlas(es); texel size {texel}"
+        if decals:
+            message += f"; {decals} decal atlas(es) from the surfaces behind them"
         if grass:
             message += f"; {grass} grass map(s) from the ground under them"
         if skipped:
