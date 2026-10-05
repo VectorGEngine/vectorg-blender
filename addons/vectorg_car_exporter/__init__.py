@@ -1897,6 +1897,8 @@ def validate_scene(settings):
             errors.append(f"{label} max steering angle must be between 1 and 90 degrees")
         if not math.isfinite(preset.road_wheel_curve) or not 0.0 <= preset.road_wheel_curve <= 1.0:
             errors.append(f"{label} steering response curve must be between 0 and 1")
+        if not math.isfinite(preset.ackermann) or not -1.0 <= preset.ackermann <= 1.0:
+            errors.append(f"{label} Ackermann must be between -1 and 1")
         if not math.isfinite(preset.max_degrees_of_rotation) or not 90.0 <= preset.max_degrees_of_rotation <= 2160.0:
             errors.append(f"{label} steering wheel rotation must be between 90 and 2160 degrees")
         if not math.isfinite(preset.brake_bias) or not 0.0 <= preset.brake_bias <= 1.0:
@@ -2430,6 +2432,18 @@ class CarPresetSettings(PropertyGroup):
         description="Blend between linear (0) and cubic (1) road-wheel response",
         default=0.5,
         min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
+    ackermann: FloatProperty(
+        name="Ackermann",
+        description=(
+            "Percent Ackermann: 1 steers the inner front wheel more (full Ackermann), "
+            "0 keeps both wheels parallel and -1 steers the outer wheel more (anti-Ackermann)"
+        ),
+        default=1.0,
+        min=-1.0,
         max=1.0,
         step=5,
         precision=2,
@@ -3486,6 +3500,7 @@ def build_presets_config(settings):
             "name": preset.display_name,
             "maxSteeringAngle": preset.max_steering_angle,
             "roadWheelCurve": preset.road_wheel_curve,
+            "ackermann": preset.ackermann,
             "maxDegreesOfRotation": preset.max_degrees_of_rotation,
             "antiRollBars": {
                 "front": preset.front_anti_roll_bar_stiffness,
@@ -4593,6 +4608,7 @@ def default_preset_values(settings):
     return {
         "max_steering_angle": 50.0,
         "road_wheel_curve": 0.5,
+        "ackermann": 1.0,
         "max_degrees_of_rotation": 540.0,
         "front_anti_roll_bar_stiffness": 15.0,
         "rear_anti_roll_bar_stiffness": 15.0,
@@ -4808,6 +4824,7 @@ def apply_preset_values(values, target):
     for field in (
         "max_steering_angle",
         "road_wheel_curve",
+        "ackermann",
         "max_degrees_of_rotation",
         "front_anti_roll_bar_stiffness",
         "rear_anti_roll_bar_stiffness",
@@ -5370,6 +5387,15 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             ):
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.roadWheelCurve must be between 0 and 1")
                 return {"CANCELLED"}
+            ackermann = preset_data.get("ackermann")
+            if (
+                isinstance(ackermann, bool)
+                or not isinstance(ackermann, (int, float))
+                or not math.isfinite(ackermann)
+                or not -1 <= ackermann <= 1
+            ):
+                self.report({"ERROR"}, f"Manifest preset {preset_index}.ackermann must be between -1 and 1")
+                return {"CANCELLED"}
             rotation = preset_data.get("maxDegreesOfRotation")
             if not isinstance(rotation, (int, float)) or not math.isfinite(rotation) or not 90 <= rotation <= 2160:
                 self.report({"ERROR"}, f"Manifest preset {preset_index}.maxDegreesOfRotation is invalid")
@@ -5562,6 +5588,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             preset.display_name = str(preset_data.get("name", preset.preset_id))
             preset.max_steering_angle = preset_data["maxSteeringAngle"]
             preset.road_wheel_curve = preset_data.get("roadWheelCurve", 0.5)
+            preset.ackermann = preset_data["ackermann"]
             preset.max_degrees_of_rotation = preset_data["maxDegreesOfRotation"]
             preset.front_anti_roll_bar_stiffness = preset_data["antiRollBars"]["front"]
             preset.rear_anti_roll_bar_stiffness = preset_data["antiRollBars"]["rear"]
@@ -5835,6 +5862,7 @@ def draw_presets(layout, settings):
     draw_split_prop(layout, preset, "display_name")
     draw_split_prop(layout, preset, "max_steering_angle")
     draw_split_prop(layout, preset, "road_wheel_curve")
+    draw_split_prop(layout, preset, "ackermann")
     draw_split_prop(layout, preset, "max_degrees_of_rotation")
     draw_split_prop(layout, preset, "front_anti_roll_bar_stiffness")
     draw_split_prop(layout, preset, "rear_anti_roll_bar_stiffness")

@@ -62,6 +62,7 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
       "name": "Default",
       "maxSteeringAngle": 50.0,
       "roadWheelCurve": 0.5,
+      "ackermann": 1.0,
       "maxDegreesOfRotation": 540.0,
       "antiRollBars": {
         "front": 15.0,
