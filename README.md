@@ -679,7 +679,8 @@ its field:
   the viewport.
 - **Shadow** (`GHOST_SHADOW`) joins Ghost Root's own meshes, without the wheels,
   into one mesh without materials at 10% of its triangles.
-- **Shadow Plane** (`GHOST_SHADOW_PLANE`) is a flat, single-sided quad textured
+- **Shadow Plane** (`GHOST_SHADOW_PLANE`) is a flat, single-sided quad on the
+  floor, at the ghost's lowest point (where its tyres touch the ground), textured
   with the whole car's top-down silhouette, wheels included: a packed PNG, white,
   with the blurred silhouette as alpha. The game takes only the alpha, as the
   shadow's shape and softness, and darkens the ground under it by each track's
@@ -715,7 +716,8 @@ by that integration.
 ## Custom Shadow
 
 Open **Custom Shadow**, check the box next to the title, and pick a **Shadow
-Mesh**, or click **Generate Shadow Mesh**. In the game the shadow mesh alone
+Mesh**, or click the refresh button at the end of its field to generate one. In
+the game the shadow mesh alone
 casts the car's live shadow: it is drawn only into the sun's shadow map, never
 on screen or in the mirror, and every other part stops casting while still
 receiving shadows. Shadow cost is per draw call, so one shadow mesh replaces
@@ -725,7 +727,7 @@ as before, and an assigned shadow mesh is left out of the export.
 The shadow mesh must be a mesh with faces, a direct child of Car Root, without
 children, and not used as a wheel, camera, collider, ghost or other reference.
 
-**Generate Shadow Mesh** joins the evaluated geometry of every mesh under Car
+The refresh button joins the evaluated geometry of every mesh under Car
 Root into one object named `SHADOW_MESH`, without materials, UV maps or color
 layers, shown as wireframe. It leaves out the wheel mount hierarchies, the
 custom ghost, colliders and helpers. Generating again
@@ -734,6 +736,37 @@ result is an ordinary object: decimate or edit it to lower its cost further.
 
 The manifest records it as `"shadow": { "obj": "SHADOW_MESH" }`, or `null`.
 A custom ghost casts with its own geometry.
+
+### AO Plane
+
+Below **Shadow Mesh**, the refresh button at the end of **AO Plane** builds the
+car's ambient shadow, `AMBIENT_SHADOW`, inside the `.blend` in a few seconds,
+without baking, and replaces what an earlier refresh made.
+
+- It copies every mesh under Car Root, wheels included, leaving out the custom
+  ghost, colliders, helpers and the shadow mesh, at 2% of their triangles, and
+  draws their outline seen from straight above into a 128 px image, blurred by
+  0.5 m on each side with a 0.6 m clear border.
+- `AMBIENT_SHADOW` is a flat, single-sided quad, a direct child of Car Root, at
+  the car's lowest point (where the tyres touch the ground), hidden in the
+  viewport. Its packed PNG is black with the blurred outline as alpha, and its
+  material shows exactly that, so Blender and the game look the same.
+
+In the game the plane stays on the ground straight under the car, turned with
+it, on every surface the car drives over. Black at the outline's opacity
+darkens the ground by the sky light the car blocks, so it needs no colour per
+track. It fades out as the car rises above its resting height and is gone 1 m
+up. The player car and replays show it; ghosts and the garage preview do not.
+It never casts or receives shadows.
+
+The plane can also be a hand-made mesh with the same layout: a direct child of
+Car Root, without children, not used as any other reference, with a material
+whose image texture holds the outline in alpha. Its height under Car Root is
+read as the ground at rest. With **Custom Shadow** off, an assigned plane is
+left out of the export like the shadow mesh.
+
+The manifest records it as `"ambientShadow": { "obj": "AMBIENT_SHADOW" }`, or
+`null` when **AO Plane** is empty or **Custom Shadow** is off.
 
 ## Lights
 
@@ -859,6 +892,15 @@ centered, lap timing is at the bottom left, and speed is at the bottom right.
 ## Export
 
 Use `Validate Car` first, then `Export Car Zip`.
+
+Objects under Car Root that are hidden in the viewport (the eye, the monitor or
+a hidden collection) are left out of the GLB, so the game never draws them;
+their visible children export where they are. **Validate Car** lists them as a
+warning. Nodes the manifest names or the game drives (Car Root, wheels,
+cameras, colliders, the ghost root, the shadow mesh, the AO plane and the like)
+and the objects the refresh buttons generate and hide always export. Hidden
+meshes are also left out of mesh merging, the shadow mesh, the AO plane and the
+ghost LODs.
 
 When the configured car root or any object below it has non-unit scale, export
 asks whether to apply hierarchy scales. Leaving **Apply scales** checked

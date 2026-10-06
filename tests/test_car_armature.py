@@ -14,7 +14,7 @@ FUNCTIONS = {
     "armature_object_poll", "armature_attachment_object", "armature_attachment_offset",
     "parse_armature_config", "blender_position_to_game",
     "build_armature_config", "import_armature_config", "validate_armature_scene",
-    "gltf_armature_export_options", "export_car_glb", "build_manifest",
+    "gltf_armature_export_options", "export_car_gltf", "export_car_glb", "build_manifest",
     "draw_armature",
 }
 
@@ -362,9 +362,12 @@ class ArmatureTests(unittest.TestCase):
             "apply_export_texture_optimization": lambda *args: (["node"], ["image"]),
             "restore_export_textures": lambda nodes, images: cleaned.append((nodes, images)),
             "gltf_image_export_options": lambda quality: {"export_image_quality": quality},
+            "hidden_export_objects": lambda settings: [SimpleNamespace(name="hidden_part")],
         })
+        hidden_during_export = []
         def exporting(**options):
             calls.append(options)
+            hidden_during_export.append(self.api.get("car_export_hidden_names"))
             return {"CANCELLED"} if len(calls) == 2 else {"FINISHED"}
         self.api["bpy"].ops = SimpleNamespace(export_scene=SimpleNamespace(gltf=exporting))
         context = SimpleNamespace(scene=SimpleNamespace(objects=self.scene_objects))
@@ -380,6 +383,8 @@ class ArmatureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not finish"):
             self.call("export_car_glb", context, Path("car.glb"), 2048, True, 90)
         self.assertEqual(cleaned, [(["node"], ["image"]), "carrier"] * 2)
+        self.assertEqual(hidden_during_export, [{"hidden_part"}] * 2, "hidden objects are left out of every car export")
+        self.assertIsNone(self.api["car_export_hidden_names"], "and only while it runs, even when it fails")
         self.settings.armature_enabled = False
         self.call("export_car_glb", context, Path("car.glb"), 2048, True, 90)
         self.assertNotIn("export_animations", calls[-1])

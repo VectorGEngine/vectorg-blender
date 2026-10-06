@@ -734,6 +734,14 @@ def excluded_ghost_objects(settings):
     return hierarchy_objects(settings.ghost_root_object) if not settings.ghost_enabled else []
 
 
+def export_visible(obj):
+    """Whether Blender shows obj in the viewport, by the same test as the glTF exporter's Visible Objects:
+    the eye, the monitor, and the monitor of every collection holding it."""
+    return obj.visible_get() and not obj.hide_viewport and not all(
+        collection.hide_viewport for collection in obj.users_collection
+    )
+
+
 def car_export_objects(settings):
     excluded = set(
         guide_objects() + downforce_helper_objects() + light_helper_objects()
@@ -746,6 +754,15 @@ SHADOW_MESH_NAME = "SHADOW_MESH"
 GENERATED_SHADOW_PROP = "vectorg_generated_shadow"
 BODY_MATERIAL_CARRIER_NAME = "VECTORG_BODY_MATERIALS"
 MERGED_OBJECT_PREFIX = "MERGED_"
+AMBIENT_SHADOW_NAME = "AMBIENT_SHADOW"
+GENERATED_AMBIENT_SHADOW_PROP = "vectorg_generated_ambient_shadow"
+# Pixels along the longer side of the ambient shadow's outline image; a blurrier image needs fewer.
+AMBIENT_SHADOW_PIXELS = 128
+# Metres of blur on each side of the outline, and of clear border around it, wider than the blur.
+AMBIENT_SHADOW_SOFTNESS = 0.5
+AMBIENT_SHADOW_BORDER = 0.6
+# The outline is drawn from a light copy of the car, like the ghost shadow plane's.
+AMBIENT_SHADOW_OUTLINE_RATIO = 0.02
 
 
 def shadow_mesh_poll(_settings, obj):
@@ -753,7 +770,10 @@ def shadow_mesh_poll(_settings, obj):
 
 
 def excluded_shadow_objects(settings):
-    return [settings.shadow_object] if settings.shadow_object and not settings.shadow_enabled else []
+    """The shadow mesh and the AO plane while Custom Shadow is off: left out of the export."""
+    if settings.shadow_enabled:
+        return []
+    return [obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj]
 
 
 def build_shadow_config(settings):
@@ -777,6 +797,25 @@ def import_shadow_config(settings, config):
     if config is None:
         return
     set_object_pointer(settings, "shadow_object", config["obj"])
+
+
+def build_ambient_shadow_config(settings):
+    if not settings.shadow_enabled or not settings.ambient_shadow_object:
+        return None
+    return {"obj": object_config_name(settings.ambient_shadow_object)}
+
+
+def parse_ambient_shadow_config(value):
+    if value is None:
+        return None
+    name = value.get("obj") if isinstance(value, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Manifest ambientShadow.obj must be a non-empty string")
+    return {"obj": name}
+
+
+def import_ambient_shadow_config(settings, config):
+    set_object_pointer(settings, "ambient_shadow_object", config["obj"] if config else None)
 
 
 def car_reference_objects(settings):
@@ -816,8 +855,80 @@ def validate_shadow_scene(settings, errors, _warnings):
         errors.append("Custom shadow mesh must be a direct child of the car root")
     if obj.children:
         errors.append("Custom shadow mesh must not have children")
-    if obj in car_reference_objects(settings):
-        errors.append("Custom shadow mesh must not also be a wheel, camera, collider, ghost or other car reference")
+    if obj in car_reference_objects(settings) or obj == settings.ambient_shadow_object:
+        errors.append("Custom shadow mesh must not also be a wheel, camera, collider, ghost, the AO plane "
+                      "or other car reference")
+
+
+def hidden_export_objects(settings):
+    """Objects under Car Root hidden in the viewport, which the export leaves out so the game never draws
+    them. Nodes the manifest names or the game drives, and the objects the add-on generates and hides
+    itself, export whatever their visibility."""
+    kept = car_reference_objects(settings) | ghost_lod_objects(settings)
+    kept.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
+    generated = (GENERATED_GHOST_LOD_PROP, GENERATED_SHADOW_PROP, GENERATED_AMBIENT_SHADOW_PROP)
+    scene_objects = set(bpy.context.scene.objects)
+    return [
+        obj for obj in hierarchy_objects(settings.car_root_object)
+        if obj in scene_objects and obj not in kept and not any(obj.get(prop) for prop in generated)
+        and not export_visible(obj)
+    ]
+
+
+# Names of the objects the running car export leaves out, or None outside a car export.
+car_export_hidden_names = None
+
+
+class glTF2ExportUserExtension:
+    """Blender's glTF exporter runs this for every export while the add-on is enabled. During a car export
+    it drops the hidden objects from the exported tree; their children stay, under the nearest exported
+    ancestor, where they were."""
+
+    def gather_tree_filter_tag_hook(self, vtree, _export_settings):
+        if not car_export_hidden_names:
+            return
+        for node in vtree.nodes.values():
+            if node.blender_object is not None and node.blender_object.name in car_export_hidden_names:
+                node.keep_tag = False
+
+
+def export_car_gltf(settings, **options):
+    """Blender's glTF export of the scene, leaving out the hidden car objects."""
+    global car_export_hidden_names
+    car_export_hidden_names = {obj.name for obj in hidden_export_objects(settings)}
+    try:
+        return bpy.ops.export_scene.gltf(**options)
+    finally:
+        car_export_hidden_names = None
+
+
+def validate_hidden_objects(settings, _errors, warnings):
+    hidden = hidden_export_objects(settings)
+    if hidden:
+        names = ", ".join(sorted(obj.name for obj in hidden)[:8]) + (", ..." if len(hidden) > 8 else "")
+        warnings.append(f"{len(hidden)} hidden objects stay hidden: left out of the export ({names})")
+
+
+def validate_ambient_shadow_scene(settings, errors, _warnings):
+    obj = settings.ambient_shadow_object
+    if not settings.shadow_enabled or not obj:
+        return
+    if obj.type != "MESH" or not obj.data.polygons:
+        errors.append("AO plane must be a mesh with faces")
+    if obj not in set(bpy.context.scene.objects):
+        errors.append("AO plane must belong to the current scene")
+    if not settings.car_root_object or obj.parent != settings.car_root_object:
+        errors.append("AO plane must be a direct child of the car root")
+    if obj.children:
+        errors.append("AO plane must not have children")
+    if obj in car_reference_objects(settings) or obj == settings.shadow_object:
+        errors.append("AO plane must not also be the shadow mesh, a wheel, camera, collider, ghost "
+                      "or other car reference")
+    material = obj.active_material if obj.type == "MESH" else None
+    if not material or not material.use_nodes or not any(
+        node.type == "TEX_IMAGE" and node.image for node in material.node_tree.nodes
+    ):
+        errors.append("AO plane needs a material with its outline image; use its refresh button")
 
 
 def is_skinned_object(obj):
@@ -826,22 +937,22 @@ def is_skinned_object(obj):
     )
 
 
-def shadow_source_objects(context, settings):
-    """The car's rendered meshes under the car root, leaving out the wheel mount hierarchies,
-    the ghost, colliders, helpers and any earlier shadow mesh."""
+def shadow_source_objects(context, settings, wheels=False):
+    """The car's rendered meshes under the car root, leaving out hidden ones, the ghost, colliders, helpers,
+    the shadow mesh and ambient shadow plane and, unless `wheels`, the wheel mount hierarchies."""
     root = settings.car_root_object
     scene_objects = set(context.scene.objects)
     excluded = set(hierarchy_objects(settings.ghost_root_object))
-    for wheel in settings.wheels:
-        excluded.update(hierarchy_objects(wheel.suspension_ref))
+    if not wheels:
+        for wheel in settings.wheels:
+            excluded.update(hierarchy_objects(wheel.suspension_ref))
     excluded.update(collider.object_ref for collider in settings.colliders if collider.object_ref)
     excluded.update(guide_objects() + downforce_helper_objects() + light_helper_objects())
-    if settings.shadow_object:
-        excluded.add(settings.shadow_object)
+    excluded.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
     return [
         obj for obj in hierarchy_objects(root)
-        if obj is not root and obj.type == "MESH" and obj in scene_objects and obj not in excluded
-        and obj.data.polygons and not obj.get(GENERATED_SHADOW_PROP)
+        if obj is not root and obj.type == "MESH" and obj in scene_objects and obj not in excluded and export_visible(obj)
+        and obj.data.polygons and not obj.get(GENERATED_SHADOW_PROP) and not obj.get(GENERATED_AMBIENT_SHADOW_PROP)
         and obj.name != BODY_MATERIAL_CARRIER_NAME
     ]
 
@@ -853,11 +964,13 @@ def evaluated_mesh_copy(obj, space, depsgraph):
     return mesh
 
 
-def join_meshes(context, meshes, collection, name):
-    """Joins mesh datablocks into one new object with an identity transform."""
+def join_meshes(context, meshes, collection, name, space):
+    """Joins mesh datablocks in `space`'s coordinates into one new object placed at `space`, so it sits
+    exactly over the objects the meshes were copied from."""
     parts = []
     for mesh in meshes:
         part = bpy.data.objects.new(name, mesh)
+        part.matrix_world = space.matrix_world.copy()
         collection.objects.link(part)
         parts.append(part)
     if len(parts) > 1:
@@ -892,7 +1005,7 @@ def generate_shadow_mesh(context, settings):
     depsgraph = context.evaluated_depsgraph_get()
     meshes = [evaluated_mesh_copy(obj, root, depsgraph) for obj in sources]
     collection = root.users_collection[0] if root.users_collection else context.scene.collection
-    shadow = join_meshes(context, meshes, collection, SHADOW_MESH_NAME)
+    shadow = join_meshes(context, meshes, collection, SHADOW_MESH_NAME, root)
     mesh = shadow.data
     mesh.name = SHADOW_MESH_NAME
     mesh.materials.clear()
@@ -951,13 +1064,12 @@ def car_merge_groups(context, settings):
     """Meshes that join into one node each: same materials in use, same UV layer count and color
     layers, under the same nearest anchor. Anchors are the car root and every node the manifest
     names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
-    dashboard, ghost nodes, shadow mesh), so each wheel merges on its own spin node and moving
+    dashboard, ghost nodes, shadow mesh, ambient shadow), so each wheel merges on its own spin node and moving
     parts keep moving. Colliders, skinned parts, referenced nodes, meshes with children and the
     body color carrier are never merged."""
     root = settings.car_root_object
     anchors = car_reference_objects(settings)
-    if settings.shadow_object:
-        anchors.add(settings.shadow_object)
+    anchors.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
     colliders = {collider.object_ref for collider in settings.colliders if collider.object_ref}
     # The ghost LODs are built per moving part already and must stay apart from the full-detail ghost.
     lod_objects = ghost_lod_objects(settings)
@@ -966,7 +1078,7 @@ def car_merge_groups(context, settings):
     for obj in hierarchy_objects(root):
         if obj.type != "MESH" or obj not in scene_objects or obj in anchors or obj in colliders:
             continue
-        if obj in lod_objects:
+        if obj in lod_objects or not export_visible(obj):
             continue
         if obj.children or obj.name == BODY_MATERIAL_CARRIER_NAME or is_skinned_object(obj) or not obj.data.polygons:
             continue
@@ -1002,7 +1114,7 @@ def apply_car_mesh_merge(context, settings):
             result.meshes.extend(meshes)
             align_merge_layers(meshes)
             collection = anchor.users_collection[0] if anchor.users_collection else context.scene.collection
-            merged = join_meshes(context, meshes, collection, f"{MERGED_OBJECT_PREFIX}{objects[0].name}")
+            merged = join_meshes(context, meshes, collection, f"{MERGED_OBJECT_PREFIX}{objects[0].name}", anchor)
             merged.parent = anchor
             merged.matrix_parent_inverse.identity()
             merged.matrix_basis.identity()
@@ -1087,8 +1199,9 @@ def ghost_lod_anchors(settings):
 
 
 def ghost_lod_parts(context, settings):
-    """Full-detail ghost meshes grouped by the nearest anchor at or above them. Each group moves as one
-    part in the game, so it gets one LOD1 mesh following that anchor."""
+    """Full-detail ghost meshes, hidden ones left out as the export leaves them out, grouped by the nearest
+    anchor at or above them. Each group moves as one part in the game, so it gets one LOD1 mesh following
+    that anchor."""
     anchors = ghost_lod_anchors(settings)
     anchor_set = set(anchors)
     scene_objects = set(context.scene.objects)
@@ -1097,7 +1210,7 @@ def ghost_lod_parts(context, settings):
     for obj in hierarchy_objects(settings.ghost_root_object):
         if obj.type != "MESH" or obj not in scene_objects or not obj.data.polygons or obj in excluded:
             continue
-        if obj.name == BODY_MATERIAL_CARRIER_NAME or obj.get(GENERATED_GHOST_LOD_PROP):
+        if obj.name == BODY_MATERIAL_CARRIER_NAME or obj.get(GENERATED_GHOST_LOD_PROP) or not export_visible(obj):
             continue
         anchor = obj
         while anchor not in anchor_set:
@@ -1410,8 +1523,9 @@ def box_blur(values, radius, axis):
     return (upper - lower) / width
 
 
-def ghost_silhouette_alpha(mesh):
-    """The mesh seen from straight above, in its own XY plane: coverage per pixel with soft edges, the XY
+def silhouette_alpha(mesh, pixels, softness, border):
+    """The mesh seen from straight above, in its own XY plane, `pixels` across its longer side with `border`
+    metres of margin: coverage per pixel blurred by `softness` metres on each side of the outline, the XY
     position of the image's first pixel corner and the metres per pixel."""
     mesh.calc_loop_triangles()
     points = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
@@ -1420,9 +1534,9 @@ def ghost_silhouette_alpha(mesh):
     triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
     mesh.loop_triangles.foreach_get("vertices", triangles)
     triangles = triangles.reshape(-1, 3)
-    low = points.min(axis=0) - GHOST_SHADOW_PLANE_BORDER
-    high = points.max(axis=0) + GHOST_SHADOW_PLANE_BORDER
-    pixel = float((high - low).max()) / GHOST_SHADOW_PLANE_PIXELS
+    low = points.min(axis=0) - border
+    high = points.max(axis=0) + border
+    pixel = float((high - low).max()) / pixels
     columns, rows = (int(math.ceil(value)) for value in (high - low) / pixel)
     covered = np.zeros((rows, columns), dtype=bool)
     corners = (points - low) / pixel
@@ -1447,29 +1561,38 @@ def ghost_silhouette_alpha(mesh):
             covered[centre[1], centre[0]] = True
     alpha = covered.astype(np.float32)
     # Three box blurs approximate a Gaussian penumbra of the given width.
-    radius = max(int(round(GHOST_SHADOW_PLANE_SOFTNESS / pixel / 3.0)), 1)
+    radius = max(int(round(softness / pixel / 3.0)), 1)
     for _pass in range(3):
         alpha = box_blur(box_blur(alpha, radius, 0), radius, 1)
     return np.clip(alpha, 0.0, 1.0), low, pixel
 
 
-def build_ghost_shadow_plane(build, collection, root, mesh):
-    """A single-sided quad under Ghost Root covering mesh's top-down silhouette, with a packed PNG: white,
-    with the soft silhouette as alpha. The game uses the alpha as the shadow's coverage and tints the
-    ground per track; the material's preview colour is for Blender only."""
-    alpha, low, pixel = ghost_silhouette_alpha(mesh)
+def lowest_point(mesh):
+    """The lowest Z of mesh's vertices: where the car meets the floor, for a mesh of the whole car."""
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coordinates)
+    return float(coordinates.reshape(-1, 3)[:, 2].min())
+
+
+def build_shadow_plane(build, collection, parent, mesh, floor, name, prop, resolution, color, preview_color):
+    """A single-sided quad under `parent`, on the floor `floor` metres up its Z, covering mesh's top-down
+    silhouette, with a packed PNG of `color` whose alpha is the silhouette blurred per `resolution` (pixels,
+    softness, border), shown by a blended material. `preview_color`, when not None, multiplies the colour in
+    Blender only. The object, material and image are marked with `prop` and named `name` plus "_new"."""
+    alpha, low, pixel = silhouette_alpha(mesh, *resolution)
     rows, columns = alpha.shape
-    image = bpy.data.images.new(f"{GHOST_SHADOW_PLANE_NAME}_silhouette_new", columns, rows, alpha=True)
+    image = bpy.data.images.new(f"{name}_silhouette_new", columns, rows, alpha=True)
     build.results.append(image)
-    image[GENERATED_GHOST_LOD_PROP] = True
-    pixels = np.ones((rows, columns, 4), dtype=np.float32)
+    image[prop] = True
+    pixels = np.empty((rows, columns, 4), dtype=np.float32)
+    pixels[:, :, :3] = color
     pixels[:, :, 3] = alpha
     image.pixels.foreach_set(pixels.ravel())
     image.pack()
 
-    material = bpy.data.materials.new(f"{GHOST_SHADOW_PLANE_NAME}_new")
+    material = bpy.data.materials.new(f"{name}_new")
     build.results.append(material)
-    material[GENERATED_GHOST_LOD_PROP] = True
+    material[prop] = True
     material.use_nodes = True
     # Single-sided: a double-sided blended material is drawn twice in the game, darkening it twice.
     material.use_backface_culling = True
@@ -1486,19 +1609,22 @@ def build_ghost_shadow_plane(build, collection, root, mesh):
     texture = tree.nodes.new("ShaderNodeTexImage")
     texture.name = "Silhouette"
     texture.image = image
-    preview = tree.nodes.new("ShaderNodeMix")
-    preview.data_type = "RGBA"
-    preview.blend_type = "MULTIPLY"
-    # The mix node has a socket per data type under each name; pick the colour ones.
-    sockets = {socket.identifier: socket for socket in list(preview.inputs) + list(preview.outputs)}
-    sockets["Factor_Float"].default_value = 1.0
-    sockets["B_Color"].default_value = (*GHOST_SHADOW_PLANE_PREVIEW_COLOR, 1.0)
-    tree.links.new(texture.outputs["Color"], sockets["A_Color"])
-    tree.links.new(sockets["Result_Color"], principled.inputs["Base Color"])
+    if preview_color is None:
+        tree.links.new(texture.outputs["Color"], principled.inputs["Base Color"])
+    else:
+        preview = tree.nodes.new("ShaderNodeMix")
+        preview.data_type = "RGBA"
+        preview.blend_type = "MULTIPLY"
+        # The mix node has a socket per data type under each name; pick the colour ones.
+        sockets = {socket.identifier: socket for socket in list(preview.inputs) + list(preview.outputs)}
+        sockets["Factor_Float"].default_value = 1.0
+        sockets["B_Color"].default_value = (*preview_color, 1.0)
+        tree.links.new(texture.outputs["Color"], sockets["A_Color"])
+        tree.links.new(sockets["Result_Color"], principled.inputs["Base Color"])
     tree.links.new(texture.outputs["Alpha"], principled.inputs["Alpha"])
 
     high = low + np.array((columns, rows)) * pixel
-    quad = bpy.data.meshes.new(f"{GHOST_SHADOW_PLANE_NAME}_new")
+    quad = bpy.data.meshes.new(f"{name}_new")
     build.results.append(quad)
     quad.from_pydata(
         [(low[0], low[1], 0.0), (high[0], low[1], 0.0), (high[0], high[1], 0.0), (low[0], high[1], 0.0)],
@@ -1510,34 +1636,36 @@ def build_ghost_shadow_plane(build, collection, root, mesh):
     quad.materials.append(material)
     quad.update()
 
-    plane = bpy.data.objects.new(f"{GHOST_SHADOW_PLANE_NAME}_new", quad)
+    plane = bpy.data.objects.new(f"{name}_new", quad)
     collection.objects.link(plane)
     build.results.append(plane)
-    plane.parent = root
+    plane[prop] = True
+    plane.parent = parent
     plane.matrix_parent_inverse.identity()
     plane.matrix_basis.identity()
+    plane.location.z = floor
     return plane
 
 
-def previous_ghost_lods(nodes):
-    """Datablocks an earlier refresh generated under these nodes: the marked objects, their meshes, and
-    the marked materials and images those use. Shared ones are only removed once nothing uses them."""
+def previous_generated(nodes, prop):
+    """Datablocks an earlier refresh generated under these nodes, marked with `prop`: the objects, their
+    meshes, and the materials and images those use. Shared ones are only removed once nothing uses them."""
     datablocks = []
     for node in nodes:
         for obj in hierarchy_objects(node):
-            if not obj.get(GENERATED_GHOST_LOD_PROP):
+            if not obj.get(prop):
                 continue
             datablocks.append(obj)
             if obj.data is None:
                 continue
             datablocks.append(obj.data)
             for material in obj.data.materials:
-                if not material or not material.get(GENERATED_GHOST_LOD_PROP):
+                if not material or not material.get(prop):
                     continue
                 datablocks.append(material)
                 datablocks.extend(
                     node.image for node in material.node_tree.nodes
-                    if node.type == "TEX_IMAGE" and node.image and node.image.get(GENERATED_GHOST_LOD_PROP)
+                    if node.type == "TEX_IMAGE" and node.image and node.image.get(prop)
                 )
     return list(dict.fromkeys(datablocks))
 
@@ -1553,7 +1681,7 @@ def strip_mesh_surface(mesh):
 
 def ghost_root_child(context, build, collection, root, meshes, name):
     """meshes, in Ghost Root's space, joined into one new object under Ghost Root."""
-    obj = join_meshes(context, meshes, collection, f"{name}_new")
+    obj = join_meshes(context, meshes, collection, f"{name}_new", root)
     build.results.append(obj)
     obj.parent = root
     obj.matrix_parent_inverse.identity()
@@ -1612,7 +1740,7 @@ def iter_generate_ghost_lods(context, settings, build, target, background_bake=F
         "LOD1": [settings.ghost_lod1_object, settings.ghost_lod2_object],
         "LOD2": [settings.ghost_lod2_object],
     }[target]
-    previous = previous_ghost_lods(replaced_nodes)
+    previous = previous_generated(replaced_nodes, GENERATED_GHOST_LOD_PROP)
     previous_set = set(previous)
     final_names = {
         "SHADOW": [GHOST_SHADOW_NAME],
@@ -1677,11 +1805,16 @@ def iter_generate_ghost_lods(context, settings, build, target, background_bake=F
         else:
             # The silhouette comes from a light copy of the whole car, wheels included.
             yield 0.7, "Simplifying the ghost for its silhouette..."
-            outline = join_meshes(context, meshes, collection, f"{GHOST_SHADOW_PLANE_NAME}_outline")
+            outline = join_meshes(context, meshes, collection, f"{GHOST_SHADOW_PLANE_NAME}_outline", root)
             build.temporary.append(outline)
+            floor = lowest_point(outline.data)
             decimate_ghost_lod(context, build, outline, GHOST_LOD2_RATIO, keep=False)
             yield 0.85, f"Building {GHOST_SHADOW_PLANE_NAME}..."
-            plane = build_ghost_shadow_plane(build, collection, root, outline.data)
+            plane = build_shadow_plane(
+                build, collection, root, outline.data, floor, GHOST_SHADOW_PLANE_NAME, GENERATED_GHOST_LOD_PROP,
+                (GHOST_SHADOW_PLANE_PIXELS, GHOST_SHADOW_PLANE_SOFTNESS, GHOST_SHADOW_PLANE_BORDER),
+                (1.0, 1.0, 1.0), GHOST_SHADOW_PLANE_PREVIEW_COLOR,
+            )
             renames.append((plane, GHOST_SHADOW_PLANE_NAME))
             renames.append((plane.active_material, GHOST_SHADOW_PLANE_NAME))
             renames.append((plane.active_material.node_tree.nodes["Silhouette"].image, f"{GHOST_SHADOW_PLANE_NAME}_silhouette"))
@@ -1708,6 +1841,8 @@ def iter_generate_ghost_lods(context, settings, build, target, background_bake=F
                 if split_mesh_faces(mesh, lambda material: material not in paint):
                     part_pieces.append((mesh, True))
                     piece = bpy.data.objects.new(f"{obj.name}_vectorg_ghost_lod_bake", mesh)
+                    # Over the object it copies, as the copy is in its anchor's space.
+                    piece.matrix_world = anchor.matrix_world.copy()
                     scene.collection.objects.link(piece)
                     build.temporary.append(piece)
                     bake_objects.append(piece)
@@ -1839,7 +1974,7 @@ def iter_generate_ghost_lods(context, settings, build, target, background_bake=F
             name = f"{GHOST_LOD1_PART_PREFIX}{anchor.name}"
             yield 0.75 + 0.15 * index / len(pieces), f"Building {name}..."
             # The part sits at its anchor's pose under the LOD1 node.
-            part = join_meshes(context, [mesh for mesh, _baked in part_pieces], collection, f"{name}_new")
+            part = join_meshes(context, [mesh for mesh, _baked in part_pieces], collection, f"{name}_new", anchor)
             build.results.append(part)
             part.parent = lod1
             part.matrix_world = anchor.matrix_world.copy()
@@ -1875,6 +2010,72 @@ def iter_generate_ghost_lods(context, settings, build, target, background_bake=F
     if lod1_count:
         summary = f"LOD1 {lod1_count}, {summary}"
     yield 1.0, f"{label} refreshed" + (f": {summary} triangles" if summary else "")
+
+
+def iter_generate_ambient_shadow(context, settings, build):
+    """Rebuilds the ambient shadow plane under Car Root, yielding (fraction, message) between steps, and
+    replaces what an earlier refresh made: a flat quad at the car's lowest point, the tyres' contact,
+    textured with the whole car's top-down outline, wheels included, blurred by AMBIENT_SHADOW_SOFTNESS.
+    The PNG is black with the outline as alpha; the game keeps the plane on the ground under the car."""
+    root = settings.car_root_object
+    if not root:
+        raise ValueError("Set Car Root first")
+    if context.mode != "OBJECT":
+        raise ValueError("Switch to Object Mode to refresh the ambient shadow")
+    sources = shadow_source_objects(context, settings, wheels=True)
+    if not sources:
+        raise ValueError("No car meshes found under the car root")
+    previous = previous_generated([settings.ambient_shadow_object], GENERATED_AMBIENT_SHADOW_PROP)
+    existing = bpy.data.objects.get(AMBIENT_SHADOW_NAME)
+    if existing and existing not in set(previous):
+        raise ValueError(f"Object name {AMBIENT_SHADOW_NAME} is reserved for the generated ambient shadow; rename that object")
+
+    depsgraph = context.evaluated_depsgraph_get()
+    view_layer = context.view_layer
+    collection = root.users_collection[0] if root.users_collection else context.scene.collection
+    selected = list(context.selected_objects)
+    active = view_layer.objects.active
+
+    def restore_selection():
+        for obj in view_layer.objects:
+            obj.select_set(obj in selected)
+        view_layer.objects.active = active if active and active.name in view_layer.objects else None
+
+    build.restores.append(restore_selection)
+    meshes = []
+    for index, obj in enumerate(sources):
+        yield 0.6 * index / len(sources), f"Copying {obj.name}..."
+        mesh = evaluated_mesh_copy(obj, root, depsgraph)
+        build.temporary.append(mesh)
+        strip_mesh_surface(mesh)
+        meshes.append(mesh)
+    yield 0.7, "Simplifying the car for its outline..."
+    outline = join_meshes(context, meshes, collection, f"{AMBIENT_SHADOW_NAME}_source", root)
+    build.temporary.append(outline)
+    # The game reads the drop from Car Root to the ground at rest from the plane's height.
+    ground = lowest_point(outline.data)
+    decimate_ghost_lod(context, build, outline, AMBIENT_SHADOW_OUTLINE_RATIO, keep=False)
+    yield 0.85, f"Building {AMBIENT_SHADOW_NAME}..."
+    plane = build_shadow_plane(
+        build, collection, root, outline.data, ground, AMBIENT_SHADOW_NAME, GENERATED_AMBIENT_SHADOW_PROP,
+        (AMBIENT_SHADOW_PIXELS, AMBIENT_SHADOW_SOFTNESS, AMBIENT_SHADOW_BORDER), (0.0, 0.0, 0.0), None,
+    )
+    image = plane.active_material.node_tree.nodes["Silhouette"].image
+
+    # Done: the result replaces what an earlier refresh made and takes its names.
+    remove_datablocks(previous)
+    # Objects linked without an operator only show in the view layer, for hiding, after an update.
+    view_layer.update()
+    for datablock, name in ((plane, AMBIENT_SHADOW_NAME), (plane.data, AMBIENT_SHADOW_NAME),
+                            (plane.active_material, AMBIENT_SHADOW_NAME), (image, f"{AMBIENT_SHADOW_NAME}_outline")):
+        datablock.name = name
+        if datablock.name != name:
+            raise RuntimeError(f"Generated ambient shadow {name} could not take its name")
+    if plane.name in view_layer.objects:
+        plane.hide_set(True)
+    settings.ambient_shadow_object = plane
+    build.succeeded = True
+    yield 1.0, f"Ambient shadow refreshed: {image.size[0]} x {image.size[1]} px outline, {ground:.3f} m below Car Root"
 
 
 def armature_object_poll(_settings, obj):
@@ -3017,6 +3218,8 @@ def validate_scene(settings):
     ensure_default_presets(settings)
     validate_ghost_scene(settings, errors, warnings)
     validate_shadow_scene(settings, errors, warnings)
+    validate_ambient_shadow_scene(settings, errors, warnings)
+    validate_hidden_objects(settings, errors, warnings)
     validate_armature_scene(settings, errors, warnings)
 
     wheel_positions = {}
@@ -3928,6 +4131,13 @@ class CarExporterSettings(PropertyGroup):
         type=bpy.types.Object,
         poll=shadow_mesh_poll,
     )
+    ambient_shadow_object: PointerProperty(
+        name="AO Plane",
+        description="Flat mesh, a direct child of Car Root, textured with the car's blurred top-down outline; "
+                    "the game keeps it on the ground under the car as its ambient shadow",
+        type=bpy.types.Object,
+        poll=shadow_mesh_poll,
+    )
     armature_enabled: BoolProperty(
         name="Enable Armature",
         description="Export bone mappings that follow, aim and stretch between existing car attachments",
@@ -4550,6 +4760,7 @@ def clear_configuration_settings(settings):
     settings.ghost_lod2_object = None
     settings.shadow_enabled = False
     settings.shadow_object = None
+    settings.ambient_shadow_object = None
     settings.armature_enabled = False
     settings.armature_object = None
     settings.armature_joints.clear()
@@ -5003,6 +5214,7 @@ def build_manifest(settings):
         "model": f"{settings.car_id}.glb",
         "ghost": build_ghost_config(settings),
         "shadow": build_shadow_config(settings),
+        "ambientShadow": build_ambient_shadow_config(settings),
         "displayName": settings.display_name,
         "class": settings.car_class,
         "trackTypes": [
@@ -5123,6 +5335,12 @@ GHOST_LOD_PROGRESS_TITLES = {
     "SUCCESS": "Ghost LOD Refreshed",
     "FAILED": "Ghost LOD Refresh Failed",
     "CANCELLED": "Ghost LOD Refresh Cancelled",
+}
+AMBIENT_SHADOW_PROGRESS_TITLES = {
+    "RUNNING": "Refreshing Ambient Shadow",
+    "SUCCESS": "Ambient Shadow Refreshed",
+    "FAILED": "Ambient Shadow Refresh Failed",
+    "CANCELLED": "Ambient Shadow Refresh Cancelled",
 }
 export_progress_state = {
     "status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": [], "titles": EXPORT_PROGRESS_TITLES,
@@ -5286,7 +5504,8 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
                 yield 0.05 + 0.35 * index / total, f"Optimizing texture {index + 1}/{total}: {name}"
 
             yield 0.40, "Exporting GLB model (this may take a while)..."
-            result = bpy.ops.export_scene.gltf(
+            result = export_car_gltf(
+                settings,
                 filepath=str(temp_path / f"{settings.car_id}.glb"),
                 export_format="GLB",
                 use_selection=False,
@@ -5430,31 +5649,24 @@ class CAR_EXPORTER_OT_generate_shadow_mesh(Operator):
         return {"FINISHED"}
 
 
-class CAR_EXPORTER_OT_generate_ghost_lods(Operator):
-    bl_idname = "car_exporter.generate_ghost_lods"
-    bl_label = "Refresh"
-    bl_options = {"REGISTER", "UNDO"}
-
-    target: EnumProperty(
-        name="Target",
-        items=[(key, label, description) for key, label, description in GHOST_LOD_TARGETS],
-        default="LOD1",
-    )
-
-    @classmethod
-    def description(cls, _context, properties):
-        return next(description for key, _label, description in GHOST_LOD_TARGETS if key == properties.target) \
-            + ". Replaces what an earlier refresh made"
+class GeneratorProgressOperator:
+    """Runs make_steps()'s (fraction, message) steps from a timer under the progress bar, so Blender stays
+    responsive while they run; Esc cancels. Without a window the steps run in place. The steps record what
+    they make in self.build, which keeps it only when they finish."""
+    progress_titles = EXPORT_PROGRESS_TITLES
+    cancelled_report = ""
 
     @classmethod
     def poll(cls, _context):
         return not export_progress_active()
 
+    def make_steps(self, context, interactive):
+        raise NotImplementedError
+
     def execute(self, context):
         self.build = GhostLodBuild()
         interactive = context.window is not None and not bpy.app.background
-        self.steps = iter_generate_ghost_lods(context, scene_settings(context), self.build, self.target,
-                                              background_bake=interactive)
+        self.steps = self.make_steps(context, interactive)
         self.message = ""
         if not interactive:
             try:
@@ -5471,7 +5683,7 @@ class CAR_EXPORTER_OT_generate_ghost_lods(Operator):
         self.result = {"FINISHED"}
         self.timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
-        export_progress_state["titles"] = GHOST_LOD_PROGRESS_TITLES
+        export_progress_state["titles"] = self.progress_titles
         update_export_progress("RUNNING", 0.0, "Starting...", "")
         return {"RUNNING_MODAL"}
 
@@ -5505,7 +5717,7 @@ class CAR_EXPORTER_OT_generate_ghost_lods(Operator):
             if self.finished_at is None:
                 if event.type == "ESC" and event.value == "PRESS":
                     self.steps.close()
-                    self.report({"WARNING"}, "Ghost LOD refresh cancelled")
+                    self.report({"WARNING"}, self.cancelled_report)
                     self.finish("CANCELLED", export_progress_state["fraction"], "Refresh cancelled")
                 elif event.type == "TIMER":
                     self.step()
@@ -5525,6 +5737,45 @@ class CAR_EXPORTER_OT_generate_ghost_lods(Operator):
                 self.build.finish()
             self.result = {"CANCELLED"}
             return self.close(context)
+
+
+class CAR_EXPORTER_OT_generate_ghost_lods(GeneratorProgressOperator, Operator):
+    bl_idname = "car_exporter.generate_ghost_lods"
+    bl_label = "Refresh"
+    bl_options = {"REGISTER", "UNDO"}
+    progress_titles = GHOST_LOD_PROGRESS_TITLES
+    cancelled_report = "Ghost LOD refresh cancelled"
+
+    target: EnumProperty(
+        name="Target",
+        items=[(key, label, description) for key, label, description in GHOST_LOD_TARGETS],
+        default="LOD1",
+    )
+
+    @classmethod
+    def description(cls, _context, properties):
+        return next(description for key, _label, description in GHOST_LOD_TARGETS if key == properties.target) \
+            + ". Replaces what an earlier refresh made"
+
+    def make_steps(self, context, interactive):
+        return iter_generate_ghost_lods(context, scene_settings(context), self.build, self.target,
+                                        background_bake=interactive)
+
+
+class CAR_EXPORTER_OT_generate_ambient_shadow(GeneratorProgressOperator, Operator):
+    bl_idname = "car_exporter.generate_ambient_shadow"
+    bl_label = "Refresh"
+    bl_description = (
+        "Draw the whole car's top-down outline, wheels included, blurred by "
+        f"{AMBIENT_SHADOW_SOFTNESS:g} m, into a flat black plane under Car Root at the tyres' lowest point. "
+        "Replaces what an earlier refresh made"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+    progress_titles = AMBIENT_SHADOW_PROGRESS_TITLES
+    cancelled_report = "Ambient shadow refresh cancelled"
+
+    def make_steps(self, context, _interactive):
+        return iter_generate_ambient_shadow(context, scene_settings(context), self.build)
 
 
 class CAR_EXPORTER_OT_add_collider(Operator):
@@ -6355,7 +6606,9 @@ def export_car_glb(context, filepath, max_texture_size, optimize_color_textures,
             Path(filepath).parent,
             jpeg_quality,
         )
-        result = bpy.ops.export_scene.gltf(
+        settings = scene_settings(context)
+        result = export_car_gltf(
+            settings,
             filepath=str(filepath),
             export_format="GLB",
             use_selection=False,
@@ -6363,7 +6616,7 @@ def export_car_glb(context, filepath, max_texture_size, optimize_color_textures,
             export_cameras=True,
             export_lights=False,
             **gltf_image_export_options(jpeg_quality),
-            **gltf_armature_export_options(scene_settings(context)),
+            **gltf_armature_export_options(settings),
         )
         if "FINISHED" not in result:
             raise RuntimeError("Blender glTF export did not finish")
@@ -6555,6 +6808,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         try:
             ghost_config = parse_ghost_config(data.get("ghost"))
             shadow_config = parse_shadow_config(data.get("shadow"))
+            ambient_shadow_config = parse_ambient_shadow_config(data.get("ambientShadow"))
             armature_config = parse_armature_config(data.get("armature"))
             lights_config = parse_lights_config(data.get("lights"))
             import_body = data.get("body")
@@ -6900,6 +7154,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.is_configured = True
         import_ghost_config(settings, ghost_config)
         import_shadow_config(settings, shadow_config)
+        import_ambient_shadow_config(settings, ambient_shadow_config)
         import_armature_config(settings, armature_config)
         settings.car_id = data.get("id", data.get("name", settings.car_id))
         settings.package_version = str(data.get("packageVersion", settings.package_version))
@@ -7092,6 +7347,15 @@ def draw_split_prop(layout, data, prop_name, label=None, **kwargs):
     split.prop(data, prop_name, text="", **kwargs)
 
 
+def draw_refresh_prop(layout, data, prop_name, operator):
+    """A split property row ending in a refresh icon that runs `operator`; returns the operator's properties."""
+    split = layout.split(factor=0.4, align=True)
+    split.label(text=data.bl_rna.properties[prop_name].name)
+    row = split.row(align=True)
+    row.prop(data, prop_name, text="")
+    return row.operator(operator, text="", icon="FILE_REFRESH")
+
+
 def draw_split_label(layout, label, value, tooltip=""):
     split = layout.split(factor=0.4, align=True)
     split.label(text=label)
@@ -7248,11 +7512,7 @@ def draw_custom_ghost(layout, settings):
     inputs.separator(factor=1.5)
     for prop, target in (("ghost_shadow_object", "SHADOW"), ("ghost_shadow_plane_object", "SHADOW_PLANE"),
                          ("ghost_lod1_object", "LOD1"), ("ghost_lod2_object", "LOD2")):
-        split = inputs.split(factor=0.4, align=True)
-        split.label(text=settings.bl_rna.properties[prop].name)
-        row = split.row(align=True)
-        row.prop(settings, prop, text="")
-        row.operator("car_exporter.generate_ghost_lods", text="", icon="FILE_REFRESH").target = target
+        draw_refresh_prop(inputs, settings, prop, "car_exporter.generate_ghost_lods").target = target
 
 
 def draw_custom_shadow(layout, settings):
@@ -7267,8 +7527,8 @@ def draw_custom_shadow(layout, settings):
         return
     layout.separator()
     inputs = layout.column()
-    draw_split_prop(inputs, settings, "shadow_object")
-    inputs.operator("car_exporter.generate_shadow_mesh", icon="MESH_DATA")
+    draw_refresh_prop(inputs, settings, "shadow_object", "car_exporter.generate_shadow_mesh")
+    draw_refresh_prop(inputs, settings, "ambient_shadow_object", "car_exporter.generate_ambient_shadow")
 
 
 def draw_presets(layout, settings):
@@ -7604,6 +7864,7 @@ classes = (
     CAR_EXPORTER_OT_remove_armature_joint,
     CAR_EXPORTER_OT_generate_shadow_mesh,
     CAR_EXPORTER_OT_generate_ghost_lods,
+    CAR_EXPORTER_OT_generate_ambient_shadow,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
     CAR_EXPORTER_OT_add_center_of_mass,
