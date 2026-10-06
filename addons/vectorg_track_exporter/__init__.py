@@ -207,6 +207,11 @@ def scene_settings(context):
     return context.scene.track_exporter
 
 
+def car_exporter_active(context):
+    car_settings = getattr(context.scene, "car_exporter", None)
+    return car_settings is not None and car_settings.is_configured
+
+
 def object_name(obj):
     return obj.name if obj else ""
 
@@ -5903,6 +5908,13 @@ class TRACK_EXPORTER_OT_create_configuration(Operator):
     bl_description = "Create the VectorG track hierarchy and collision surface groups"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        if car_exporter_active(context):
+            cls.poll_message_set("Scene already has a VectorG car configuration")
+            return False
+        return True
+
     def execute(self, context):
         settings = scene_settings(context)
         reset_settings(settings)
@@ -7092,6 +7104,10 @@ class TRACK_EXPORTER_PT_track_export(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "VectorG"
+
+    @classmethod
+    def poll(cls, context):
+        return not car_exporter_active(context)
 
     def draw(self, context):
         layout = self.layout

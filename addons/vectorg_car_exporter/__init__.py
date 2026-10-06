@@ -180,6 +180,11 @@ def scene_settings(context):
     return context.scene.car_exporter
 
 
+def track_exporter_active(context):
+    track_settings = getattr(context.scene, "track_exporter", None)
+    return track_settings is not None and track_settings.is_configured
+
+
 def find_object(name):
     return bpy.data.objects.get(name) if name else None
 
@@ -6261,6 +6266,13 @@ class CAR_EXPORTER_OT_create_configuration(Operator):
     bl_label = "Create Car Structure"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        if track_exporter_active(context):
+            cls.poll_message_set("Scene already has a VectorG track configuration")
+            return False
+        return True
+
     def execute(self, context):
         settings = scene_settings(context)
         initialize_configuration_settings(settings)
@@ -6525,6 +6537,13 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         description="Vehicle manifest JSON file to import into the current scene",
         subtype="FILE_PATH",
     )
+
+    @classmethod
+    def poll(cls, context):
+        if track_exporter_active(context):
+            cls.poll_message_set("Scene already has a VectorG track configuration")
+            return False
+        return True
 
     def execute(self, context):
         settings = scene_settings(context)
@@ -7423,6 +7442,10 @@ class CAR_EXPORTER_PT_car_export(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "VectorG"
+
+    @classmethod
+    def poll(cls, context):
+        return not track_exporter_active(context)
 
     def draw(self, context):
         layout = self.layout
