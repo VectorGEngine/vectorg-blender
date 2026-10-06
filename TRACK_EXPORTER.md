@@ -72,6 +72,25 @@ in one of them:
 
 Validation fails for an object placed directly under `FOLIAGE_CARDS`.
 
+## Merged static meshes
+
+With **Merge Same-Material Meshes** on (the default, next to JPEG Quality),
+export joins the static meshes under every `PBR` root into as few nodes as the
+data allows, because the game pays per draw call, not per triangle. Meshes join
+when they share the materials their faces use, lightmap atlas, shadow casting
+(Ray Visibility > Shadow), UV layer count and color layers, and lie in the same
+300 m ground cell of the track, so distant cells still cull. UV map and color
+layer names do not matter. The joined node takes the group's lightmap
+and shadow settings; modifiers are applied and world transforms baked in. The
+Blender scene is not changed: the joined objects exist only during the export.
+
+Left as their own nodes: linked duplicates (they export as GPU instances
+already), meshes with children, dynamic collider targets, and everything
+outside `PBR` (foliage cards, decals,
+obstacles, colliders, events, spawn points). Objects with actions merge in their
+current pose; the track GLB carries no animation. The Blender console prints
+how many meshes were merged.
+
 ## Workflow
 
 1. Select **Create Track Structure**.

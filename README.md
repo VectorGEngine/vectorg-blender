@@ -643,9 +643,60 @@ in manifest version 8 when checked (all four wheel entries are required):
         "spin": { "obj": "ghost_spin_rr" }
       }
     }
-  }
+  },
+  "shadow": { "obj": "GHOST_SHADOW" },
+  "shadowPlane": { "obj": "GHOST_SHADOW_PLANE" },
+  "lods": [{ "obj": "GHOST_LOD1" }, { "obj": "GHOST_LOD2" }]
 }
 ```
+
+`shadow`, `shadowPlane` and `lods` are `null` when **Shadow**, **Shadow Plane**,
+and **LOD1** with **LOD2** are empty. `lods` requires `shadow` and `shadowPlane`.
+
+### Ghost LODs
+
+Below the wheel boxes, **Shadow**, **Shadow Plane**, **LOD1** and **LOD2** each
+have a refresh button that builds that object inside the `.blend`, so export does
+no LOD work. Refresh what changed; each replaces what it built before and fills
+its field:
+
+- **Shadow** and **Shadow Plane** take seconds and bake nothing.
+- **LOD1** bakes the texture atlas and also rebuilds **LOD2**, as both use it.
+- **LOD2** rebuilds from the current LOD1 without baking.
+
+- Every ghost face except the body paint is unwrapped into one 2048 px atlas and
+  baked with Cycles from its own material: base color (darkened by alpha and
+  transmission, so glass is a tinted solid), roughness and metallic, and the
+  normal map. Light materials are baked as plain color: LODs do not glow.
+- **LOD1** (`GHOST_LOD1`, an empty under Ghost Root) holds one mesh per moving
+  part at 20% of its triangles: the body and each wheel's mount, joint and spin.
+  Each part is named `LOD1_` plus the node it follows and sits at that node's
+  pose; the game attaches it there, so wheels keep spinning and steering.
+- **LOD2** (`GHOST_LOD2`) is the whole car as one mesh at 2% of its triangles,
+  wheels included.
+- Each LOD draws the atlas material plus the body paint, so body colors still
+  apply. The atlas images are packed into the `.blend`; the LODs are hidden in
+  the viewport.
+- **Shadow** (`GHOST_SHADOW`) joins Ghost Root's own meshes, without the wheels,
+  into one mesh without materials at 10% of its triangles.
+- **Shadow Plane** (`GHOST_SHADOW_PLANE`) is a flat, single-sided quad textured
+  with the whole car's top-down silhouette, wheels included: a packed PNG, white,
+  with the blurred silhouette as alpha. The game takes only the alpha, as the
+  shadow's shape and softness, and darkens the ground under it by each track's
+  own shadow tint (the sky's share of the sun and sky light), so edit the PNG's
+  alpha to change the shape. Its dark blue-grey colour shows in Blender only.
+
+**Shadow**, **Shadow Plane**, **LOD1** and **LOD2** can also point at hand-made
+objects under Ghost Root with the same layout. Validation requires childless
+meshes with faces as Shadow and Shadow Plane, LOD1 and LOD2 both or neither and
+both shadows with them, one `LOD1_` part for each moving node that has ghost
+geometry, and mesh geometry in LOD2.
+
+In the game, LOD1 shows from 50 m and LOD2 from 100 m. The ghost's shadow has its
+own LOD: up to 50 m the shadow mesh casts the live shadow, like the car's
+**Custom Shadow**, and never renders; from 50 m the shadow plane lies on the
+track under the ghost instead, aligned to the road and shifted away from the
+sun. A ghost with neither shadow mesh nor LODs casts from every part.
 
 The enabled hierarchy is embedded in the same `<car_id>.glb`. Unchecking keeps
 the selections and source objects in the `.blend`, but excludes the configured
@@ -660,6 +711,29 @@ and the car-root transform for custom ghosts, remove Ghost Root for normal cars
 and ordinary replays, and use existing ghost behavior for null/missing `ghost`.
 Body paint, wheel animation, fading, and emission-based lights will be applied
 by that integration.
+
+## Custom Shadow
+
+Open **Custom Shadow**, check the box next to the title, and pick a **Shadow
+Mesh**, or click **Generate Shadow Mesh**. In the game the shadow mesh alone
+casts the car's live shadow: it is drawn only into the sun's shadow map, never
+on screen or in the mirror, and every other part stops casting while still
+receiving shadows. Shadow cost is per draw call, so one shadow mesh replaces
+the car's many parts in the shadow pass. With the section off, every part casts
+as before, and an assigned shadow mesh is left out of the export.
+
+The shadow mesh must be a mesh with faces, a direct child of Car Root, without
+children, and not used as a wheel, camera, collider, ghost or other reference.
+
+**Generate Shadow Mesh** joins the evaluated geometry of every mesh under Car
+Root into one object named `SHADOW_MESH`, without materials, UV maps or color
+layers, shown as wireframe. It leaves out the wheel mount hierarchies, the
+custom ghost, colliders and helpers. Generating again
+replaces the previously generated mesh; a picked mesh is never deleted. The
+result is an ordinary object: decimate or edit it to lower its cost further.
+
+The manifest records it as `"shadow": { "obj": "SHADOW_MESH" }`, or `null`.
+A custom ghost casts with its own geometry.
 
 ## Lights
 
@@ -799,6 +873,18 @@ Principled BSDF base-color or emission inputs are exported as JPEG at the
 selected quality. Textures used for alpha, normals, metallic, roughness, masks,
 or ambiguous node graphs are not converted to JPEG. Textures are embedded in
 the GLB.
+
+**Merge Same-Material Meshes** (on by default) joins meshes during export
+because the game pays per draw call, not per triangle. Meshes join when their
+faces use the same materials and they have the same UV layer count and color
+layers, under the same nearest anchor: the car root or a node the manifest
+names or the game moves (wheel mount, joint, pivot and spin, steering wheel,
+cameras, dashboard screen, ghost root and ghost wheel nodes, shadow mesh). Each
+wheel therefore merges on its own spin node and moving parts keep moving.
+Colliders, skinned meshes, referenced objects, meshes with children and the
+body color carrier are never merged. Modifiers are applied and transforms baked
+into the joined node. The Blender scene is not changed: the joined objects
+exist only during the export, and the Blender console prints the merge count.
 
 The GLB export uses Blender's built-in glTF exporter with:
 

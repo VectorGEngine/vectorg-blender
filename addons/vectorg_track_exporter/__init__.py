@@ -767,6 +767,159 @@ def restore_shadow_casting_export_flags(tagged):
             del obj[CAST_SHADOW_PROPERTY]
 
 
+STATIC_MERGE_CELL_SIZE = 300.0
+MERGED_OBJECT_PREFIX = "MERGED_"
+
+
+class StaticMergeResult:
+    """Temporary joined objects made for one export, removed again afterwards."""
+
+    def __init__(self):
+        self.sources = set()
+        self.objects = []
+        self.meshes = []
+
+
+def used_material_names(mesh):
+    """Materials that faces actually use; unused slots do not reach the glTF."""
+    if not mesh.polygons:
+        return frozenset()
+    indices = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("material_index", indices)
+    names = set()
+    for index in np.unique(indices):
+        material = mesh.materials[index] if index < len(mesh.materials) else None
+        names.add(material.name if material else "")
+    return frozenset(names)
+
+
+def static_merge_key(root, obj):
+    """Meshes join only when the glTF primitives they produce would match: the materials the
+    faces use, lightmap atlas, shadow casting, UV layer count with the lightmap layer's place,
+    and color layers, within one ground cell of the root. Layer names do not matter: the
+    export copies get canonical names before joining."""
+    mesh = obj.data
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    centre = sum(corners, Vector()) / len(corners)
+    cell = (math.floor(centre.x / STATIC_MERGE_CELL_SIZE), math.floor(centre.y / STATIC_MERGE_CELL_SIZE))
+    uv_names = [layer.name for layer in mesh.uv_layers]
+    colors = mesh.color_attributes
+    return (
+        root.name,
+        used_material_names(mesh),
+        obj.get(LIGHTMAP_PROPERTY),
+        obj.visible_shadow,
+        len(uv_names),
+        uv_names.index(LIGHTMAP_UV_NAME) if LIGHTMAP_UV_NAME in uv_names else -1,
+        tuple((attribute.domain, attribute.data_type) for attribute in colors),
+        colors.render_color_index,
+        cell,
+    )
+
+
+def align_merge_layers(meshes):
+    """Gives every mesh the first mesh's UV and color layer names, position by position, so joining
+    maps layers by index while material UV references keep resolving to existing names. The merge
+    key puts the lightmap layer at the same position in every mesh of a group."""
+    uv_names = [layer.name for layer in meshes[0].uv_layers]
+    color_names = [attribute.name for attribute in meshes[0].color_attributes]
+    for mesh in meshes[1:]:
+        for layer, name in zip(mesh.uv_layers, uv_names):
+            layer.name = name
+        for attribute, name in zip(mesh.color_attributes, color_names):
+            attribute.name = name
+
+
+def exports_as_gpu_instance(obj):
+    """Linked duplicates stay instances: the glTF exporter turns shared meshes into GPU
+    instances, one draw already."""
+    return obj.data.users > 1
+
+
+def static_merge_groups(settings, export_objects):
+    """Groups of PBR meshes that export as one node each. Left out: linked duplicates (GPU
+    instances), meshes with children and dynamic collider targets. The evaluated world
+    transform is baked in, so constraints, modifiers and actions are fine: the track GLB
+    carries no animation, only the current pose."""
+    export_set = set(export_objects)
+    dynamic_targets = {link.target_object for link in settings.dynamic_colliders if link.target_object}
+    groups = {}
+    for root in export_objects:
+        if root.get(ROLE_PROPERTY) != ROLE_PBR:
+            continue
+        for obj in descendants(root):
+            if obj not in export_set or obj.type != "MESH" or obj.children:
+                continue
+            if obj in dynamic_targets or exports_as_gpu_instance(obj):
+                continue
+            groups.setdefault(static_merge_key(root, obj), (root, []))[1].append(obj)
+    return [group for group in groups.values() if len(group[1]) > 1]
+
+
+def apply_static_mesh_merge(context, settings, export_objects):
+    """Joins each static merge group into one temporary object under its PBR root, with the
+    evaluated (modifier-applied) geometry, world transforms baked in, and the group's lightmap
+    and shadow settings. The sources stay untouched; the caller exports the temporary objects
+    in their place. Draw calls are per node in the game, so this cuts the track's frame cost."""
+    result = StaticMergeResult()
+    groups = static_merge_groups(settings, export_objects)
+    if not groups:
+        return result
+    depsgraph = context.evaluated_depsgraph_get()
+    try:
+        for root, objects in groups:
+            collection = root.users_collection[0] if root.users_collection else context.scene.collection
+            parts = []
+            for obj in objects:
+                mesh = bpy.data.meshes.new_from_object(
+                    obj.evaluated_get(depsgraph), preserve_all_data_layers=True, depsgraph=depsgraph
+                )
+                result.meshes.append(mesh)
+                part = bpy.data.objects.new(f"{MERGED_OBJECT_PREFIX}part", mesh)
+                part.matrix_world = obj.matrix_world.copy()
+                collection.objects.link(part)
+                parts.append(part)
+            align_merge_layers([part.data for part in parts])
+            with context.temp_override(
+                object=parts[0],
+                active_object=parts[0],
+                selected_objects=parts,
+                selected_editable_objects=parts,
+            ):
+                if "FINISHED" not in bpy.ops.object.join():
+                    raise RuntimeError(f"Blender could not join meshes under {root.name} for export")
+            merged = parts[0]
+            merged.name = f"{MERGED_OBJECT_PREFIX}{objects[0].name}"
+            merged.parent = root
+            merged.matrix_parent_inverse = root.matrix_world.inverted()
+            merged.visible_shadow = objects[0].visible_shadow
+            lightmap = objects[0].get(LIGHTMAP_PROPERTY)
+            if lightmap is not None:
+                merged[LIGHTMAP_PROPERTY] = lightmap
+            result.objects.append(merged)
+            result.sources.update(objects)
+    except Exception:
+        restore_static_mesh_merge(result)
+        raise
+    print(f"VectorG track export: merged {len(result.sources)} static meshes into {len(result.objects)} nodes "
+          f"({sum(len(objects) for _root, objects in groups)} candidates in {len(groups)} groups).")
+    return result
+
+
+def restore_static_mesh_merge(result):
+    if not result:
+        return
+    for obj in result.objects:
+        if obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for mesh in result.meshes:
+        if mesh.name in bpy.data.meshes and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    result.objects.clear()
+    result.meshes.clear()
+    result.sources.clear()
+
+
 def restore_dynamic_target_export_names(target_names, collider_targets):
     for collider, had_target, target_name in reversed(collider_targets):
         if had_target:
@@ -5544,6 +5697,7 @@ def reset_settings(settings):
     settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
     settings.optimize_color_textures = True
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
+    settings.merge_meshes = True
     settings.track_root_object = None
     settings.shared_root_object = None
     settings.layouts.clear()
@@ -5679,6 +5833,12 @@ class TrackExporterSettings(PropertyGroup):
         min=1,
         max=100,
     )
+    merge_meshes: BoolProperty(
+        name="Merge Same-Material Meshes",
+        description="On export, join PBR meshes that share materials, lightmap and shadow casting within one "
+                    "ground cell into one node, so the game draws fewer objects. Colliders and other roles are kept",
+        default=True,
+    )
     track_root_object: PointerProperty(name="Track Root", description="Root of all track content", type=bpy.types.Object)
     shared_root_object: PointerProperty(name="Shared Root", description="Content shared by every layout", type=bpy.types.Object)
     hdr_image: PointerProperty(name="HDR", description="Loaded HDR or EXR image exported as the track environment", type=bpy.types.Image, poll=hdr_image_poll)
@@ -5753,6 +5913,7 @@ class TRACK_EXPORTER_OT_create_configuration(Operator):
         settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
         settings.optimize_color_textures = True
         settings.jpeg_quality = DEFAULT_JPEG_QUALITY
+        settings.merge_meshes = True
 
         track_root = create_empty(context, "TRACK_ROOT", role=ROLE_TRACK)
         shared = create_empty(context, "SHARED", track_root, ROLE_SHARED)
@@ -6383,12 +6544,16 @@ def export_track_glb(
     target_names = []
     collider_targets = []
     shadow_flagged = []
+    merge_result = None
     try:
-        target_names, collider_targets = apply_dynamic_target_export_names(settings)
-        shadow_flagged = apply_shadow_casting_export_flags(export_objects)
         for obj, _hidden, _hide_render in visibility_before:
             obj.hide_set(False)
             obj.hide_render = False
+        if settings.merge_meshes:
+            merge_result = apply_static_mesh_merge(context, settings, export_objects)
+            export_objects = [obj for obj in export_objects if obj not in merge_result.sources] + merge_result.objects
+        target_names, collider_targets = apply_dynamic_target_export_names(settings)
+        shadow_flagged = apply_shadow_casting_export_flags(export_objects)
         bpy.ops.object.select_all(action="DESELECT")
         for obj in export_objects:
             obj.select_set(True)
@@ -6407,6 +6572,7 @@ def export_track_glb(
             raise RuntimeError("Blender glTF export did not finish")
     finally:
         restore_shadow_casting_export_flags(shadow_flagged)
+        restore_static_mesh_merge(merge_result)
         restore_dynamic_target_export_names(target_names, collider_targets)
         restore_export_textures(restored_nodes, temp_images)
         bpy.ops.object.select_all(action="DESELECT")
@@ -6621,6 +6787,7 @@ def iter_track_zip_export(context, settings, filepath, report):
         restored_nodes, temp_images = [], []
         target_names, collider_targets = [], []
         shadow_flagged = []
+        merge_result = None
         try:
             for index, total, name in iter_export_texture_optimization(
                 export_objects,
@@ -6633,12 +6800,16 @@ def iter_track_zip_export(context, settings, filepath, report):
             ):
                 yield 0.05 + 0.30 * index / total, f"Optimizing texture {index + 1}/{total}: {name}"
 
-            yield 0.35, "Exporting GLB model (this may take a while)..."
-            target_names, collider_targets = apply_dynamic_target_export_names(settings)
-            shadow_flagged = apply_shadow_casting_export_flags(export_objects)
             for obj, _hidden, _hide_render in visibility_before:
                 obj.hide_set(False)
                 obj.hide_render = False
+            if settings.merge_meshes:
+                yield 0.35, "Merging static meshes..."
+                merge_result = apply_static_mesh_merge(context, settings, export_objects)
+                export_objects = [obj for obj in export_objects if obj not in merge_result.sources] + merge_result.objects
+            yield 0.37, "Exporting GLB model (this may take a while)..."
+            target_names, collider_targets = apply_dynamic_target_export_names(settings)
+            shadow_flagged = apply_shadow_casting_export_flags(export_objects)
             bpy.ops.object.select_all(action="DESELECT")
             for obj in export_objects:
                 obj.select_set(True)
@@ -6657,6 +6828,7 @@ def iter_track_zip_export(context, settings, filepath, report):
                 raise RuntimeError("Blender glTF export did not finish")
         finally:
             restore_shadow_casting_export_flags(shadow_flagged)
+            restore_static_mesh_merge(merge_result)
             restore_dynamic_target_export_names(target_names, collider_targets)
             restore_export_textures(restored_nodes, temp_images)
             bpy.ops.object.select_all(action="DESELECT")
@@ -6943,6 +7115,7 @@ class TRACK_EXPORTER_PT_track_export(Panel):
         color_quality = box.row()
         color_quality.enabled = settings.optimize_color_textures
         draw_split_prop(color_quality, settings, "jpeg_quality")
+        draw_split_prop(box, settings, "merge_meshes")
         draw_split_prop(box, settings, "track_root_object")
         draw_split_prop(box, settings, "shared_root_object")
         draw_split_prop(box, settings, "hdr_image")

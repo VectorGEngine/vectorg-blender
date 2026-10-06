@@ -21,8 +21,10 @@ import zipfile
 from pathlib import Path
 
 import blf
+import bmesh
 import bpy
 import gpu
+import numpy as np
 from gpu_extras.batch import batch_for_shader
 from bpy_extras.io_utils import ExportHelper
 from bpy.app.handlers import persistent
@@ -728,8 +730,1146 @@ def excluded_ghost_objects(settings):
 
 
 def car_export_objects(settings):
-    excluded = set(guide_objects() + downforce_helper_objects() + light_helper_objects() + excluded_ghost_objects(settings))
+    excluded = set(
+        guide_objects() + downforce_helper_objects() + light_helper_objects()
+        + excluded_ghost_objects(settings) + excluded_shadow_objects(settings)
+    )
     return [obj for obj in bpy.context.scene.objects if obj not in excluded]
+
+
+SHADOW_MESH_NAME = "SHADOW_MESH"
+GENERATED_SHADOW_PROP = "vectorg_generated_shadow"
+BODY_MATERIAL_CARRIER_NAME = "VECTORG_BODY_MATERIALS"
+MERGED_OBJECT_PREFIX = "MERGED_"
+
+
+def shadow_mesh_poll(_settings, obj):
+    return obj.type == "MESH"
+
+
+def excluded_shadow_objects(settings):
+    return [settings.shadow_object] if settings.shadow_object and not settings.shadow_enabled else []
+
+
+def build_shadow_config(settings):
+    if not settings.shadow_enabled:
+        return None
+    return {"obj": object_config_name(settings.shadow_object)}
+
+
+def parse_shadow_config(value):
+    if value is None:
+        return None
+    name = value.get("obj") if isinstance(value, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Manifest shadow.obj must be a non-empty string")
+    return {"obj": name}
+
+
+def import_shadow_config(settings, config):
+    settings.shadow_enabled = config is not None
+    # Preserve a disabled selection so the mesh can still be excluded from export.
+    if config is None:
+        return
+    set_object_pointer(settings, "shadow_object", config["obj"])
+
+
+def car_reference_objects(settings):
+    """Objects the manifest names or the game moves at runtime."""
+    refs = [settings.car_root_object, settings.center_of_mass_object, settings.steering_wheel_object,
+            settings.dashboard_screen_object, settings.ghost_root_object,
+            settings.ghost_shadow_object, settings.ghost_shadow_plane_object,
+            settings.ghost_lod1_object, settings.ghost_lod2_object]
+    refs.extend(getattr(settings, f"{prefix}_camera_object") for prefix in CAMERA_PREFIXES)
+    refs.extend(collider.object_ref for collider in settings.colliders)
+    refs.extend(point.object_ref for point in settings.down_force_points)
+    refs.extend(
+        getattr(wheel, prop)
+        for wheel in settings.wheels
+        for prop in ("suspension_ref", "hub_ref", "pivot_ref", "wheel_ref")
+    )
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = ghost_wheel_settings(settings, group, key)
+        refs.extend(getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES)
+    if settings.armature_object:
+        refs.append(settings.armature_object)
+    return {obj for obj in refs if obj}
+
+
+def validate_shadow_scene(settings, errors, _warnings):
+    if not settings.shadow_enabled:
+        return
+    obj = settings.shadow_object
+    if not obj:
+        errors.append("Custom shadow mesh is required")
+        return
+    if obj.type != "MESH" or not obj.data.polygons:
+        errors.append("Custom shadow mesh must be a mesh with faces")
+    if obj not in set(bpy.context.scene.objects):
+        errors.append("Custom shadow mesh must belong to the current scene")
+    if not settings.car_root_object or obj.parent != settings.car_root_object:
+        errors.append("Custom shadow mesh must be a direct child of the car root")
+    if obj.children:
+        errors.append("Custom shadow mesh must not have children")
+    if obj in car_reference_objects(settings):
+        errors.append("Custom shadow mesh must not also be a wheel, camera, collider, ghost or other car reference")
+
+
+def is_skinned_object(obj):
+    return (obj.parent is not None and obj.parent.type == "ARMATURE") or any(
+        modifier.type == "ARMATURE" for modifier in obj.modifiers
+    )
+
+
+def shadow_source_objects(context, settings):
+    """The car's rendered meshes under the car root, leaving out the wheel mount hierarchies,
+    the ghost, colliders, helpers and any earlier shadow mesh."""
+    root = settings.car_root_object
+    scene_objects = set(context.scene.objects)
+    excluded = set(hierarchy_objects(settings.ghost_root_object))
+    for wheel in settings.wheels:
+        excluded.update(hierarchy_objects(wheel.suspension_ref))
+    excluded.update(collider.object_ref for collider in settings.colliders if collider.object_ref)
+    excluded.update(guide_objects() + downforce_helper_objects() + light_helper_objects())
+    if settings.shadow_object:
+        excluded.add(settings.shadow_object)
+    return [
+        obj for obj in hierarchy_objects(root)
+        if obj is not root and obj.type == "MESH" and obj in scene_objects and obj not in excluded
+        and obj.data.polygons and not obj.get(GENERATED_SHADOW_PROP)
+        and obj.name != BODY_MATERIAL_CARRIER_NAME
+    ]
+
+
+def evaluated_mesh_copy(obj, space, depsgraph):
+    """The object's evaluated geometry in `space`'s coordinates, as a new mesh datablock."""
+    mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), preserve_all_data_layers=True, depsgraph=depsgraph)
+    mesh.transform(space.matrix_world.inverted() @ obj.matrix_world)
+    return mesh
+
+
+def join_meshes(context, meshes, collection, name):
+    """Joins mesh datablocks into one new object with an identity transform."""
+    parts = []
+    for mesh in meshes:
+        part = bpy.data.objects.new(name, mesh)
+        collection.objects.link(part)
+        parts.append(part)
+    if len(parts) > 1:
+        with context.temp_override(
+            object=parts[0],
+            active_object=parts[0],
+            selected_objects=parts,
+            selected_editable_objects=parts,
+        ):
+            if "FINISHED" not in bpy.ops.object.join():
+                for part in parts:
+                    bpy.data.objects.remove(part, do_unlink=True)
+                raise RuntimeError(f"Blender could not join meshes into {name}")
+    joined = parts[0]
+    joined.name = name
+    return joined
+
+
+def generate_shadow_mesh(context, settings):
+    root = settings.car_root_object
+    if not root:
+        raise ValueError("Car root object is required")
+    sources = shadow_source_objects(context, settings)
+    if not sources:
+        raise ValueError("No body meshes found under the car root")
+    previous = settings.shadow_object
+    if previous and previous.get(GENERATED_SHADOW_PROP):
+        previous_mesh = previous.data
+        bpy.data.objects.remove(previous, do_unlink=True)
+        if previous_mesh.users == 0:
+            bpy.data.meshes.remove(previous_mesh)
+    depsgraph = context.evaluated_depsgraph_get()
+    meshes = [evaluated_mesh_copy(obj, root, depsgraph) for obj in sources]
+    collection = root.users_collection[0] if root.users_collection else context.scene.collection
+    shadow = join_meshes(context, meshes, collection, SHADOW_MESH_NAME)
+    mesh = shadow.data
+    mesh.name = SHADOW_MESH_NAME
+    mesh.materials.clear()
+    # Removing a layer invalidates references to the others, so look each one up again.
+    while mesh.uv_layers:
+        mesh.uv_layers.remove(mesh.uv_layers[0])
+    while mesh.color_attributes:
+        mesh.color_attributes.remove(mesh.color_attributes[0])
+    shadow.parent = root
+    shadow.matrix_parent_inverse.identity()
+    shadow.matrix_basis.identity()
+    shadow.display_type = "WIRE"
+    shadow[GENERATED_SHADOW_PROP] = True
+    for orphan in meshes[1:]:
+        if orphan.name in bpy.data.meshes and orphan.users == 0:
+            bpy.data.meshes.remove(orphan)
+    return shadow, len(sources)
+
+
+class CarMeshMergeResult:
+    """Temporary joined objects made for one export, removed again afterwards."""
+
+    def __init__(self):
+        self.objects = []
+        self.meshes = []
+        self.source_states = []
+
+    @property
+    def sources(self):
+        return [state.obj for state in self.source_states]
+
+
+def used_material_names(mesh):
+    """Materials that faces actually use; unused slots do not reach the glTF."""
+    names = set()
+    for polygon in mesh.polygons:
+        index = polygon.material_index
+        material = mesh.materials[index] if index < len(mesh.materials) else None
+        names.add(material.name if material else "")
+    return frozenset(names)
+
+
+def align_merge_layers(meshes):
+    """Gives every mesh the first mesh's UV and color layer names, position by position, so joining
+    maps layers by index while material UV references keep resolving to existing names."""
+    uv_names = [layer.name for layer in meshes[0].uv_layers]
+    color_names = [attribute.name for attribute in meshes[0].color_attributes]
+    for mesh in meshes[1:]:
+        for layer, name in zip(mesh.uv_layers, uv_names):
+            layer.name = name
+        for attribute, name in zip(mesh.color_attributes, color_names):
+            attribute.name = name
+
+
+def car_merge_groups(context, settings):
+    """Meshes that join into one node each: same materials in use, same UV layer count and color
+    layers, under the same nearest anchor. Anchors are the car root and every node the manifest
+    names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
+    dashboard, ghost nodes, shadow mesh), so each wheel merges on its own spin node and moving
+    parts keep moving. Colliders, skinned parts, referenced nodes, meshes with children and the
+    body color carrier are never merged."""
+    root = settings.car_root_object
+    anchors = car_reference_objects(settings)
+    if settings.shadow_object:
+        anchors.add(settings.shadow_object)
+    colliders = {collider.object_ref for collider in settings.colliders if collider.object_ref}
+    # The ghost LODs are built per moving part already and must stay apart from the full-detail ghost.
+    lod_objects = ghost_lod_objects(settings)
+    scene_objects = set(context.scene.objects)
+    groups = {}
+    for obj in hierarchy_objects(root):
+        if obj.type != "MESH" or obj not in scene_objects or obj in anchors or obj in colliders:
+            continue
+        if obj in lod_objects:
+            continue
+        if obj.children or obj.name == BODY_MATERIAL_CARRIER_NAME or is_skinned_object(obj) or not obj.data.polygons:
+            continue
+        anchor = obj.parent
+        while anchor and anchor not in anchors:
+            anchor = anchor.parent
+        if not anchor or anchor not in scene_objects:
+            continue
+        mesh = obj.data
+        key = (
+            anchor.name,
+            used_material_names(mesh),
+            len(mesh.uv_layers),
+            tuple((attribute.domain, attribute.data_type) for attribute in mesh.color_attributes),
+            mesh.color_attributes.render_color_index,
+        )
+        groups.setdefault(key, (anchor, []))[1].append(obj)
+    return [group for group in groups.values() if len(group[1]) > 1]
+
+
+def apply_car_mesh_merge(context, settings):
+    """Joins each merge group into one temporary object on its anchor, with the evaluated
+    geometry in the anchor's space, and unlinks the sources from the scene for the export.
+    The game pays per draw call, so this cuts the car's frame cost."""
+    result = CarMeshMergeResult()
+    groups = car_merge_groups(context, settings)
+    if not groups:
+        return result
+    depsgraph = context.evaluated_depsgraph_get()
+    try:
+        for anchor, objects in groups:
+            meshes = [evaluated_mesh_copy(obj, anchor, depsgraph) for obj in objects]
+            result.meshes.extend(meshes)
+            align_merge_layers(meshes)
+            collection = anchor.users_collection[0] if anchor.users_collection else context.scene.collection
+            merged = join_meshes(context, meshes, collection, f"{MERGED_OBJECT_PREFIX}{objects[0].name}")
+            merged.parent = anchor
+            merged.matrix_parent_inverse.identity()
+            merged.matrix_basis.identity()
+            result.objects.append(merged)
+            result.source_states.extend(export_exclusions(objects))
+        unlink_export_helpers(result.source_states)
+    except Exception:
+        restore_car_mesh_merge(result)
+        raise
+    print(f"VectorG car export: merged {len(result.source_states)} meshes into {len(result.objects)} nodes.")
+    return result
+
+
+def restore_car_mesh_merge(result):
+    if not result:
+        return
+    for obj in result.objects:
+        if obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for mesh in result.meshes:
+        if mesh.name in bpy.data.meshes and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    relink_export_helpers(result.source_states)
+    result.objects.clear()
+    result.meshes.clear()
+    result.source_states.clear()
+
+
+GHOST_LOD1_NAME = "GHOST_LOD1"
+GHOST_LOD2_NAME = "GHOST_LOD2"
+GHOST_SHADOW_NAME = "GHOST_SHADOW"
+GHOST_SHADOW_PLANE_NAME = "GHOST_SHADOW_PLANE"
+# Pixels along the longer side of the top-down silhouette image.
+GHOST_SHADOW_PLANE_PIXELS = 256
+# Metres of soft edge on each side of the outline, and of clear border around it.
+GHOST_SHADOW_PLANE_SOFTNESS = 0.1
+GHOST_SHADOW_PLANE_BORDER = 0.3
+# The plane's colour in Blender only (linear): the game multiplies the ground under the silhouette by
+# each track's own shadow tint. This is roughly how the live shadow looks on Apex Park's asphalt.
+GHOST_SHADOW_PLANE_PREVIEW_COLOR = (0.00665, 0.00961, 0.01197)
+# Every LOD1 part is a child of the LOD1 node named after the moving ghost node it follows.
+GHOST_LOD1_PART_PREFIX = "LOD1_"
+GHOST_LOD1_RATIO = 0.2
+GHOST_LOD2_RATIO = 0.02
+# About the density of a hand-decimated car shadow mesh (the Veyra's casts from 37.7k triangles).
+GHOST_SHADOW_RATIO = 0.1
+GHOST_LOD_ATLAS_NAME = "GHOST_LOD_ATLAS"
+GHOST_LOD_ATLAS_SIZE = 2048
+GENERATED_GHOST_LOD_PROP = "vectorg_generated_ghost_lod"
+GHOST_LOD_BAKE_UV_NAME = "VectorG_GhostLOD"
+# The LOD meshes carry one UV map, written as TEXCOORD_0: three.js derives normal-map tangents from it.
+GHOST_LOD_UV_NAME = "UVMap"
+GHOST_LOD_SMART_PROJECT_ANGLE = math.radians(66.0)
+GHOST_LOD_ISLAND_MARGIN = 0.005
+GHOST_LOD_BAKE_MARGIN_PIXELS = 16
+GHOST_LOD_BAKE_SAMPLES = 1
+# (image, Cycles bake type, color space): the normal pass renders the materials as authored,
+# the others route Principled inputs into emission. glTF packs roughness in G and metallic in B.
+GHOST_LOD_BAKE_PASSES = (
+    ("normal", "NORMAL", "Non-Color"),
+    ("color", "EMIT", "sRGB"),
+    ("metallic_roughness", "EMIT", "Non-Color"),
+)
+
+
+def ghost_lod_objects(settings):
+    """The shadow mesh and the objects under the LOD1 and LOD2 nodes, none of which is full-detail ghost."""
+    objects = set()
+    for lod in (settings.ghost_shadow_object, settings.ghost_shadow_plane_object,
+                settings.ghost_lod1_object, settings.ghost_lod2_object):
+        objects.update(hierarchy_objects(lod))
+    return objects
+
+
+def ghost_lod_anchors(settings):
+    """The ghost root and every ghost wheel's mount, joint and spin: the nodes the game moves apart."""
+    anchors = [settings.ghost_root_object]
+    for group, key, _steering in WHEEL_KEYS:
+        wheel = ghost_wheel_settings(settings, group, key)
+        anchors.extend(getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES)
+    return list(dict.fromkeys(obj for obj in anchors if obj))
+
+
+def ghost_lod_parts(context, settings):
+    """Full-detail ghost meshes grouped by the nearest anchor at or above them. Each group moves as one
+    part in the game, so it gets one LOD1 mesh following that anchor."""
+    anchors = ghost_lod_anchors(settings)
+    anchor_set = set(anchors)
+    scene_objects = set(context.scene.objects)
+    excluded = ghost_lod_objects(settings)
+    parts = {anchor: [] for anchor in anchors}
+    for obj in hierarchy_objects(settings.ghost_root_object):
+        if obj.type != "MESH" or obj not in scene_objects or not obj.data.polygons or obj in excluded:
+            continue
+        if obj.name == BODY_MATERIAL_CARRIER_NAME or obj.get(GENERATED_GHOST_LOD_PROP):
+            continue
+        anchor = obj
+        while anchor not in anchor_set:
+            anchor = anchor.parent
+        parts[anchor].append(obj)
+    return [(anchor, objects) for anchor, objects in parts.items() if objects]
+
+
+def validate_ghost_shadow(settings, errors):
+    shadow = settings.ghost_shadow_object
+    if not shadow:
+        return
+    if shadow.type != "MESH" or not shadow.data.polygons:
+        errors.append("Ghost shadow must be a mesh with faces")
+    if shadow.parent != settings.ghost_root_object:
+        errors.append("Ghost shadow must be a direct child of Ghost Root")
+    if shadow.children:
+        errors.append("Ghost shadow must not have children")
+    if shadow not in set(bpy.context.scene.objects):
+        errors.append("Ghost shadow must belong to the current scene")
+    lods = (settings.ghost_lod1_object, settings.ghost_lod2_object)
+    if shadow in set(ghost_lod_anchors(settings)) or any(shadow in set(hierarchy_objects(lod)) for lod in lods):
+        errors.append("Ghost shadow must not be a ghost wheel node or part of LOD1 or LOD2")
+
+
+def validate_ghost_shadow_plane(settings, errors):
+    plane = settings.ghost_shadow_plane_object
+    if not plane:
+        return
+    if plane.type != "MESH" or not plane.data.polygons:
+        errors.append("Ghost shadow plane must be a mesh with faces")
+    if plane.parent != settings.ghost_root_object:
+        errors.append("Ghost shadow plane must be a direct child of Ghost Root")
+    if plane.children:
+        errors.append("Ghost shadow plane must not have children")
+    if plane not in set(bpy.context.scene.objects):
+        errors.append("Ghost shadow plane must belong to the current scene")
+    others = (settings.ghost_shadow_object, settings.ghost_lod1_object, settings.ghost_lod2_object)
+    if plane in set(ghost_lod_anchors(settings)) or any(plane in set(hierarchy_objects(other)) for other in others):
+        errors.append("Ghost shadow plane must not be a ghost wheel node, the shadow mesh or part of LOD1 or LOD2")
+
+
+def validate_ghost_lods(settings, errors):
+    lod1, lod2 = settings.ghost_lod1_object, settings.ghost_lod2_object
+    if not lod1 and not lod2:
+        return
+    if not (lod1 and lod2):
+        errors.append("Ghost LOD1 and LOD2 must both be set; use their refresh buttons")
+        return
+    if not settings.ghost_shadow_object or not settings.ghost_shadow_plane_object:
+        errors.append("Ghost LOD1 and LOD2 need the ghost Shadow mesh and Shadow Plane; use their refresh buttons")
+    root = settings.ghost_root_object
+    scene_objects = set(bpy.context.scene.objects)
+    anchors = set(ghost_lod_anchors(settings))
+    for label, lod in (("LOD1", lod1), ("LOD2", lod2)):
+        if lod.parent != root:
+            errors.append(f"Ghost {label} must be a direct child of Ghost Root")
+        if lod not in scene_objects:
+            errors.append(f"Ghost {label} must belong to the current scene")
+        if anchors & set(hierarchy_objects(lod)):
+            errors.append(f"Ghost {label} must not contain Ghost Root or ghost wheel nodes")
+    if lod1 is lod2 or is_object_in_tree(lod1, lod2) or is_object_in_tree(lod2, lod1):
+        errors.append("Ghost LOD1 and LOD2 must be separate hierarchies")
+        return
+    expected = {f"{GHOST_LOD1_PART_PREFIX}{anchor.name}" for anchor, _objects in ghost_lod_parts(bpy.context, settings)}
+    parts = {child.name: child for child in lod1.children}
+    for name in sorted(expected - parts.keys()):
+        errors.append(f"Ghost LOD1 has no part {name}; refresh LOD1")
+    for name in sorted(parts.keys() - expected):
+        errors.append(f"Ghost LOD1 part {name} follows no ghost node with geometry; refresh LOD1")
+    for name in sorted(parts.keys() & expected):
+        if parts[name].type != "MESH" or not parts[name].data.polygons:
+            errors.append(f"Ghost LOD1 part {name} must be a mesh with faces")
+    if not any(obj.type == "MESH" and obj.data.polygons for obj in hierarchy_objects(lod2)):
+        errors.append("Ghost LOD2 must contain mesh geometry")
+
+
+def surface_principled(output):
+    """The Principled BSDF that feeds a material output, searching upstream through mix shaders."""
+    surface = output.inputs["Surface"]
+    pending = [surface.links[0].from_node] if surface.is_linked else []
+    seen = set()
+    while pending:
+        node = pending.pop(0)
+        if node in seen:
+            continue
+        seen.add(node)
+        if node.type == "BSDF_PRINCIPLED":
+            return node
+        pending.extend(link.from_node for socket in node.inputs for link in socket.links)
+    return None
+
+
+def feed_socket(tree, source, target):
+    """Links source's input into target, or copies source's value when nothing is linked to it."""
+    if source.is_linked:
+        tree.links.new(source.links[0].from_socket, target)
+        return
+    value = source.default_value
+    values = tuple(value) if hasattr(value, "__len__") else (value,)
+    current = target.default_value
+    if not hasattr(current, "__len__"):
+        target.default_value = values[0]
+        return
+    size = len(current)
+    target.default_value = (values * size)[:size] if len(values) == 1 else (values + (1.0,) * size)[:size]
+
+
+class GhostLodBakeMaterial:
+    """A temporary copy of one ghost material that the atlas bakes through. The normal pass renders the
+    material as authored; the other passes route Principled BSDF inputs into an emission shader.
+    Materials without a reachable Principled BSDF bake their viewport display values."""
+
+    def __init__(self, source):
+        self.material = source.copy() if source else bpy.data.materials.new("vectorg_ghost_lod_bake")
+        self.material.name = f"{source.name if source else 'default'}_vectorg_ghost_lod_bake"
+        self.constants = {
+            "color": tuple(source.diffuse_color[:3]) + (1.0,) if source else (0.8, 0.8, 0.8, 1.0),
+            "metallic_roughness": (1.0, source.roughness, source.metallic, 1.0) if source else (1.0, 0.5, 0.0, 1.0),
+        }
+        uses_nodes = bool(source and source.use_nodes)
+        self.material.use_nodes = True
+        tree = self.material.node_tree
+        self.tree = tree
+        self.output = tree.get_output_node("CYCLES") or tree.nodes.new("ShaderNodeOutputMaterial")
+        surface = self.output.inputs["Surface"]
+        self.surface = surface.links[0].from_socket if surface.is_linked else None
+        self.principled = surface_principled(self.output) if uses_nodes else None
+        self.emission = tree.nodes.new("ShaderNodeEmission")
+        self.emission.inputs["Strength"].default_value = 1.0
+        self.image_node = tree.nodes.new("ShaderNodeTexImage")
+        tree.nodes.active = self.image_node
+
+    def route(self, name, image):
+        """Prepares one bake pass into image. Base color is darkened by alpha and transmission, so
+        glass bakes as a tinted solid instead of white."""
+        tree = self.tree
+        self.image_node.image = image
+        surface = self.output.inputs["Surface"]
+        for link in list(surface.links):
+            tree.links.remove(link)
+        if name == "normal":
+            if self.surface:
+                tree.links.new(self.surface, surface)
+            return
+        tree.links.new(self.emission.outputs["Emission"], surface)
+        color = self.emission.inputs["Color"]
+        for link in list(color.links):
+            tree.links.remove(link)
+        principled = self.principled
+        if principled is None:
+            color.default_value = self.constants[name]
+            return
+        if name == "metallic_roughness":
+            channels = tree.nodes.new("ShaderNodeCombineColor")
+            channels.inputs["Red"].default_value = 1.0
+            feed_socket(tree, principled.inputs["Roughness"], channels.inputs["Green"])
+            feed_socket(tree, principled.inputs["Metallic"], channels.inputs["Blue"])
+            tree.links.new(channels.outputs["Color"], color)
+            return
+        tint = tree.nodes.new("ShaderNodeVectorMath")
+        tint.operation = "MULTIPLY"
+        feed_socket(tree, principled.inputs["Base Color"], tint.inputs[0])
+        coverage = tree.nodes.new("ShaderNodeMath")
+        coverage.operation = "MULTIPLY"
+        feed_socket(tree, principled.inputs["Alpha"], coverage.inputs[0])
+        transmission = principled.inputs.get("Transmission Weight") or principled.inputs.get("Transmission")
+        if transmission:
+            opaque = tree.nodes.new("ShaderNodeMath")
+            opaque.operation = "SUBTRACT"
+            opaque.inputs[0].default_value = 1.0
+            feed_socket(tree, transmission, opaque.inputs[1])
+            tree.links.new(opaque.outputs[0], coverage.inputs[1])
+        else:
+            coverage.inputs[1].default_value = 1.0
+        tree.links.new(coverage.outputs[0], tint.inputs[1])
+        tree.links.new(tint.outputs["Vector"], color)
+
+
+class GhostLodBuild:
+    """Datablocks made while generating LODs. Temporary ones are always removed; the results are kept
+    only when generation finishes, so a failed or cancelled run leaves the scene as it was."""
+
+    def __init__(self):
+        self.temporary = []
+        self.results = []
+        self.restores = []
+        self.succeeded = False
+
+    def assign(self, owner, attribute, value):
+        previous = getattr(owner, attribute)
+        self.restores.append(lambda: setattr(owner, attribute, previous))
+        setattr(owner, attribute, value)
+
+    def finish(self):
+        for restore in reversed(self.restores):
+            try:
+                restore()
+            except ReferenceError:
+                pass
+        remove_datablocks(self.temporary if self.succeeded else self.temporary + self.results)
+        self.temporary, self.results, self.restores = [], [], []
+
+
+def remove_datablocks(datablocks):
+    """Removes the objects, then the meshes, materials and images nothing uses any more."""
+    collections = (
+        (bpy.types.Object, bpy.data.objects),
+        (bpy.types.Mesh, bpy.data.meshes),
+        (bpy.types.Material, bpy.data.materials),
+        (bpy.types.Image, bpy.data.images),
+    )
+    for kind, collection in collections:
+        for datablock in datablocks:
+            try:
+                if isinstance(datablock, kind) and (kind is bpy.types.Object or datablock.users == 0):
+                    collection.remove(datablock)
+            except ReferenceError:
+                pass
+
+
+def ghost_lod_cycles_device():
+    preferences = bpy.context.preferences.addons.get("cycles")
+    if preferences and preferences.preferences.has_active_device():
+        return "GPU"
+    return "CPU"
+
+
+def split_mesh_faces(mesh, keep):
+    """Deletes the faces whose material keep() rejects; returns False when none remain."""
+    materials = list(mesh.materials)
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        rejected = [
+            face for face in bm.faces
+            if not keep(materials[face.material_index] if face.material_index < len(materials) else None)
+        ]
+        bmesh.ops.delete(bm, geom=rejected, context="FACES")
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    mesh.update()
+    return bool(mesh.polygons)
+
+
+def keep_single_uv_layer(mesh, name):
+    """Leaves only the UV map `name` (a fresh one when it is missing), renamed to the LOD UV map."""
+    for other in [layer.name for layer in mesh.uv_layers if layer.name != name]:
+        mesh.uv_layers.remove(mesh.uv_layers[other])
+    layer = mesh.uv_layers.get(name) if name else None
+    if layer is None:
+        layer = mesh.uv_layers.new(name=GHOST_LOD_UV_NAME)
+    layer.name = GHOST_LOD_UV_NAME
+    layer.active = True
+    layer.active_render = True
+
+
+def decimate_ghost_lod(context, build, obj, ratio, keep=True):
+    """Replaces obj's mesh with its Collapse-decimated version and returns the triangle count. The new mesh
+    is a result to keep, or temporary when obj is."""
+    modifier = obj.modifiers.new("VectorG Ghost LOD", "DECIMATE")
+    modifier.decimate_type = "COLLAPSE"
+    modifier.ratio = ratio
+    depsgraph = context.evaluated_depsgraph_get()
+    mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph), preserve_all_data_layers=True, depsgraph=depsgraph)
+    (build.results if keep else build.temporary).append(mesh)
+    obj.modifiers.remove(modifier)
+    build.temporary.append(obj.data)
+    obj.data = mesh
+    # Collapsing small parts leaves zero-area faces behind.
+    mesh.validate(clean_customdata=False)
+    mesh.calc_loop_triangles()
+    return len(mesh.loop_triangles)
+
+
+def ghost_lod_atlas_material(build, images):
+    material = bpy.data.materials.new(GHOST_LOD_ATLAS_NAME)
+    build.results.append(material)
+    material[GENERATED_GHOST_LOD_PROP] = True
+    material.use_nodes = True
+    tree = material.node_tree
+    principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
+
+    def texture(image):
+        node = tree.nodes.new("ShaderNodeTexImage")
+        node.image = image
+        return node
+
+    tree.links.new(texture(images["color"]).outputs["Color"], principled.inputs["Base Color"])
+    channels = tree.nodes.new("ShaderNodeSeparateColor")
+    tree.links.new(texture(images["metallic_roughness"]).outputs["Color"], channels.inputs["Color"])
+    tree.links.new(channels.outputs["Green"], principled.inputs["Roughness"])
+    tree.links.new(channels.outputs["Blue"], principled.inputs["Metallic"])
+    normal_map = tree.nodes.new("ShaderNodeNormalMap")
+    tree.links.new(texture(images["normal"]).outputs["Color"], normal_map.inputs["Color"])
+    tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+    return material
+
+
+def box_blur(values, radius, axis):
+    """A box blur of the given radius in pixels along one axis, with zeros beyond the edges."""
+    if radius < 1:
+        return values
+    width = 2 * radius + 1
+    padded = np.pad(values, [(radius + 1, radius) if index == axis else (0, 0) for index in range(values.ndim)])
+    totals = np.cumsum(padded, axis=axis)
+    upper = np.take(totals, range(width, totals.shape[axis]), axis=axis)
+    lower = np.take(totals, range(0, totals.shape[axis] - width), axis=axis)
+    return (upper - lower) / width
+
+
+def ghost_silhouette_alpha(mesh):
+    """The mesh seen from straight above, in its own XY plane: coverage per pixel with soft edges, the XY
+    position of the image's first pixel corner and the metres per pixel."""
+    mesh.calc_loop_triangles()
+    points = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", points)
+    points = points.reshape(-1, 3)[:, :2]
+    triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+    mesh.loop_triangles.foreach_get("vertices", triangles)
+    triangles = triangles.reshape(-1, 3)
+    low = points.min(axis=0) - GHOST_SHADOW_PLANE_BORDER
+    high = points.max(axis=0) + GHOST_SHADOW_PLANE_BORDER
+    pixel = float((high - low).max()) / GHOST_SHADOW_PLANE_PIXELS
+    columns, rows = (int(math.ceil(value)) for value in (high - low) / pixel)
+    covered = np.zeros((rows, columns), dtype=bool)
+    corners = (points - low) / pixel
+    for a, b, c in corners[triangles]:
+        area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        if area == 0.0:
+            continue
+        x0, y0 = (max(int(math.floor(min(a[i], b[i], c[i]) - 0.5)), 0) for i in (0, 1))
+        x1 = min(int(math.ceil(max(a[0], b[0], c[0]) - 0.5)), columns - 1)
+        y1 = min(int(math.ceil(max(a[1], b[1], c[1]) - 0.5)), rows - 1)
+        if x1 < x0 or y1 < y0:
+            continue
+        xs, ys = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+        sign = 1.0 if area > 0.0 else -1.0
+        inside = np.ones(xs.shape, dtype=bool)
+        for p, q in ((a, b), (b, c), (c, a)):
+            inside &= sign * ((q[0] - p[0]) * (ys - p[1]) - (q[1] - p[1]) * (xs - p[0])) >= 0.0
+        covered[y0:y1 + 1, x0:x1 + 1] |= inside
+        # A triangle smaller than a pixel still darkens the pixel it sits in.
+        centre = ((a + b + c) / 3.0).astype(int)
+        if 0 <= centre[0] < columns and 0 <= centre[1] < rows:
+            covered[centre[1], centre[0]] = True
+    alpha = covered.astype(np.float32)
+    # Three box blurs approximate a Gaussian penumbra of the given width.
+    radius = max(int(round(GHOST_SHADOW_PLANE_SOFTNESS / pixel / 3.0)), 1)
+    for _pass in range(3):
+        alpha = box_blur(box_blur(alpha, radius, 0), radius, 1)
+    return np.clip(alpha, 0.0, 1.0), low, pixel
+
+
+def build_ghost_shadow_plane(build, collection, root, mesh):
+    """A single-sided quad under Ghost Root covering mesh's top-down silhouette, with a packed PNG: white,
+    with the soft silhouette as alpha. The game uses the alpha as the shadow's coverage and tints the
+    ground per track; the material's preview colour is for Blender only."""
+    alpha, low, pixel = ghost_silhouette_alpha(mesh)
+    rows, columns = alpha.shape
+    image = bpy.data.images.new(f"{GHOST_SHADOW_PLANE_NAME}_silhouette_new", columns, rows, alpha=True)
+    build.results.append(image)
+    image[GENERATED_GHOST_LOD_PROP] = True
+    pixels = np.ones((rows, columns, 4), dtype=np.float32)
+    pixels[:, :, 3] = alpha
+    image.pixels.foreach_set(pixels.ravel())
+    image.pack()
+
+    material = bpy.data.materials.new(f"{GHOST_SHADOW_PLANE_NAME}_new")
+    build.results.append(material)
+    material[GENERATED_GHOST_LOD_PROP] = True
+    material.use_nodes = True
+    # Single-sided: a double-sided blended material is drawn twice in the game, darkening it twice.
+    material.use_backface_culling = True
+    if hasattr(material, "blend_method"):
+        material.blend_method = "BLEND"
+    if hasattr(material, "surface_render_method"):
+        material.surface_render_method = "BLENDED"
+    tree = material.node_tree
+    principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
+    principled.inputs["Roughness"].default_value = 1.0
+    specular = principled.inputs.get("Specular IOR Level") or principled.inputs.get("Specular")
+    if specular:
+        specular.default_value = 0.0
+    texture = tree.nodes.new("ShaderNodeTexImage")
+    texture.name = "Silhouette"
+    texture.image = image
+    preview = tree.nodes.new("ShaderNodeMix")
+    preview.data_type = "RGBA"
+    preview.blend_type = "MULTIPLY"
+    # The mix node has a socket per data type under each name; pick the colour ones.
+    sockets = {socket.identifier: socket for socket in list(preview.inputs) + list(preview.outputs)}
+    sockets["Factor_Float"].default_value = 1.0
+    sockets["B_Color"].default_value = (*GHOST_SHADOW_PLANE_PREVIEW_COLOR, 1.0)
+    tree.links.new(texture.outputs["Color"], sockets["A_Color"])
+    tree.links.new(sockets["Result_Color"], principled.inputs["Base Color"])
+    tree.links.new(texture.outputs["Alpha"], principled.inputs["Alpha"])
+
+    high = low + np.array((columns, rows)) * pixel
+    quad = bpy.data.meshes.new(f"{GHOST_SHADOW_PLANE_NAME}_new")
+    build.results.append(quad)
+    quad.from_pydata(
+        [(low[0], low[1], 0.0), (high[0], low[1], 0.0), (high[0], high[1], 0.0), (low[0], high[1], 0.0)],
+        [], [(0, 1, 2, 3)],
+    )
+    layer = quad.uv_layers.new(name=GHOST_LOD_UV_NAME)
+    for loop, uv in zip(quad.loops, ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))):
+        layer.data[loop.index].uv = uv
+    quad.materials.append(material)
+    quad.update()
+
+    plane = bpy.data.objects.new(f"{GHOST_SHADOW_PLANE_NAME}_new", quad)
+    collection.objects.link(plane)
+    build.results.append(plane)
+    plane.parent = root
+    plane.matrix_parent_inverse.identity()
+    plane.matrix_basis.identity()
+    return plane
+
+
+def previous_ghost_lods(nodes):
+    """Datablocks an earlier refresh generated under these nodes: the marked objects, their meshes, and
+    the marked materials and images those use. Shared ones are only removed once nothing uses them."""
+    datablocks = []
+    for node in nodes:
+        for obj in hierarchy_objects(node):
+            if not obj.get(GENERATED_GHOST_LOD_PROP):
+                continue
+            datablocks.append(obj)
+            if obj.data is None:
+                continue
+            datablocks.append(obj.data)
+            for material in obj.data.materials:
+                if not material or not material.get(GENERATED_GHOST_LOD_PROP):
+                    continue
+                datablocks.append(material)
+                datablocks.extend(
+                    node.image for node in material.node_tree.nodes
+                    if node.type == "TEX_IMAGE" and node.image and node.image.get(GENERATED_GHOST_LOD_PROP)
+                )
+    return list(dict.fromkeys(datablocks))
+
+
+def strip_mesh_surface(mesh):
+    """Leaves only geometry: no materials, UV maps or color attributes."""
+    mesh.materials.clear()
+    while mesh.uv_layers:
+        mesh.uv_layers.remove(mesh.uv_layers[0])
+    while mesh.color_attributes:
+        mesh.color_attributes.remove(mesh.color_attributes[0])
+
+
+def ghost_root_child(context, build, collection, root, meshes, name):
+    """meshes, in Ghost Root's space, joined into one new object under Ghost Root."""
+    obj = join_meshes(context, meshes, collection, f"{name}_new")
+    build.results.append(obj)
+    obj.parent = root
+    obj.matrix_parent_inverse.identity()
+    obj.matrix_basis.identity()
+    return obj
+
+
+GHOST_LOD_TARGETS = (
+    ("SHADOW", "Shadow", "Join Ghost Root's own meshes, without the wheels, into the shadow mesh at "
+     f"{round(GHOST_SHADOW_RATIO * 100)}% of their triangles"),
+    ("SHADOW_PLANE", "Shadow Plane", "Bake the whole ghost's top-down silhouette into the shadow plane's texture"),
+    ("LOD1", "LOD1", "Bake the ghost's materials into the LOD texture atlas and build LOD1, one mesh per moving part "
+     f"at {round(GHOST_LOD1_RATIO * 100)}% of its triangles; LOD2 is rebuilt from it, as both use the atlas"),
+    ("LOD2", "LOD2", f"Build LOD2 from LOD1, the whole car as one mesh at {round(GHOST_LOD2_RATIO * 100)}% of "
+     "the ghost's triangles"),
+)
+
+
+def iter_generate_ghost_lods(context, settings, build, target, background_bake=False):
+    """Rebuilds one generated part of the custom ghost in the scene, yielding (fraction, message) between
+    steps, and replaces what an earlier refresh made for it. Results are hidden in the viewport.
+
+    SHADOW: Ghost Root's own meshes without wheels, as one material-less mesh at GHOST_SHADOW_RATIO, which
+    the game casts the ghost's shadow from with LOD0.
+    SHADOW_PLANE: a flat quad textured with the whole ghost's top-down silhouette, which the game lays on
+    the ground in place of the shadow from LOD1 on.
+    LOD1: every full-detail ghost mesh is copied into its part's space; all faces except the body paint are
+    unwrapped into one atlas and baked from their own materials (normal, base color, roughness, metallic).
+    An empty under Ghost Root holds one mesh per part at GHOST_LOD1_RATIO, named after the node it follows,
+    so wheels keep moving. LOD2 is rebuilt from it.
+    LOD2: the LOD1 parts as one mesh under Ghost Root at GHOST_LOD2_RATIO, using the same atlas.
+
+    With background_bake, each Cycles pass runs as Blender's bake job and this keeps yielding while it
+    runs, so Blender stays responsive; otherwise the passes bake in place."""
+    root = settings.ghost_root_object
+    if not settings.ghost_enabled or not root:
+        raise ValueError("Enable Custom Ghost and set Ghost Root first")
+    if context.mode != "OBJECT":
+        raise ValueError("Switch to Object Mode to refresh ghost LODs")
+    parts = ghost_lod_parts(context, settings)
+    if not parts:
+        raise ValueError("The ghost has no mesh geometry")
+    body_objects = next((objects for anchor, objects in parts if anchor == root), [])
+    if target == "SHADOW" and not body_objects:
+        raise ValueError("Ghost Root has no meshes of its own (outside the wheels) to build the shadow mesh from")
+    lod1_parts = [
+        child for child in hierarchy_objects(settings.ghost_lod1_object)[1:]
+        if child.type == "MESH" and child.name.startswith(GHOST_LOD1_PART_PREFIX)
+    ]
+    if target == "LOD2" and not lod1_parts:
+        raise ValueError("LOD2 is built from LOD1: refresh LOD1 first")
+
+    replaced_nodes = {
+        "SHADOW": [settings.ghost_shadow_object],
+        "SHADOW_PLANE": [settings.ghost_shadow_plane_object],
+        "LOD1": [settings.ghost_lod1_object, settings.ghost_lod2_object],
+        "LOD2": [settings.ghost_lod2_object],
+    }[target]
+    previous = previous_ghost_lods(replaced_nodes)
+    previous_set = set(previous)
+    final_names = {
+        "SHADOW": [GHOST_SHADOW_NAME],
+        "SHADOW_PLANE": [GHOST_SHADOW_PLANE_NAME],
+        "LOD1": [GHOST_LOD1_NAME, GHOST_LOD2_NAME] + [f"{GHOST_LOD1_PART_PREFIX}{anchor.name}" for anchor, _objects in parts],
+        "LOD2": [GHOST_LOD2_NAME],
+    }[target]
+    for name in final_names:
+        existing = bpy.data.objects.get(name)
+        if existing and existing not in previous_set:
+            raise ValueError(f"Object name {name} is reserved for the generated ghost LODs; rename that object")
+
+    depsgraph = context.evaluated_depsgraph_get()
+    scene = context.scene
+    view_layer = context.view_layer
+    collection = root.users_collection[0] if root.users_collection else scene.collection
+    selected = list(context.selected_objects)
+    active = view_layer.objects.active
+
+    def restore_selection():
+        for obj in view_layer.objects:
+            obj.select_set(obj in selected)
+        view_layer.objects.active = active if active and active.name in view_layer.objects else None
+
+    build.restores.append(restore_selection)
+    root_inverse = root.matrix_world.inverted()
+    # (datablock, final name) for every result, renamed once the earlier ones are gone, and the fields that
+    # take the results only then, so a failed or cancelled refresh leaves them as they were.
+    renames = []
+    fields = []
+    triangles = {}
+
+    def build_lod2(part_meshes):
+        """LOD2 from LOD1 part meshes and their world matrices: copies in Ghost Root's space, joined."""
+        copies = []
+        for mesh, matrix in part_meshes:
+            copy = mesh.copy()
+            build.temporary.append(copy)
+            copy.transform(root_inverse @ matrix)
+            copies.append(copy)
+        lod2 = ghost_root_child(context, build, collection, root, copies, GHOST_LOD2_NAME)
+        triangles[GHOST_LOD2_NAME] = decimate_ghost_lod(context, build, lod2, GHOST_LOD2_RATIO / GHOST_LOD1_RATIO)
+        renames.append((lod2, GHOST_LOD2_NAME))
+        fields.append(("ghost_lod2_object", lod2))
+
+    if target in {"SHADOW", "SHADOW_PLANE"}:
+        sources = body_objects if target == "SHADOW" else [obj for _anchor, objects in parts for obj in objects]
+        meshes = []
+        for index, obj in enumerate(sources):
+            yield 0.6 * index / len(sources), f"Copying {obj.name}..."
+            mesh = evaluated_mesh_copy(obj, root, depsgraph)
+            build.temporary.append(mesh)
+            strip_mesh_surface(mesh)
+            meshes.append(mesh)
+        if target == "SHADOW":
+            yield 0.7, f"Building {GHOST_SHADOW_NAME}..."
+            shadow = ghost_root_child(context, build, collection, root, meshes, GHOST_SHADOW_NAME)
+            shadow.display_type = "WIRE"
+            triangles[GHOST_SHADOW_NAME] = decimate_ghost_lod(context, build, shadow, GHOST_SHADOW_RATIO)
+            renames.append((shadow, GHOST_SHADOW_NAME))
+            fields.append(("ghost_shadow_object", shadow))
+        else:
+            # The silhouette comes from a light copy of the whole car, wheels included.
+            yield 0.7, "Simplifying the ghost for its silhouette..."
+            outline = join_meshes(context, meshes, collection, f"{GHOST_SHADOW_PLANE_NAME}_outline")
+            build.temporary.append(outline)
+            decimate_ghost_lod(context, build, outline, GHOST_LOD2_RATIO, keep=False)
+            yield 0.85, f"Building {GHOST_SHADOW_PLANE_NAME}..."
+            plane = build_ghost_shadow_plane(build, collection, root, outline.data)
+            renames.append((plane, GHOST_SHADOW_PLANE_NAME))
+            renames.append((plane.active_material, GHOST_SHADOW_PLANE_NAME))
+            renames.append((plane.active_material.node_tree.nodes["Silhouette"].image, f"{GHOST_SHADOW_PLANE_NAME}_silhouette"))
+            fields.append(("ghost_shadow_plane_object", plane))
+
+    elif target == "LOD2":
+        yield 0.3, f"Building {GHOST_LOD2_NAME}..."
+        build_lod2([(part.data, part.matrix_world) for part in lod1_parts])
+
+    else:
+        paint = {color.material for color in settings.body_colors if color.material}
+        # (anchor, [(mesh, baked)]): baked faces take the atlas, the rest keep the body paint.
+        pieces = []
+        bake_objects = []
+        copied, total = 0, sum(len(objects) for _anchor, objects in parts)
+        for anchor, objects in parts:
+            part_pieces = []
+            for obj in objects:
+                yield 0.1 * copied / total, f"Copying {obj.name}..."
+                copied += 1
+                mesh = evaluated_mesh_copy(obj, anchor, depsgraph)
+                painted = mesh.copy()
+                build.temporary.extend((mesh, painted))
+                if split_mesh_faces(mesh, lambda material: material not in paint):
+                    part_pieces.append((mesh, True))
+                    piece = bpy.data.objects.new(f"{obj.name}_vectorg_ghost_lod_bake", mesh)
+                    scene.collection.objects.link(piece)
+                    build.temporary.append(piece)
+                    bake_objects.append(piece)
+                if split_mesh_faces(painted, lambda material: material in paint):
+                    part_pieces.append((painted, False))
+            pieces.append((anchor, part_pieces))
+
+        atlas_material = None
+        if bake_objects:
+            bake_materials = {}
+            for piece in bake_objects:
+                mesh = piece.data
+                if not mesh.materials:
+                    mesh.materials.append(None)
+                # Every slot needs a bake image, including paint slots that no face uses any more.
+                for index, source in enumerate(mesh.materials):
+                    if source not in bake_materials:
+                        bake_materials[source] = GhostLodBakeMaterial(source)
+                        build.temporary.append(bake_materials[source].material)
+                    mesh.materials[index] = bake_materials[source].material
+                layer = mesh.uv_layers.new(name=GHOST_LOD_BAKE_UV_NAME, do_init=False)
+                if layer is None:
+                    raise RuntimeError(f"Ghost mesh {piece.name} has no free UV map slot for the LOD atlas")
+                mesh.uv_layers.active = layer
+
+            yield 0.1, "Unwrapping the LOD texture atlas..."
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            for piece in bake_objects:
+                piece.select_set(True)
+            view_layer.objects.active = bake_objects[0]
+            bpy.ops.object.mode_set(mode="EDIT")
+            try:
+                bpy.ops.mesh.reveal(select=False)
+                bpy.ops.mesh.select_all(action="SELECT")
+                bpy.ops.uv.smart_project(
+                    angle_limit=GHOST_LOD_SMART_PROJECT_ANGLE,
+                    island_margin=GHOST_LOD_ISLAND_MARGIN,
+                    area_weight=0.0,
+                    correct_aspect=True,
+                    scale_to_bounds=False,
+                )
+            finally:
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+            images = {}
+            bake_state = GhostLodBuild()
+            bake_state.succeeded = True
+            try:
+                bake_state.assign(scene.render, "engine", "CYCLES")
+                bake_state.assign(scene.cycles, "device", ghost_lod_cycles_device())
+                bake_state.assign(scene.cycles, "samples", GHOST_LOD_BAKE_SAMPLES)
+                # Each pass syncs every renderable object; the copies bake from their own materials alone.
+                for obj in scene.objects:
+                    if obj not in bake_objects and not obj.hide_render:
+                        bake_state.assign(obj, "hide_render", True)
+                size = GHOST_LOD_ATLAS_SIZE
+                for index, (name, bake_type, colorspace) in enumerate(GHOST_LOD_BAKE_PASSES):
+                    fraction = 0.2 + 0.5 * index / len(GHOST_LOD_BAKE_PASSES)
+                    message = f"Baking {name.replace('_', ' ')} ({index + 1}/{len(GHOST_LOD_BAKE_PASSES)})..."
+                    yield fraction, message
+                    image = bpy.data.images.new(f"{GHOST_LOD_ATLAS_NAME}_{name}_new", size, size, alpha=False)
+                    build.results.append(image)
+                    image[GENERATED_GHOST_LOD_PROP] = True
+                    image.colorspace_settings.name = colorspace
+                    for material in bake_materials.values():
+                        material.route(name, image)
+                    options = {
+                        "type": bake_type,
+                        "margin": GHOST_LOD_BAKE_MARGIN_PIXELS,
+                        "margin_type": "EXTEND",
+                        "use_selected_to_active": False,
+                        "use_clear": True,
+                        "target": "IMAGE_TEXTURES",
+                        "uv_layer": GHOST_LOD_BAKE_UV_NAME,
+                    }
+                    if bake_type == "NORMAL":
+                        options["normal_space"] = "TANGENT"
+                    if background_bake:
+                        # Esc while the job runs cancels it, and Blender reports failures the same way.
+                        stopped = []
+                        on_stop = lambda *_args: stopped.append(True)
+                        bpy.app.handlers.object_bake_cancel.append(on_stop)
+                        try:
+                            outcome = bpy.ops.object.bake("INVOKE_DEFAULT", **options)
+                            if "RUNNING_MODAL" not in outcome and "FINISHED" not in outcome:
+                                raise RuntimeError(f"Cycles {name} bake did not start; see the Info log")
+                            while bpy.app.is_job_running("OBJECT_BAKE"):
+                                yield fraction, message
+                        finally:
+                            bpy.app.handlers.object_bake_cancel.remove(on_stop)
+                        if stopped:
+                            raise RuntimeError(f"Cycles {name} bake was cancelled or failed; see the Info log")
+                    elif "FINISHED" not in bpy.ops.object.bake(**options):
+                        raise RuntimeError(f"Cycles {name} bake did not finish")
+                    # Packed, so the atlas is saved inside the .blend file.
+                    image.pack()
+                    images[name] = image
+                    renames.append((image, f"{GHOST_LOD_ATLAS_NAME}_{name}"))
+            finally:
+                bake_state.finish()
+            atlas_material = ghost_lod_atlas_material(build, images)
+            renames.append((atlas_material, GHOST_LOD_ATLAS_NAME))
+            remove_datablocks(bake_objects)
+
+        yield 0.75, "Building LOD meshes..."
+        for _anchor, part_pieces in pieces:
+            for mesh, baked_faces in part_pieces:
+                if baked_faces:
+                    keep_single_uv_layer(mesh, GHOST_LOD_BAKE_UV_NAME)
+                    while mesh.color_attributes:
+                        mesh.color_attributes.remove(mesh.color_attributes[0])
+                    mesh.materials.clear()
+                    mesh.materials.append(atlas_material)
+                    mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), dtype=np.int32))
+                else:
+                    render_layer = next((layer.name for layer in mesh.uv_layers if layer.active_render), None)
+                    keep_single_uv_layer(mesh, render_layer)
+
+        lod1 = bpy.data.objects.new(f"{GHOST_LOD1_NAME}_new", None)
+        collection.objects.link(lod1)
+        build.results.append(lod1)
+        lod1.parent = root
+        lod1.matrix_parent_inverse.identity()
+        lod1.matrix_basis.identity()
+        renames.append((lod1, GHOST_LOD1_NAME))
+        built = []
+        for index, (anchor, part_pieces) in enumerate(pieces):
+            name = f"{GHOST_LOD1_PART_PREFIX}{anchor.name}"
+            yield 0.75 + 0.15 * index / len(pieces), f"Building {name}..."
+            # The part sits at its anchor's pose under the LOD1 node.
+            part = join_meshes(context, [mesh for mesh, _baked in part_pieces], collection, f"{name}_new")
+            build.results.append(part)
+            part.parent = lod1
+            part.matrix_world = anchor.matrix_world.copy()
+            triangles[name] = decimate_ghost_lod(context, build, part, GHOST_LOD1_RATIO)
+            renames.append((part, name))
+            built.append((part.data, anchor.matrix_world.copy()))
+        fields.append(("ghost_lod1_object", lod1))
+
+        yield 0.9, f"Building {GHOST_LOD2_NAME}..."
+        build_lod2(built)
+
+    # Done: the results replace what an earlier refresh made and take their names.
+    remove_datablocks(previous)
+    # Objects linked without an operator since only show in the view layer, for hiding, after an update.
+    view_layer.update()
+    for datablock, name in renames:
+        datablock.name = name
+        if isinstance(datablock, bpy.types.Object):
+            datablock[GENERATED_GHOST_LOD_PROP] = True
+            if datablock.data:
+                datablock.data.name = name
+            if datablock.name in view_layer.objects:
+                datablock.hide_set(True)
+        if datablock.name != name:
+            raise RuntimeError(f"Generated ghost LOD {name} could not take its name")
+    for field, obj in fields:
+        setattr(settings, field, obj)
+    build.succeeded = True
+    print(f"VectorG ghost {target} triangles {triangles}")
+    label = next(label for key, label, _description in GHOST_LOD_TARGETS if key == target)
+    summary = ", ".join(f"{name} {count}" for name, count in triangles.items() if not name.startswith(GHOST_LOD1_PART_PREFIX))
+    lod1_count = sum(count for name, count in triangles.items() if name.startswith(GHOST_LOD1_PART_PREFIX))
+    if lod1_count:
+        summary = f"LOD1 {lod1_count}, {summary}"
+    yield 1.0, f"{label} refreshed" + (f": {summary} triangles" if summary else "")
 
 
 def armature_object_poll(_settings, obj):
@@ -902,7 +2042,14 @@ def build_ghost_config(settings):
             role: {"obj": object_config_name(getattr(wheel, prop))}
             for role, prop in GHOST_WHEEL_ROLES
         }
-    return {"obj": object_config_name(settings.ghost_root_object), "wheels": wheels}
+    lods = None
+    if settings.ghost_lod1_object and settings.ghost_lod2_object:
+        lods = [{"obj": object_config_name(lod)} for lod in (settings.ghost_lod1_object, settings.ghost_lod2_object)]
+    shadow = {"obj": object_config_name(settings.ghost_shadow_object)} if settings.ghost_shadow_object else None
+    plane = settings.ghost_shadow_plane_object
+    shadow_plane = {"obj": object_config_name(plane)} if plane else None
+    return {"obj": object_config_name(settings.ghost_root_object), "wheels": wheels, "shadow": shadow,
+            "shadowPlane": shadow_plane, "lods": lods}
 
 
 def parse_ghost_config(value):
@@ -936,6 +2083,30 @@ def parse_ghost_config(value):
             raise ValueError("Manifest ghost wheel nodes must not overlap the root or another wheel")
         used_names.update(names)
         result["wheels"][group][key] = nodes
+    shadow = value.get("shadow")
+    if shadow is not None:
+        shadow = {"obj": node_name(shadow, "ghost.shadow")}
+        if shadow["obj"] in used_names:
+            raise ValueError("Manifest ghost.shadow must not be the ghost root or a ghost wheel node")
+        used_names.add(shadow["obj"])
+    result["shadow"] = shadow
+    shadow_plane = value.get("shadowPlane")
+    if shadow_plane is not None:
+        shadow_plane = {"obj": node_name(shadow_plane, "ghost.shadowPlane")}
+        if shadow_plane["obj"] in used_names:
+            raise ValueError("Manifest ghost.shadowPlane must not be the ghost root, its shadow or a ghost wheel node")
+        used_names.add(shadow_plane["obj"])
+    result["shadowPlane"] = shadow_plane
+    lods = value.get("lods")
+    if lods is not None:
+        if not isinstance(lods, list) or len(lods) != 2:
+            raise ValueError("Manifest ghost.lods must list LOD1 and LOD2")
+        if shadow is None or shadow_plane is None:
+            raise ValueError("Manifest ghost.lods needs ghost.shadow and ghost.shadowPlane")
+        lods = [{"obj": node_name(lod, f"ghost.lods[{index}]")} for index, lod in enumerate(lods)]
+        if len({lod["obj"] for lod in lods} | used_names) != len(used_names) + 2:
+            raise ValueError("Manifest ghost LOD nodes must be distinct from each other, the shadow and the ghost wheel nodes")
+    result["lods"] = lods
     return result
 
 
@@ -949,6 +2120,12 @@ def import_ghost_config(settings, config):
         wheel = ghost_wheel_settings(settings, group, key)
         for role, prop in GHOST_WHEEL_ROLES:
             set_object_pointer(wheel, prop, config["wheels"][group][key][role]["obj"])
+    set_object_pointer(settings, "ghost_shadow_object", config["shadow"]["obj"] if config["shadow"] else None)
+    set_object_pointer(settings, "ghost_shadow_plane_object",
+                       config["shadowPlane"]["obj"] if config["shadowPlane"] else None)
+    lods = config["lods"] or [{"obj": None}, {"obj": None}]
+    for prop, lod in zip(("ghost_lod1_object", "ghost_lod2_object"), lods):
+        set_object_pointer(settings, prop, lod["obj"])
 
 
 def validate_ghost_scene(settings, errors, warnings):
@@ -975,6 +2152,9 @@ def validate_ghost_scene(settings, errors, warnings):
         return
     if not any(obj.type == "MESH" and obj.data.polygons for obj in ghost_objects):
         errors.append("Ghost hierarchy must contain mesh geometry")
+    validate_ghost_shadow(settings, errors)
+    validate_ghost_shadow_plane(settings, errors)
+    validate_ghost_lods(settings, errors)
     used_nodes = {root}
     mounts = []
     for group, key, _steering in WHEEL_KEYS:
@@ -1318,25 +2498,51 @@ def with_helpers_unlinked(callback, excluded_objects=()):
                     collection.objects.link(obj)
 
 
+class ExportExclusion:
+    """An object's collections and parent link, held while it is kept out of an export."""
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.collections = list(obj.users_collection)
+        self.parent = obj.parent
+        self.parent_type = obj.parent_type
+        self.parent_bone = obj.parent_bone
+        self.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
+
+
+def export_exclusions(objects):
+    return [ExportExclusion(obj) for obj in dict.fromkeys(objects)]
+
+
 def export_helper_states(excluded_objects=()):
-    helpers = list(dict.fromkeys(guide_objects() + downforce_helper_objects() + light_helper_objects() + list(excluded_objects)))
-    return [(obj, list(obj.users_collection)) for obj in helpers]
+    return export_exclusions(guide_objects() + downforce_helper_objects() + light_helper_objects() + list(excluded_objects))
 
 
 def unlink_export_helpers(states):
-    for obj, collections in states:
-        for collection in collections:
+    """Unlinks the objects from every collection and from their parent: Blender's glTF exporter
+    follows parent-to-child links, so a child left on an exported parent would still export."""
+    for state in states:
+        obj = state.obj
+        for collection in state.collections:
             if obj.name in collection.objects.keys():
                 collection.objects.unlink(obj)
+        if obj.parent:
+            obj.parent = None
 
 
 def relink_export_helpers(states):
-    for obj, collections in states:
+    for state in states:
+        obj = state.obj
         if obj.name not in bpy.data.objects:
             continue
-        for collection in collections:
+        for collection in state.collections:
             if obj.name not in collection.objects.keys():
                 collection.objects.link(obj)
+        if state.parent and state.parent.name in bpy.data.objects:
+            obj.parent = state.parent
+            obj.parent_type = state.parent_type
+            obj.parent_bone = state.parent_bone
+            obj.matrix_parent_inverse = state.matrix_parent_inverse
 
 
 def node_trees(root_tree):
@@ -1805,6 +3011,7 @@ def validate_scene(settings):
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
     validate_ghost_scene(settings, errors, warnings)
+    validate_shadow_scene(settings, errors, warnings)
     validate_armature_scene(settings, errors, warnings)
 
     wheel_positions = {}
@@ -2620,6 +3827,12 @@ class CarExporterSettings(PropertyGroup):
         min=1,
         max=100,
     )
+    merge_meshes: BoolProperty(
+        name="Merge Same-Material Meshes",
+        description="On export, join meshes that share materials under the same wheel, camera or other moving node "
+                    "into one node, so the game draws fewer objects. Colliders and referenced objects are kept",
+        default=True,
+    )
     car_class: EnumProperty(
         name="Class",
         description="Vehicle class used for display and multiplayer class matching",
@@ -2676,6 +3889,40 @@ class CarExporterSettings(PropertyGroup):
     ghost_front_r: PointerProperty(type=CarGhostWheelSettings)
     ghost_rear_l: PointerProperty(type=CarGhostWheelSettings)
     ghost_rear_r: PointerProperty(type=CarGhostWheelSettings)
+    ghost_shadow_object: PointerProperty(
+        name="Shadow",
+        description="Mesh, a direct child of Ghost Root, that casts the ghost's shadow until LOD2; it never renders in the game",
+        type=bpy.types.Object,
+        poll=shadow_mesh_poll,
+    )
+    ghost_shadow_plane_object: PointerProperty(
+        name="Shadow Plane",
+        description="Flat mesh, a direct child of Ghost Root, textured with the ghost's top-down shadow; "
+                    "the game lays it on the ground in place of the shadow from LOD1 on",
+        type=bpy.types.Object,
+        poll=shadow_mesh_poll,
+    )
+    ghost_lod1_object: PointerProperty(
+        name="LOD1",
+        description="Node under Ghost Root whose children are the LOD1 parts, each named LOD1_ and the ghost node it follows",
+        type=bpy.types.Object,
+    )
+    ghost_lod2_object: PointerProperty(
+        name="LOD2",
+        description="Node under Ghost Root holding the whole-car LOD2",
+        type=bpy.types.Object,
+    )
+    shadow_enabled: BoolProperty(
+        name="Enable Custom Shadow",
+        description="Cast the car's live shadow in the game from one shadow mesh instead of every part",
+        default=False,
+    )
+    shadow_object: PointerProperty(
+        name="Shadow Mesh",
+        description="Mesh, a direct child of Car Root, that casts the car's shadow; it never renders in the game",
+        type=bpy.types.Object,
+        poll=shadow_mesh_poll,
+    )
     armature_enabled: BoolProperty(
         name="Enable Armature",
         description="Export bone mappings that follow, aim and stretch between existing car attachments",
@@ -3282,6 +4529,7 @@ def clear_configuration_settings(settings):
     settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
     settings.optimize_color_textures = True
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
+    settings.merge_meshes = True
     settings.car_class = DEFAULT_VEHICLE_CLASS
     settings.vehicle_tag_tarmac = False
     settings.vehicle_tag_offroad = False
@@ -3291,6 +4539,12 @@ def clear_configuration_settings(settings):
     settings.car_root_object = None
     settings.ghost_enabled = False
     settings.ghost_root_object = None
+    settings.ghost_shadow_object = None
+    settings.ghost_shadow_plane_object = None
+    settings.ghost_lod1_object = None
+    settings.ghost_lod2_object = None
+    settings.shadow_enabled = False
+    settings.shadow_object = None
     settings.armature_enabled = False
     settings.armature_object = None
     settings.armature_joints.clear()
@@ -3370,6 +4624,7 @@ def initialize_configuration_settings(settings):
     settings.max_texture_size = str(DEFAULT_MAX_TEXTURE_SIZE)
     settings.optimize_color_textures = True
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
+    settings.merge_meshes = True
     settings.car_class = DEFAULT_VEHICLE_CLASS
     settings.vehicle_tag_tarmac = True
     settings.vehicle_tag_offroad = True
@@ -3742,6 +4997,7 @@ def build_manifest(settings):
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
         "ghost": build_ghost_config(settings),
+        "shadow": build_shadow_config(settings),
         "displayName": settings.display_name,
         "class": settings.car_class,
         "trackTypes": [
@@ -3857,7 +5113,15 @@ EXPORT_PROGRESS_TITLES = {
     "FAILED": "Export Failed",
     "CANCELLED": "Export Cancelled",
 }
-export_progress_state = {"status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": []}
+GHOST_LOD_PROGRESS_TITLES = {
+    "RUNNING": "Refreshing Ghost LOD",
+    "SUCCESS": "Ghost LOD Refreshed",
+    "FAILED": "Ghost LOD Refresh Failed",
+    "CANCELLED": "Ghost LOD Refresh Cancelled",
+}
+export_progress_state = {
+    "status": None, "fraction": 0.0, "message": "", "detail": "", "handlers": [], "titles": EXPORT_PROGRESS_TITLES,
+}
 
 
 def export_progress_active():
@@ -3889,7 +5153,7 @@ def hide_export_progress():
     state = export_progress_state
     for space, handler in state["handlers"]:
         space.draw_handler_remove(handler, "WINDOW")
-    state.update(status=None, fraction=0.0, message="", detail="", handlers=[])
+    state.update(status=None, fraction=0.0, message="", detail="", handlers=[], titles=EXPORT_PROGRESS_TITLES)
     try:
         redraw_all_areas()
     except AttributeError:
@@ -3971,7 +5235,7 @@ def draw_export_progress():
 
     white, dim = (0.93, 0.93, 0.93, 1.0), (0.62, 0.62, 0.62, 1.0)
     title_y = y + height - 28 * scale
-    draw_export_text(EXPORT_PROGRESS_TITLES[state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
+    draw_export_text(state["titles"][state["status"]], x + padding, title_y, 16 * scale, white, inner * 0.75)
     draw_export_text(f"{round(fraction * 100)}%", x + width - padding, title_y, 14 * scale, dim, inner * 0.25, "RIGHT")
     draw_export_text(state["message"], x + padding, bar_y - 26 * scale, 13 * scale, white, inner)
     if state["detail"]:
@@ -3995,12 +5259,16 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             sounds_path.mkdir()
 
         yield 0.05, "Preparing export scene..."
-        states = export_helper_states(excluded_ghost_objects(settings))
+        states = export_helper_states(excluded_ghost_objects(settings) + excluded_shadow_objects(settings))
         carrier = None
+        merge_result = None
         restored_nodes, temp_images = [], []
         try:
             unlink_export_helpers(states)
             carrier = create_body_material_export_carrier(context)
+            if settings.merge_meshes:
+                yield 0.05, "Merging same-material meshes..."
+                merge_result = apply_car_mesh_merge(context, settings)
             for index, total, name in iter_export_texture_optimization(
                 list(context.scene.objects),
                 int(settings.max_texture_size),
@@ -4027,6 +5295,7 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
                 raise RuntimeError("Blender glTF export did not finish")
         finally:
             restore_export_textures(restored_nodes, temp_images)
+            restore_car_mesh_merge(merge_result)
             remove_body_material_export_carrier(carrier)
             relink_export_helpers(states)
 
@@ -4129,6 +5398,128 @@ class CAR_EXPORTER_OT_remove_armature_joint(Operator):
             return {"CANCELLED"}
         joints.remove(self.index)
         return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_generate_shadow_mesh(Operator):
+    bl_idname = "car_exporter.generate_shadow_mesh"
+    bl_label = "Generate Shadow Mesh"
+    bl_description = (
+        "Join the car's meshes, without wheels, colliders or the ghost, into one shadow mesh under Car Root. "
+        "Replaces a previously generated shadow mesh"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        if context.mode != "OBJECT":
+            self.report({"ERROR"}, "Switch to Object Mode to generate the shadow mesh")
+            return {"CANCELLED"}
+        try:
+            shadow, source_count = generate_shadow_mesh(context, settings)
+        except (RuntimeError, ValueError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.shadow_object = shadow
+        settings.shadow_enabled = True
+        self.report({"INFO"}, f"{shadow.name}: {len(shadow.data.polygons)} faces from {source_count} meshes")
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_generate_ghost_lods(Operator):
+    bl_idname = "car_exporter.generate_ghost_lods"
+    bl_label = "Refresh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target: EnumProperty(
+        name="Target",
+        items=[(key, label, description) for key, label, description in GHOST_LOD_TARGETS],
+        default="LOD1",
+    )
+
+    @classmethod
+    def description(cls, _context, properties):
+        return next(description for key, _label, description in GHOST_LOD_TARGETS if key == properties.target) \
+            + ". Replaces what an earlier refresh made"
+
+    @classmethod
+    def poll(cls, _context):
+        return not export_progress_active()
+
+    def execute(self, context):
+        self.build = GhostLodBuild()
+        interactive = context.window is not None and not bpy.app.background
+        self.steps = iter_generate_ghost_lods(context, scene_settings(context), self.build, self.target,
+                                              background_bake=interactive)
+        self.message = ""
+        if not interactive:
+            try:
+                for _fraction, self.message in self.steps:
+                    pass
+            except (RuntimeError, ValueError) as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+            finally:
+                self.build.finish()
+            self.report({"INFO"}, self.message)
+            return {"FINISHED"}
+        self.finished_at = None
+        self.result = {"FINISHED"}
+        self.timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        export_progress_state["titles"] = GHOST_LOD_PROGRESS_TITLES
+        update_export_progress("RUNNING", 0.0, "Starting...", "")
+        return {"RUNNING_MODAL"}
+
+    def finish(self, status, fraction, message, detail=""):
+        self.build.finish()
+        self.finished_at = time.monotonic()
+        self.result = {"FINISHED"} if status == "SUCCESS" else {"CANCELLED"}
+        update_export_progress(status, fraction, message, detail)
+
+    def step(self):
+        try:
+            fraction, message = next(self.steps)
+        except StopIteration:
+            self.report({"INFO"}, self.message)
+            self.finish("SUCCESS", 1.0, self.message)
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            self.finish("FAILED", export_progress_state["fraction"], str(error), "See the system console for details")
+        else:
+            self.message = message
+            update_export_progress(fraction=fraction, message=message)
+
+    def close(self, context):
+        context.window_manager.event_timer_remove(self.timer)
+        hide_export_progress()
+        return self.result
+
+    def modal(self, context, event):
+        try:
+            if self.finished_at is None:
+                if event.type == "ESC" and event.value == "PRESS":
+                    self.steps.close()
+                    self.report({"WARNING"}, "Ghost LOD refresh cancelled")
+                    self.finish("CANCELLED", export_progress_state["fraction"], "Refresh cancelled")
+                elif event.type == "TIMER":
+                    self.step()
+                return {"RUNNING_MODAL"}
+            if event.type == "TIMER":
+                if time.monotonic() - self.finished_at >= EXPORT_RESULT_SECONDS:
+                    return self.close(context)
+                return {"RUNNING_MODAL"}
+            if event.value == "PRESS" and event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC", "RET", "NUMPAD_ENTER", "SPACE"}:
+                return self.close(context)
+            return {"PASS_THROUGH"}
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            if self.finished_at is None:
+                self.steps.close()
+                self.build.finish()
+            self.result = {"CANCELLED"}
+            return self.close(context)
 
 
 class CAR_EXPORTER_OT_add_collider(Operator):
@@ -4909,7 +6300,7 @@ def create_body_material_export_carrier(context):
         vertices.extend(((0.0, 0.0, 0.0),) * 3)
         faces.append((vertex_index, vertex_index + 1, vertex_index + 2))
 
-    mesh = bpy.data.meshes.new("VECTORG_BODY_MATERIALS")
+    mesh = bpy.data.meshes.new(BODY_MATERIAL_CARRIER_NAME)
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
     for material in carrier_materials:
@@ -4917,7 +6308,7 @@ def create_body_material_export_carrier(context):
     for index, polygon in enumerate(mesh.polygons):
         polygon.material_index = index
 
-    carrier = bpy.data.objects.new("VECTORG_BODY_MATERIALS", mesh)
+    carrier = bpy.data.objects.new(BODY_MATERIAL_CARRIER_NAME, mesh)
     context.scene.collection.objects.link(carrier)
     default_material = settings.body_colors[0].material if settings.body_colors else None
     carrier_parent = object_with_assigned_material(default_material, car_objects)
@@ -5144,6 +6535,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             return {"CANCELLED"}
         try:
             ghost_config = parse_ghost_config(data.get("ghost"))
+            shadow_config = parse_shadow_config(data.get("shadow"))
             armature_config = parse_armature_config(data.get("armature"))
             lights_config = parse_lights_config(data.get("lights"))
             import_body = data.get("body")
@@ -5488,6 +6880,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
 
         settings.is_configured = True
         import_ghost_config(settings, ghost_config)
+        import_shadow_config(settings, shadow_config)
         import_armature_config(settings, armature_config)
         settings.car_id = data.get("id", data.get("name", settings.car_id))
         settings.package_version = str(data.get("packageVersion", settings.package_version))
@@ -5833,7 +7226,30 @@ def draw_custom_ghost(layout, settings):
         wheel = ghost_wheel_settings(settings, group, key)
         for _role, prop in GHOST_WHEEL_ROLES:
             draw_split_prop(box, wheel, prop)
-    layout.label(text="Uses existing wheel axes, body colors and light materials", icon="INFO")
+    inputs.separator(factor=1.5)
+    for prop, target in (("ghost_shadow_object", "SHADOW"), ("ghost_shadow_plane_object", "SHADOW_PLANE"),
+                         ("ghost_lod1_object", "LOD1"), ("ghost_lod2_object", "LOD2")):
+        split = inputs.split(factor=0.4, align=True)
+        split.label(text=settings.bl_rna.properties[prop].name)
+        row = split.row(align=True)
+        row.prop(settings, prop, text="")
+        row.operator("car_exporter.generate_ghost_lods", text="", icon="FILE_REFRESH").target = target
+
+
+def draw_custom_shadow(layout, settings):
+    header = layout.row(align=True)
+    header.alignment = "LEFT"
+    header.use_property_split = False
+    header.use_property_decorate = False
+    header.label(text="Custom Shadow")
+    header.separator(factor=0.5)
+    header.prop(settings, "shadow_enabled", text="")
+    if not settings.shadow_enabled:
+        return
+    layout.separator()
+    inputs = layout.column()
+    draw_split_prop(inputs, settings, "shadow_object")
+    inputs.operator("car_exporter.generate_shadow_mesh", icon="MESH_DATA")
 
 
 def draw_presets(layout, settings):
@@ -6026,6 +7442,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
         color_quality = box.row()
         color_quality.enabled = settings.optimize_color_textures
         draw_split_prop(color_quality, settings, "jpeg_quality")
+        draw_split_prop(box, settings, "merge_meshes")
         draw_split_prop(box, settings, "car_class")
         draw_vehicle_tags(box, settings)
 
@@ -6109,6 +7526,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         draw_custom_ghost(layout.box(), settings)
 
+        draw_custom_shadow(layout.box(), settings)
+
         box = layout.box()
         box.label(text="Audio")
         draw_split_prop(box, settings, "sound_pitch_offset")
@@ -6160,6 +7579,8 @@ classes = (
     CAR_EXPORTER_OT_estimate_brake_force,
     CAR_EXPORTER_OT_add_armature_joint,
     CAR_EXPORTER_OT_remove_armature_joint,
+    CAR_EXPORTER_OT_generate_shadow_mesh,
+    CAR_EXPORTER_OT_generate_ghost_lods,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
     CAR_EXPORTER_OT_add_center_of_mass,
