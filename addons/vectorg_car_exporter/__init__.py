@@ -104,17 +104,18 @@ SOUND_SLOTS = {
     "on_low": {"label": "On Low", "default": "BAC_Mono_onlow.wav", "rpm": 1000, "volume": 0.4},
     "on_mid": {"label": "On Mid", "default": "", "rpm": 1000, "volume": 0.4},
     "on_high": {"label": "On High", "default": "BAC_Mono_onhigh.wav", "rpm": 1000, "volume": 0.5},
-    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "rpm": 0, "volume": 0.1},
-    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "rpm": 0, "volume": 0.6},
-    "limiter": {"label": "Limiter", "default": "limiter.wav", "rpm": 8000, "volume": 0.4},
-    "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "rpm": 8000, "volume": 0.6},
-    "backfire": {"label": "Backfire", "default": "", "rpm": 0, "volume": 5.0},
+    "tranny_off": {"label": "Transmission Off", "default": "tw_offlow_4.wav", "volume": 0.1},
+    "tranny_on": {"label": "Transmission On", "default": "trany_power_high.wav", "volume": 0.6},
+    "limiter": {"label": "Limiter", "default": "limiter.wav", "volume": 0.4},
+    "turbo": {"label": "Turbo", "default": "turbo_flutter.wav", "volume": 0.6},
+    "backfire": {"label": "Backfire", "default": "", "volume": 5.0},
     "traction_control": {"label": "Traction Control", "default": "", "rpm": 4000, "volume": 3.0},
-    "engine_start": {"label": "Engine Start", "default": "", "rpm": 0, "volume": 0.8},
-    "gear_grinding": {"label": "Gear Grinding", "default": "", "rpm": 0, "volume": 0.8},
-    "brake_squeal": {"label": "Brake Squeal", "default": "", "rpm": 0, "volume": 0.5},
+    "engine_start": {"label": "Engine Start", "default": "", "volume": 0.8},
+    "gear_grinding": {"label": "Gear Grinding", "default": "", "volume": 0.8},
+    "gear_change": {"label": "Gear Change", "default": "", "volume": 1.0},
+    "brake_squeal": {"label": "Brake Squeal", "default": "", "volume": 0.5},
 }
-SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low"}
+SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low", "traction_control"}
 
 ORIENTATION_DOT_THRESHOLD = math.cos(math.radians(1.0))
 # Minimum suspension-length change per metre of wheel travel along a pivot arm.
@@ -257,9 +258,9 @@ def validate_sound_sample(sound):
         sound_sample_path(sound)
 
 
-def sound_reference_rpm(settings, slot, meta):
+def sound_reference_rpm(settings, slot):
     if slot not in SOUND_RPM_SLOTS:
-        return meta["rpm"]
+        return None
     rpm = getattr(settings, f"sound_{slot}_rpm")
     if isinstance(rpm, bool) or not isinstance(rpm, (int, float)) or not math.isfinite(rpm) or rpm <= 0:
         raise ValueError(f"Sound {slot} reference RPM must be a finite positive number")
@@ -288,7 +289,7 @@ def load_manifest_sound_samples(sounds, manifest_path):
     paths = {}
     for slot in SOUND_SLOTS:
         sound = sounds.get(slot)
-        if not isinstance(sound, dict):
+        if not isinstance(sound, dict) or "source" not in sound:
             continue
         path = (sound_root / sound["source"].strip()).resolve()
         if not path.is_relative_to(sound_root) or not path.is_file():
@@ -3504,7 +3505,7 @@ def validate_scene(settings):
                 try:
                     validate_sound_sample(sound)
                     sound_export_name(sound, slot)
-                    sound_reference_rpm(settings, slot, SOUND_SLOTS[slot])
+                    sound_reference_rpm(settings, slot)
                 except ValueError as error:
                     errors.append(f"Sound {slot}: {error}")
 
@@ -4581,6 +4582,12 @@ class CarExporterSettings(PropertyGroup):
         description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
         default=True,
     )
+    sound_traction_control_rpm: IntProperty(
+        name="RPM",
+        description="Reference engine speed for pitching the traction control sample",
+        default=4000,
+        min=1,
+    )
     sound_engine_start: PointerProperty(
         name="Engine Start",
         description="Starter sound datablock played while the engine is starting",
@@ -4612,6 +4619,23 @@ class CarExporterSettings(PropertyGroup):
         name="Volume",
         description="Playback volume multiplier for the gear grinding sound",
         default=0.8,
+        min=0.0,
+        soft_max=1.0,
+    )
+    sound_gear_change: PointerProperty(
+        name="Gear Change",
+        description="Sound datablock played each time the gear changes",
+        type=bpy.types.Sound,
+    )
+    sound_gear_change_enabled: BoolProperty(
+        name="Gear Change Enabled",
+        description="Use the default sound when no datablock is assigned, use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_gear_change_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the gear change sound",
+        default=1.0,
         min=0.0,
         soft_max=1.0,
     )
@@ -4726,6 +4750,91 @@ class CarExporterSettings(PropertyGroup):
         min=0.0,
         soft_max=10.0,
     )
+    sound_idle_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_off_low_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_off_mid_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_off_high_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_on_low_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_on_mid_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_on_high_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_tranny_off_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_tranny_on_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_limiter_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_turbo_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_backfire_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_traction_control_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_engine_start_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_gear_grinding_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_gear_change_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
+    sound_brake_squeal_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
 
 
 def clear_configuration_settings(settings):
@@ -4821,6 +4930,7 @@ def clear_configuration_settings(settings):
     for slot, meta in SOUND_SLOTS.items():
         setattr(settings, f"sound_{slot}_enabled", True)
         setattr(settings, f"sound_{slot}", None)
+        setattr(settings, f"sound_{slot}_override_volume", False)
         setattr(settings, f"sound_{slot}_volume", meta["volume"])
         if slot in SOUND_RPM_SLOTS:
             setattr(settings, f"sound_{slot}_rpm", meta["rpm"])
@@ -5158,18 +5268,22 @@ def compact_manifest_floats(value):
 def build_manifest(settings):
     sounds = {"pitchOffset": settings.sound_pitch_offset}
     if settings.use_custom_sounds:
-        for slot, meta in SOUND_SLOTS.items():
+        for slot in SOUND_SLOTS:
             if not getattr(settings, f"sound_{slot}_enabled"):
                 sounds[slot] = None
                 continue
             sound = getattr(settings, f"sound_{slot}")
             if sound is None:
+                sounds[slot] = {}
+                if getattr(settings, f"sound_{slot}_override_volume"):
+                    sounds[slot]["volume"] = getattr(settings, f"sound_{slot}_volume")
                 continue
-            sounds[slot] = {
-                "source": sound_export_name(sound, slot),
-                "rpm": sound_reference_rpm(settings, slot, meta),
-                "volume": getattr(settings, f"sound_{slot}_volume"),
-            }
+            sounds[slot] = {"source": sound_export_name(sound, slot)}
+            rpm = sound_reference_rpm(settings, slot)
+            if rpm is not None:
+                sounds[slot]["rpm"] = rpm
+            if getattr(settings, f"sound_{slot}_override_volume"):
+                sounds[slot]["volume"] = getattr(settings, f"sound_{slot}_volume")
 
     lights = build_lights_config(settings)
 
@@ -6873,7 +6987,11 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             if not isinstance(sound, dict):
                 self.report({"ERROR"}, f"Manifest sounds.{slot} must be an object or null")
                 return {"CANCELLED"}
-            if not isinstance(sound.get("source"), str) or not sound["source"].strip():
+            if "source" not in sound:
+                if "rpm" in sound:
+                    self.report({"ERROR"}, f"Manifest sounds.{slot}.rpm requires a source")
+                    return {"CANCELLED"}
+            elif not isinstance(sound["source"], str) or not sound["source"].strip():
                 self.report({"ERROR"}, f"Manifest sounds.{slot}.source must be a non-empty string")
                 return {"CANCELLED"}
             for field, default in (("rpm", 1000), ("volume", 1)):
@@ -6882,7 +7000,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     self.report({"ERROR"}, f"Manifest sounds.{slot}.{field} must be a finite non-negative number")
                     return {"CANCELLED"}
                 if field == "rpm" and slot in SOUND_RPM_SLOTS and value <= 0:
-                    self.report({"ERROR"}, f"Manifest sounds.{slot}.rpm must be positive for an engine sample")
+                    self.report({"ERROR"}, f"Manifest sounds.{slot}.rpm must be positive")
                     return {"CANCELLED"}
         body = data.get("body")
         if not isinstance(body, dict):
@@ -7166,6 +7284,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             sound = sounds.get(slot)
             setattr(settings, f"sound_{slot}_enabled", slot not in sounds or sound is not None)
             setattr(settings, f"sound_{slot}", loaded_sounds.get(slot))
+            setattr(settings, f"sound_{slot}_override_volume", isinstance(sound, dict) and "volume" in sound)
             if not isinstance(sound, dict):
                 continue
             setattr(settings, f"sound_{slot}_volume", sound.get("volume", meta["volume"]))
@@ -7832,9 +7951,15 @@ class CAR_EXPORTER_PT_car_export(Panel):
                 sound_picker = controls.split(factor=0.4, align=True)
                 sound_picker.label(text="Sound")
                 sound_picker.template_ID(settings, f"sound_{slot}", open="sound.open")
-                if slot in SOUND_RPM_SLOTS:
+                if slot in SOUND_RPM_SLOTS and getattr(settings, f"sound_{slot}") is not None:
                     draw_split_prop(controls, settings, f"sound_{slot}_rpm")
-                draw_split_prop(controls, settings, f"sound_{slot}_volume")
+                volume = controls.split(factor=0.4, align=True)
+                volume.label(text=settings.bl_rna.properties[f"sound_{slot}_volume"].name)
+                volume_row = volume.row(align=True)
+                volume_row.prop(settings, f"sound_{slot}_override_volume", text="")
+                volume_input = volume_row.row(align=True)
+                volume_input.enabled = getattr(settings, f"sound_{slot}_override_volume")
+                volume_input.prop(settings, f"sound_{slot}_volume", text="")
         box = layout.box()
         box.operator("car_exporter.remove_configuration", icon="TRASH")
 

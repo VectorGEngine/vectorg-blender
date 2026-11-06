@@ -387,20 +387,22 @@ Backfire
 Traction Control
 Engine Start
 Gear Grinding
+Gear Change
 Brake Squeal
 ```
 
-The game decides which samples loop. Engine Start, Gear Grinding, Turbo, and
-Backfire play once; every other slot loops. The exporter writes no `loop` flag, and
-manifest import ignores one. Backfire, Traction Control, Engine Start, Gear
-Grinding, and Brake Squeal have enabled and volume controls but no RPM reference.
+The game decides which samples loop. Engine Start, Gear Grinding, Gear Change,
+Turbo, and Backfire play once; every other slot loops. The exporter writes no `loop` flag, and
+manifest import ignores one. The engine samples and Traction Control have an RPM
+reference; every other slot has enabled and volume controls only.
 
 Backfire plays exhaust pops on high-rev throttle lifts, loaded upshifts, and the
 rev limiter. A custom Backfire sample must hold a weak pop within its first
 0.24 s followed by a strong pop; the game plays either pop alone or both.
 Traction Control loops while traction control cuts power. Its pitch and speed
-follow the vehicle's normalized engine RPM around the fixed reference the
-exporter writes, so one sample fits every rev range.
+follow the vehicle's normalized engine RPM around its RPM reference, so one
+sample fits every rev range.
+Gear Change plays each time the gear changes, including into neutral and reverse.
 
 **Pitch Offset (cents)** adjusts all loaded and off-throttle engine samples for
 the vehicle. It defaults to `0`; positive values raise pitch and negative values

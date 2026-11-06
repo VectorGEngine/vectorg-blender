@@ -10,7 +10,7 @@ import unittest
 
 
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
-NEW_SLOTS = ("idle", "on_mid", "off_mid", "backfire", "traction_control", "engine_start", "gear_grinding", "brake_squeal")
+NEW_SLOTS = ("idle", "on_mid", "off_mid", "backfire", "traction_control", "engine_start", "gear_grinding", "gear_change", "brake_squeal")
 SOUND_HELPERS = {
     "sound_sample_path", "sound_export_name", "validate_sound_sample",
     "export_sound_samples", "load_manifest_sound_samples",
@@ -92,8 +92,11 @@ class CarSoundTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(ADDON), "exec"), namespace)
         return namespace
 
-    def settings(self):
-        return SimpleNamespace(**self.defaults, use_custom_sounds=True)
+    def settings(self, override_volume=False):
+        settings = SimpleNamespace(**self.defaults, use_custom_sounds=True)
+        for slot in self.constants["SOUND_SLOTS"]:
+            setattr(settings, f"sound_{slot}_override_volume", override_volume)
+        return settings
 
     def export(self, settings):
         return self.execute(self.export_nodes, settings=settings)["sounds"]
@@ -108,8 +111,9 @@ class CarSoundTests(unittest.TestCase):
         namespace["self"] = SimpleNamespace(report=lambda _, message: errors.append(message))
         return namespace["validate"](), errors
 
-    def test_unassigned_optional_slots_are_omitted(self):
-        self.assertEqual(self.export(self.settings()), {"pitchOffset": 0})
+    def test_unassigned_slots_export_empty_default_entries(self):
+        self.assertEqual(self.export(self.settings()),
+                         {"pitchOffset": 0, **{slot: {} for slot in self.constants["SOUND_SLOTS"]}})
 
     def test_engine_reference_rpm_must_be_positive(self):
         for slot in self.constants["SOUND_RPM_SLOTS"]:
@@ -143,7 +147,7 @@ class CarSoundTests(unittest.TestCase):
         self.assertEqual(list(self.constants["SOUND_SLOTS"]), [
             "idle", "off_low", "off_mid", "off_high", "on_low", "on_mid", "on_high",
             "tranny_off", "tranny_on", "limiter", "turbo", "backfire", "traction_control",
-            "engine_start", "gear_grinding", "brake_squeal",
+            "engine_start", "gear_grinding", "gear_change", "brake_squeal",
         ])
         self.assertEqual({node.target.id for node in self.pointers},
                          {f"sound_{slot}" for slot in self.constants["SOUND_SLOTS"]})
@@ -155,12 +159,15 @@ class CarSoundTests(unittest.TestCase):
             self.assertEqual(self.defaults[f"sound_{slot}_enabled"], True)
             self.assertEqual(self.defaults[f"sound_{slot}_volume"], meta["volume"])
             self.assertEqual(f"sound_{slot}_rpm" in self.defaults, slot in self.constants["SOUND_RPM_SLOTS"])
+            self.assertEqual("rpm" in meta, slot in self.constants["SOUND_RPM_SLOTS"])
+            if slot in self.constants["SOUND_RPM_SLOTS"]:
+                self.assertEqual(self.defaults[f"sound_{slot}_rpm"], meta["rpm"])
 
     def test_new_slots_round_trip_custom_omitted_and_disabled(self):
         for slot in NEW_SLOTS:
             for mode in ("custom", "omitted", "disabled"):
                 with self.subTest(slot=slot, mode=mode):
-                    settings = self.settings()
+                    settings = self.settings(override_volume=mode == "custom")
                     if mode != "omitted":
                         setattr(settings, f"sound_{slot}", sound_datablock(f"//{slot}.wav", packed=b"audio"))
                     setattr(settings, f"sound_{slot}_enabled", mode != "disabled")
@@ -169,12 +176,15 @@ class CarSoundTests(unittest.TestCase):
                     setattr(settings, f"sound_{slot}_volume", 0.65)
                     sounds = self.export(settings)
                     if mode == "custom":
-                        rpm = 3200 if slot in self.constants["SOUND_RPM_SLOTS"] else self.constants["SOUND_SLOTS"][slot]["rpm"]
-                        self.assertEqual(sounds[slot], {"source": f"{slot}.wav", "rpm": rpm, "volume": 0.65})
+                        expected = {"source": f"{slot}.wav"}
+                        if slot in self.constants["SOUND_RPM_SLOTS"]:
+                            expected["rpm"] = 3200
+                        expected["volume"] = 0.65
+                        self.assertEqual(sounds[slot], expected)
                     elif mode == "disabled":
                         self.assertIsNone(sounds[slot])
                     else:
-                        self.assertNotIn(slot, sounds)
+                        self.assertEqual(sounds[slot], {})
                     imported = self.settings()
                     setattr(imported, f"sound_{slot}", sound_datablock("stale.wav"))
                     namespace = self.execute([])
@@ -185,6 +195,65 @@ class CarSoundTests(unittest.TestCase):
                     self.assertEqual(getattr(imported, f"sound_{slot}_enabled"), mode != "disabled")
                     self.assertIs(getattr(imported, f"sound_{slot}"), loaded.get(slot))
                     self.assertEqual(self.export(imported), sounds)
+
+    def test_override_volume_defaults_off(self):
+        for slot in self.constants["SOUND_SLOTS"]:
+            self.assertIs(self.defaults[f"sound_{slot}_override_volume"], False)
+
+    def test_default_sound_volume_override_round_trips(self):
+        for slot in self.constants["SOUND_SLOTS"]:
+            with self.subTest(slot=slot):
+                settings = self.settings(override_volume=True)
+                setattr(settings, f"sound_{slot}_volume", 0.65)
+                sounds = self.export(settings)
+                self.assertEqual(sounds[slot], {"volume": 0.65})
+                self.assertEqual(self.validate_import(sounds), (None, []))
+                self.assertEqual(self.execute([])["load_manifest_sound_samples"](sounds, self.root / "manifest.json"), {})
+                imported = self.settings()
+                self.execute([self.import_loop], settings=imported, sounds=sounds, loaded_sounds={})
+                self.assertIs(getattr(imported, f"sound_{slot}_override_volume"), True)
+                self.assertIsNone(getattr(imported, f"sound_{slot}"))
+                self.assertEqual(self.export(imported), sounds)
+
+    def test_override_off_or_custom_file_or_disabled_ignores_override(self):
+        settings = self.settings(override_volume=True)
+        settings.sound_idle = sound_datablock("//idle.wav", packed=b"audio")
+        settings.sound_limiter_enabled = False
+        sounds = self.export(settings)
+        self.assertEqual(sounds["idle"], {"source": "idle.wav", "rpm": 1000, "volume": settings.sound_idle_volume})
+        self.assertIsNone(sounds["limiter"])
+
+    def test_custom_sound_without_override_keeps_the_default_volume(self):
+        settings = self.settings(override_volume=False)
+        settings.sound_tranny_on = sound_datablock("//tranny.wav", packed=b"audio")
+        settings.sound_tranny_on_volume = 0.65
+        sounds = self.export(settings)
+        self.assertEqual(sounds["tranny_on"], {"source": "tranny_on.wav"})
+        self.execute([])["export_sound_samples"](settings, self.sound_dir)
+        loaded = self.execute([])["load_manifest_sound_samples"](sounds, self.root / "manifest.json")
+        imported = self.settings(override_volume=True)
+        self.execute([self.import_loop], settings=imported, sounds=sounds, loaded_sounds=loaded)
+        self.assertIs(imported.sound_tranny_on_override_volume, False)
+        self.assertEqual(self.export(imported), sounds)
+
+    def test_import_rejects_rpm_without_source(self):
+        result, errors = self.validate_import({"idle": {"rpm": 1000, "volume": 1}})
+        self.assertEqual(result, {"CANCELLED"})
+        self.assertIn("rpm requires a source", errors[0])
+
+    def test_empty_entry_imports_as_enabled_default_sound(self):
+        sounds = {"pitchOffset": 0, "engine_start": {}, "turbo": None}
+        self.assertEqual(self.validate_import(sounds), (None, []))
+        self.assertEqual(self.execute([])["load_manifest_sound_samples"](sounds, self.root / "manifest.json"), {})
+        imported = self.settings(override_volume=True)
+        self.execute([self.import_loop], settings=imported, sounds=sounds, loaded_sounds={})
+        self.assertIs(imported.sound_engine_start_enabled, True)
+        self.assertIs(imported.sound_engine_start_override_volume, False)
+        self.assertIsNone(imported.sound_engine_start)
+        self.assertIs(imported.sound_turbo_enabled, False)
+        exported = self.export(imported)
+        self.assertEqual(exported["engine_start"], {})
+        self.assertIsNone(exported["turbo"])
 
     def test_custom_sound_switch_still_omits_all_slots_when_disabled(self):
         settings = self.settings()
