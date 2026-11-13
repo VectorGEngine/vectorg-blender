@@ -739,7 +739,7 @@ The manifest records it as `"ambientShadow": { "obj": "AMBIENT_SHADOW" }`, or
 
 ## Lights
 
-Lights are optional. Leave all three lamp materials empty to export
+Lights are optional. Leave all four lamp materials empty to export
 `"lights": null`.
 
 Each light function has its own lamp material. The game turns the material's
@@ -748,14 +748,20 @@ every LOD level included:
 
 | Material | Glows at its Full Emission |
 | --- | --- |
-| **Headlights / Tail Lights** | with the light switch on |
+| **Headlights** | with the light switch on |
+| **Tail Lights** | with the light switch on (its **Tail Lights** emission) |
 | **Brake Lights** | while braking |
 | **Reverse Lights** | in reverse gear |
+
+The Tail Lights material has a second emission, **Brake Lights**, that it glows
+at while braking, for tail lamps that double as brake lamps. It starts at 0,
+which leaves the tail lamps to the light switch. With the lights on while
+braking, the brighter of the two shows.
 
 Lamps on any other material (indicators, fog lights) never light. A function
 without a material is allowed; Validate Car warns about it.
 
-1. Assign the three materials to the lamp meshes, on every LOD level, and pick
+1. Assign the four materials to the lamp meshes, on every LOD level, and pick
    them in the Lights panel. Each material needs an **Emission Strength** above
    0 and its emission colour or texture; the game multiplies it by **Full
    Emission**.
@@ -765,7 +771,8 @@ without a material is allowed; Validate Car warns about it.
    down. Click **+** beside **Rear Lamp** and move it onto one tail lamp. The
    game mirrors both markers across the car's centre line; any empty beneath
    Car Root can be picked instead.
-3. Set each function's **Full Emission**.
+3. Set each function's **Full Emission**, and the tail lamps' **Brake Lights**
+   emission if they also light while braking.
 
 The markers are authoring helpers and are left out of the GLB. The game lights
 the road with one shaped spotlight on the car's centre line at the front
@@ -777,8 +784,8 @@ ghosts.
 ```json
 {
   "lights": {
-    "materials": { "lights": "Lamp_Lights", "brake": "Lamp_Brake", "reverse": "Lamp_Reverse" },
-    "emission": { "lights": 10, "brake": 4, "reverse": 4 },
+    "materials": { "headlights": "Lamp_Head", "tail": "Lamp_Tail", "brake": "Lamp_Brake", "reverse": "Lamp_Reverse" },
+    "emission": { "headlights": 10, "tail": 2, "tailBrake": 0, "brake": 4, "reverse": 4 },
     "front": { "position": [0.645, 0.552, 1.7], "direction": [0, -0.06, 0.998] },
     "rear": { "position": [0.52, 0.743, -1.85] }
   }

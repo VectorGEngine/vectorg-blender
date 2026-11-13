@@ -319,9 +319,18 @@ def game_position_to_blender(position):
 
 
 LIGHT_ROLES = (
-    ("lights", "lights", "Headlights / Tail Lights"),
+    ("headlights", "headlights", "Headlights"),
+    ("tail", "tail", "Tail Lights"),
     ("brake", "brake", "Brake Lights"),
     ("reverse", "reverse", "Reverse Lights"),
+)
+# Each lamp material's full emission (manifest key, setting prefix); the tail lamps also glow while braking.
+LIGHT_EMISSIONS = (
+    ("headlights", "headlights"),
+    ("tail", "tail"),
+    ("tailBrake", "tail_brake"),
+    ("brake", "brake"),
+    ("reverse", "reverse"),
 )
 LIGHT_MARKER_PROP = "vectorg_light_marker"
 LIGHT_MARKERS = (("front", "front_light_marker", "LAMP_FRONT", "Front Lamp"), ("rear", "rear_light_marker", "LAMP_REAR", "Rear Lamp"))
@@ -340,8 +349,8 @@ def light_helper_objects():
 
 
 def parse_lights_config(value):
-    """The manifest's lamps: a lamp material and full emission per function, and the front and rear
-    markers; or None. Mirrors the game's reader."""
+    """The manifest's lamps: a lamp material and full emission per function, the tail lamps' emission
+    while braking, and the front and rear markers; or None. Mirrors the game's reader."""
     if value is None:
         return None
     if not isinstance(value, dict) or set(value) != {"materials", "emission", "front", "rear"}:
@@ -371,8 +380,9 @@ def parse_lights_config(value):
         raise ValueError("Manifest lights.materials needs at least one lamp material")
     if len(set(named)) != len(named):
         raise ValueError("Manifest lights.materials must name a different material per function")
-    if not isinstance(emission, dict) or set(emission) != set(roles):
-        raise ValueError(f"Manifest lights.emission must have exactly {', '.join(roles)}")
+    emissions = [key for key, _prefix in LIGHT_EMISSIONS]
+    if not isinstance(emission, dict) or set(emission) != set(emissions):
+        raise ValueError(f"Manifest lights.emission must have exactly {', '.join(emissions)}")
     if not isinstance(front, dict) or set(front) != {"position", "direction"}:
         raise ValueError("Manifest lights.front must have exactly position and direction")
     direction = vector(front["direction"], "front.direction")
@@ -385,7 +395,7 @@ def parse_lights_config(value):
         raise ValueError("Manifest lights.rear must have exactly position")
     return {
         "materials": {role: materials[role] for role in roles},
-        "emission": {role: number(emission[role], f"emission.{role}") for role in roles},
+        "emission": {key: number(emission[key], f"emission.{key}") for key in emissions},
         "front": {"position": vector(front["position"], "front.position"),
                   "direction": [component / length for component in direction]},
         "rear": {"position": vector(rear["position"], "rear.position")},
@@ -435,7 +445,7 @@ def build_lights_config(settings):
     (front, aim), (rear, _rear_aim) = markers["front"], markers["rear"]
     return parse_lights_config({
         "materials": {role: material.name if material else None for role, material in materials.items()},
-        "emission": {role: getattr(settings, f"{prefix}_emissive_intensity") for role, prefix, _label in LIGHT_ROLES},
+        "emission": {key: getattr(settings, f"{prefix}_emissive_intensity") for key, prefix in LIGHT_EMISSIONS},
         "front": {"position": front, "direction": aim},
         "rear": {"position": rear},
     })
@@ -493,7 +503,7 @@ def place_light_marker(context, settings, key, position, direction=None):
 
 
 def import_lights_config(context, settings, config):
-    """Restores each function's lamp material and full emission, and both markers."""
+    """Restores each function's lamp material and full emissions, and both markers."""
     if config is None:
         for _role, prefix, _label in LIGHT_ROLES:
             setattr(settings, f"{prefix}_material", None)
@@ -502,7 +512,8 @@ def import_lights_config(context, settings, config):
         raise ValueError("Manifest car root object is required to import lights")
     for role, prefix, _label in LIGHT_ROLES:
         set_material_pointer(settings, f"{prefix}_material", config["materials"][role])
-        setattr(settings, f"{prefix}_emissive_intensity", config["emission"][role])
+    for key, prefix in LIGHT_EMISSIONS:
+        setattr(settings, f"{prefix}_emissive_intensity", config["emission"][key])
     place_light_marker(context, settings, "front", config["front"]["position"], config["front"]["direction"])
     place_light_marker(context, settings, "rear", config["rear"]["position"])
 
@@ -3778,9 +3789,14 @@ class CarExporterSettings(PropertyGroup):
     )
     # Retained as hidden migration sources for blend files saved with preset schema 4.
     max_degrees_of_rotation: FloatProperty(default=540.0, min=90.0, max=2160.0, options={"HIDDEN"})
-    lights_material: PointerProperty(
-        name="Headlights / Tail Lights",
-        description="Material of the headlamps and tail lamps: glows with the light switch",
+    headlights_material: PointerProperty(
+        name="Headlights",
+        description="Material of the headlamps: glows with the light switch",
+        type=bpy.types.Material,
+    )
+    tail_material: PointerProperty(
+        name="Tail Lights",
+        description="Material of the tail lamps: glows with the light switch, and while braking at its Brake Lights emission",
         type=bpy.types.Material,
     )
     brake_material: PointerProperty(
@@ -3806,8 +3822,13 @@ class CarExporterSettings(PropertyGroup):
         type=bpy.types.Object,
         poll=light_marker_poll,
     )
-    lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
-                                             description="Headlamp and tail lamp glow with the light switch on")
+    headlights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                                 description="Headlamp glow with the light switch on")
+    tail_emissive_intensity: FloatProperty(name="Tail Lights", default=10.0, min=0.0,
+                                           description="Tail lamp glow with the light switch on")
+    tail_brake_emissive_intensity: FloatProperty(name="Brake Lights", default=0.0, min=0.0,
+                                                 description="Tail lamp glow while braking; 0 leaves the tail lamps "
+                                                             "to the light switch. With both on, the brighter shows")
     brake_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
                                             description="Brake lamp glow while braking")
     reverse_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
@@ -4508,7 +4529,8 @@ def clear_configuration_settings(settings):
     settings.active_body_color_index = 0
     for _role, prefix, _label in LIGHT_ROLES:
         setattr(settings, f"{prefix}_material", None)
-        setattr(settings, f"{prefix}_emissive_intensity", 10.0)
+    for _key, prefix in LIGHT_EMISSIONS:
+        setattr(settings, f"{prefix}_emissive_intensity", 0.0 if prefix == "tail_brake" else 10.0)
     settings.dashboard_screen_object = None
     settings.colliders.clear()
     settings.down_force_points.clear()
@@ -7481,6 +7503,8 @@ def draw_vehicle_lights(layout, settings):
         emission = box.column()
         emission.enabled = getattr(settings, f"{prefix}_material") is not None
         draw_split_prop(emission, settings, f"{prefix}_emissive_intensity")
+        if prefix == "tail":
+            draw_split_prop(emission, settings, "tail_brake_emissive_intensity")
     if not any(lamp_materials(settings).values()):
         layout.label(text="No lamp materials: the car exports without lights")
         return

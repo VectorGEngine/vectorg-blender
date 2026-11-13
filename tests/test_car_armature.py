@@ -385,7 +385,7 @@ class ArmatureTests(unittest.TestCase):
     def test_manifest_omits_disabled_section_and_keeps_existing_wheels(self):
         settings = self.settings
         defaults = dict(
-            sound_pitch_offset=0, use_custom_sounds=False, lights_material=None,
+            sound_pitch_offset=0, use_custom_sounds=False, headlights_material=None, tail_material=None,
             brake_material=None, reverse_material=None,
             dashboard_screen_object=None, center_of_mass_object=None, colliders=[],
             down_force_points=[], drag_per_downforce=0.2, air_drag=1, body_colors=[], car_id="test",
