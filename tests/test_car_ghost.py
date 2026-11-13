@@ -10,7 +10,7 @@ ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__ini
 FUNCTIONS = {
     "find_object", "object_config_name", "set_object_pointer", "hierarchy_objects",
     "lod_name_level", "lod_level_row", "car_lod_meshes", "exported_lod_levels", "lod_dropped_objects",
-    "lod_part_key", "lod_object_ranges", "ghost_lod_position", "build_lods_config", "parse_lods_config",
+    "lod_object_ranges", "ghost_lod_position", "build_lods_config", "parse_lods_config",
     "import_lods_config", "sync_lod_level_rows", "validate_lods_scene", "build_ghost_config",
     "parse_ghost_config", "import_ghost_config", "validate_ghost_helper", "validate_ghost_scene",
     "is_object_in_tree", "in_car_body",
@@ -104,21 +104,20 @@ class LodTests(unittest.TestCase):
         self.assertEqual(self.names(found[1]), ["Badge_LOD1", "Body_LOD1", "Wheel_LOD1"])
         self.assertEqual([row.level for row in self.settings.lod_levels], [0, 1, 2])
 
-    def test_parts_keep_their_last_mesh_and_start_where_their_first_is(self):
+    def test_each_level_shows_its_own_meshes_only(self):
         self.assertEqual(self.ranges(), {
             "Body_LOD0": (0, 0), "Body_LOD1": (1, 1), "Body_LOD2": (2, 2),
-            "Wheel_LOD0": (0, 0), "Wheel_LOD1": (1, 2), "Badge_LOD1": (1, 2),
+            "Wheel_LOD0": (0, 0), "Wheel_LOD1": (1, 1), "Badge_LOD1": (1, 1),
         })
         errors, warnings = self.validate()
         self.assertEqual(errors, [])
-        self.assertIn("Wheel: no LOD2, keeps LOD1", warnings)
-        self.assertIn("Badge: starts at LOD1, not shown at finer levels", warnings)
+        self.assertFalse([warning for warning in warnings if "LOD" in warning], "parts may end or start at any level")
 
     def test_unticked_levels_are_skipped_and_dropped(self):
         self.call("lod_level_row", self.settings, 1).export = False
         self.assertEqual(self.call("exported_lod_levels", self.settings), [0, 2])
         self.assertEqual(self.names(self.call("lod_dropped_objects", self.settings)), ["Badge_LOD1", "Body_LOD1", "Wheel_LOD1"])
-        self.assertEqual(self.ranges()["Wheel_LOD0"], (0, 1), "the wheel keeps LOD0 at the next exported level")
+        self.assertEqual(self.ranges()["Wheel_LOD0"], (0, 0), "the wheel has no mesh at the next exported level")
         self.assertEqual(self.ranges()["Body_LOD2"], (1, 1))
         # LOD0 always exports.
         self.call("lod_level_row", self.settings, 0).export = False

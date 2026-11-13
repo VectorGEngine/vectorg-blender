@@ -612,10 +612,9 @@ per level found under Car Root:
   smaller than the level before; below the last exported level's value the car is
   not drawn.
 
-A part that has no mesh at a coarser level keeps showing its last mesh; a part
-whose first mesh is at a coarser level shows nothing before it. Validate Car warns
-about both. With **LODs** unchecked only LOD0 and meshes without the suffix
-export. **Merge Meshes** never joins meshes of different levels.
+Each level shows only its own meshes: a part without a mesh at a level is not
+drawn there, so a coarse level may be a single mesh for the whole car. With
+**LODs** unchecked only LOD0 and meshes without the suffix export. **Merge Meshes** never joins meshes of different levels.
 
 The manifest lists the exported levels, finest first, with their screen height as
 a fraction, the ghost default level's position among them, and the level positions
@@ -753,10 +752,10 @@ every LOD level included:
 | **Brake Lights** | while braking |
 | **Reverse Lights** | in reverse gear |
 
-The Tail Lights material has a second emission, **Brake Lights**, that it glows
-at while braking, for tail lamps that double as brake lamps. It starts at 0,
+The Tail Lights material has a second emission, **Brake Lights**, added to its
+glow while braking, for tail lamps that double as brake lamps. It starts at 0,
 which leaves the tail lamps to the light switch. With the lights on while
-braking, the brighter of the two shows.
+braking the tail lamps glow at the sum of both.
 
 Lamps on any other material (indicators, fog lights) never light. A function
 without a material is allowed; Validate Car warns about it.

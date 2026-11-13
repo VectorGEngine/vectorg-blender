@@ -781,30 +781,14 @@ def lod_dropped_objects(settings):
     return [obj for level, objects in found.items() if level not in exported for obj in objects]
 
 
-def lod_part_key(obj):
-    """A LOD mesh's part: its parent and its name without the level suffix."""
-    return (obj.parent.name if obj.parent else "", lod_name_level(obj.name)[0])
-
-
 def lod_object_ranges(settings):
-    """{mesh: (first, last)}: the exported level positions each exported LOD mesh shows at. A part shows a
-    mesh from its level up to the part's next exported level, and its last mesh at every coarser level."""
+    """{mesh: (first, last)}: the exported level positions each exported LOD mesh shows at. Each level
+    shows its own meshes only: a part without a mesh at a level is not drawn there."""
     found = car_lod_meshes(settings)
     levels = exported_lod_levels(settings, found)
     position = {level: index for index, level in enumerate(levels)}
-    parts = {}
-    for level, objects in found.items():
-        if level not in position:
-            continue
-        for obj in objects:
-            parts.setdefault(lod_part_key(obj), {}).setdefault(position[level], []).append(obj)
-    ranges = {}
-    for by_position in parts.values():
-        positions = sorted(by_position)
-        for current, following in zip(positions, positions[1:] + [len(levels)]):
-            for obj in by_position[current]:
-                ranges[obj] = (current, following - 1)
-    return ranges
+    return {obj: (position[level], position[level]) for level, objects in found.items() if level in position
+            for obj in objects}
 
 
 def ghost_lod_position(settings):
@@ -2023,18 +2007,6 @@ def validate_lods_scene(settings, errors, warnings):
             previous = (level, height)
     if ghost_lod_position(settings) is None:
         errors.append(f"Ghost Default LOD{settings.ghost_lod} is not an exported level")
-    # Parts that end early keep their last mesh at coarser levels; parts that start late show nothing before.
-    position = {level: index for index, level in enumerate(levels)}
-    parts = {}
-    for level, objects in found.items():
-        if level in position:
-            for obj in objects:
-                parts.setdefault(lod_part_key(obj), set()).add(level)
-    for (_parent, part), part_levels in sorted(parts.items()):
-        if max(part_levels) < levels[-1]:
-            warnings.append(f"{part}: no LOD{levels[-1]}, keeps LOD{max(part_levels)}")
-        if min(part_levels) > levels[0]:
-            warnings.append(f"{part}: starts at LOD{min(part_levels)}, not shown at finer levels")
 
 
 def objects_with_unapplied_scale(root_obj):
@@ -3827,8 +3799,8 @@ class CarExporterSettings(PropertyGroup):
     tail_emissive_intensity: FloatProperty(name="Tail Lights", default=10.0, min=0.0,
                                            description="Tail lamp glow with the light switch on")
     tail_brake_emissive_intensity: FloatProperty(name="Brake Lights", default=0.0, min=0.0,
-                                                 description="Tail lamp glow while braking; 0 leaves the tail lamps "
-                                                             "to the light switch. With both on, the brighter shows")
+                                                 description="Tail lamp glow added while braking; 0 leaves the tail "
+                                                             "lamps to the light switch")
     brake_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
                                             description="Brake lamp glow while braking")
     reverse_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
@@ -6345,14 +6317,10 @@ def create_body_material_export_carrier(context):
 
     carrier = bpy.data.objects.new(BODY_MATERIAL_CARRIER_NAME, mesh)
     context.scene.collection.objects.link(carrier)
-    default_material = settings.body_colors[0].material if settings.body_colors else None
-    carrier_parent = object_with_assigned_material(default_material, car_objects)
-    if carrier_parent:
-        carrier.parent = carrier_parent
-        carrier.location = carrier_parent.data.vertices[0].co
-    elif settings.car_root_object:
-        carrier.parent = settings.car_root_object
-        carrier.location = (0.0, 0.0, 0.0)
+    # Directly under Car Root: beneath any other node it would go with it when the game drops that node
+    # (colliders, shadows, finer LODs).
+    carrier.parent = settings.car_root_object
+    carrier.location = (0.0, 0.0, 0.0)
     return carrier
 
 
@@ -7597,8 +7565,6 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.separator(type="LINE")
         draw_body_colors(box, settings)
 
-        draw_lods(layout.box(), settings)
-
         box = layout.box()
         box.label(text="Colliders")
         draw_colliders(box, settings)
@@ -7628,6 +7594,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_cameras(box, settings)
 
         draw_armature(layout.box(), settings)
+
+        draw_lods(layout.box(), settings)
 
         draw_ghost(layout.box(), settings)
 
