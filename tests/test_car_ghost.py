@@ -170,9 +170,9 @@ class LodTests(unittest.TestCase):
 
     def test_screen_heights_must_be_set_and_fall(self):
         self.call("lod_level_row", self.settings, 2).screen_height = 0.0
-        self.assertIn("LOD2 needs a Show Above Screen Height value", self.validate()[0])
+        self.assertIn("LOD2 needs a Screen Size value", self.validate()[0])
         self.call("lod_level_row", self.settings, 2).screen_height = 30.0
-        self.assertIn("LOD2 must show above a smaller screen height than LOD1", self.validate()[0])
+        self.assertIn("LOD2 needs a smaller Screen Size than LOD1", self.validate()[0])
 
     def test_ghost_level_must_export_and_ghost_shadows_sit_on_the_car_root(self):
         self.call("lod_level_row", self.settings, 1).export = False

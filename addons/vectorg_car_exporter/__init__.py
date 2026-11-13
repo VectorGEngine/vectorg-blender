@@ -2116,9 +2116,9 @@ def validate_lods_scene(settings, errors, warnings):
         row = lod_level_row(settings, level)
         height = row.screen_height if row else 0.0
         if height <= 0.0:
-            errors.append(f"LOD{level} needs a Show Above Screen Height value")
+            errors.append(f"LOD{level} needs a Screen Size value")
         elif previous is not None and height >= previous[1]:
-            errors.append(f"LOD{level} must show above a smaller screen height than LOD{previous[0]}")
+            errors.append(f"LOD{level} needs a smaller Screen Size than LOD{previous[0]}")
         if height > 0.0:
             previous = (level, height)
     if ghost_lod_position(settings) is None:
@@ -2434,11 +2434,14 @@ def with_helpers_unlinked(callback, excluded_objects=()):
 
 
 class ExportExclusion:
-    """An object's collections and parent link, held while it is kept out of an export."""
+    """An object's collections, parent link and eye, held while it is kept out of an export. Unlinking
+    drops the object's place in the view layer, which holds the eye, so relinking sets it again."""
 
     def __init__(self, obj):
         self.obj = obj
         self.collections = list(obj.users_collection)
+        view_layer = bpy.context.view_layer
+        self.hidden = obj.hide_get(view_layer=view_layer) if obj.name in view_layer.objects else None
         self.parent = obj.parent
         self.parent_type = obj.parent_type
         self.parent_bone = obj.parent_bone
@@ -2466,6 +2469,7 @@ def unlink_export_helpers(states):
 
 
 def relink_export_helpers(states):
+    view_layer = bpy.context.view_layer
     for state in states:
         obj = state.obj
         if obj.name not in bpy.data.objects:
@@ -2478,6 +2482,12 @@ def relink_export_helpers(states):
             obj.parent_type = state.parent_type
             obj.parent_bone = state.parent_bone
             obj.matrix_parent_inverse = state.matrix_parent_inverse
+    # The view layer lists relinked objects only after an update; set their eyes after it.
+    view_layer.update()
+    for state in states:
+        obj = state.obj
+        if state.hidden is not None and obj.name in bpy.data.objects and obj.name in view_layer.objects:
+            obj.hide_set(state.hidden, view_layer=view_layer)
 
 
 def node_trees(root_tree):
@@ -3436,7 +3446,7 @@ class CarLodLevelSettings(PropertyGroup):
         default=True,
     )
     screen_height: FloatProperty(
-        name="Show Above Screen Height (%)",
+        name="Screen Size (%)",
         description="The level shows while the car is taller on screen than this share of the screen height; "
                     "below the last exported level's share the car is not drawn",
         default=0.0,
@@ -7386,6 +7396,17 @@ def sync_lod_level_rows_later():
     return None
 
 
+# Width of each LODs table column in UI units: unfold, eye, export, level, screen size, meshes, triangles.
+LOD_COLUMN_UNITS = (1.2, 1.2, 1.2, 2.8, 8.0, 2.4, 3.2)
+
+
+def lod_cell(row, index):
+    """One LODs table cell, as wide as its column, so the header and level rows line up."""
+    cell = row.row(align=True)
+    cell.ui_units_x = LOD_COLUMN_UNITS[index]
+    return cell
+
+
 def draw_lods(layout, settings):
     header = layout.row(align=True)
     header.alignment = "LEFT"
@@ -7404,31 +7425,32 @@ def draw_lods(layout, settings):
         if not bpy.app.timers.is_registered(sync_lod_level_rows_later):
             bpy.app.timers.register(sync_lod_level_rows_later, first_interval=0.0)
     columns = layout.row(align=True)
-    for text, factor in (("", 0.06), ("", 0.06), ("", 0.06), ("Level", 0.14), ("Show Above Screen Height (%)", 0.4),
-                         ("Meshes", 0.12), ("Triangles", 0.16)):
-        cell = columns.row()
-        cell.ui_units_x = factor * 20
-        cell.label(text=text)
+    for index, text in enumerate(("", "", "", "Level", "Screen Size (%)", "Meshes", "Triangles")):
+        lod_cell(columns, index).label(text=text)
     exported = set(exported_lod_levels(settings, found))
     for level, objects in found.items():
         row_settings = lod_level_row(settings, level)
         if row_settings is None:
             continue
         row = layout.row(align=True)
-        row.prop(row_settings, "expanded", text="", emboss=False,
-                 icon="TRIA_DOWN" if row_settings.expanded else "TRIA_RIGHT")
+        lod_cell(row, 0).prop(row_settings, "expanded", text="", emboss=False,
+                              icon="TRIA_DOWN" if row_settings.expanded else "TRIA_RIGHT")
         visible = any(obj.visible_get() for obj in objects)
-        row.operator("car_exporter.toggle_lod_visibility", text="", emboss=False,
-                     icon="HIDE_OFF" if visible else "HIDE_ON").level = level
-        export = row.row(align=True)
+        lod_cell(row, 1).operator("car_exporter.toggle_lod_visibility", text="", emboss=False,
+                                  icon="HIDE_OFF" if visible else "HIDE_ON").level = level
+        export = lod_cell(row, 2)
         export.enabled = level != 0
         export.prop(row_settings, "export", text="")
-        values = row.row(align=True)
-        values.active = level in exported
-        values.label(text=f"LOD{level}")
-        values.prop(row_settings, "screen_height", text="")
-        values.label(text=str(len(objects)))
-        values.label(text=f"{sum(mesh_triangle_count(obj.data) for obj in objects):,}")
+        active = level in exported
+        for index, draw in (
+            (3, lambda cell: cell.label(text=f"LOD{level}")),
+            (4, lambda cell: cell.prop(row_settings, "screen_height", text="")),
+            (5, lambda cell: cell.label(text=str(len(objects)))),
+            (6, lambda cell: cell.label(text=f"{sum(mesh_triangle_count(obj.data) for obj in objects):,}")),
+        ):
+            cell = lod_cell(row, index)
+            cell.active = active
+            draw(cell)
         if row_settings.expanded:
             meshes = layout.box().column(align=True)
             for obj in objects:

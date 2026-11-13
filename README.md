@@ -607,7 +607,7 @@ per level found under Car Root:
   level alone. Hidden LOD meshes still export.
 - The checkbox exports the level; an unticked level is skipped and its meshes stay
   in the `.blend`. LOD0 always exports.
-- **Show Above Screen Height (%)**: the level shows while the car's bounding
+- **Screen Size (%)**: the level shows while the car's bounding
   sphere spans at least this share of the screen height. Each level needs a value
   smaller than the level before; below the last exported level's value the car is
   not drawn.
