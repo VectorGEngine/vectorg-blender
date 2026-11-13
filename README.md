@@ -91,7 +91,7 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
       "wheels": {
         "front": {
           "l": {
-            "tireType": "medium",
+            "tireType": "mixed",
             "pressure": 2.0,
             "camber": -4.0,
             "caster": 6.0,
@@ -202,8 +202,9 @@ braking and grip configuration. Each assist level is an
 integer from zero through the car-wide `driverAssists.<assist>.maxLevel`, and
 runtime strength is `level / maxLevel`. New exporter configurations default
 every maximum level to 5. The current game uses the first preset. Tire type is
-`soft`, `medium`, `hard`, `wet`, or `snow`, with `medium` as the default.
-Wet tires specialize in wet roads; Snow tires represent studless winter tires
+`tarmac`, `mixed`, `gravel`, `wet`, or `snow`, with `mixed` as the default.
+Tarmac and Gravel tires specialize in their surface and Mixed sits between
+them; Wet tires specialize in wet roads; Snow tires represent studless winter tires
 for snow and ice. Grip tables are configured in the game.
 
 **Bump Travel** and **Droop Travel** are required, positive distances in metres

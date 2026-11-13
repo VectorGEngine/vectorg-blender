@@ -88,9 +88,9 @@ ARMATURE_ATTACHMENT_ITEMS = tuple(
 ARMATURE_TIP_ITEMS = (("none", "None", "Follow Base Attachment without aiming"),) + ARMATURE_ATTACHMENT_ITEMS
 
 TIRE_TYPE_ITEMS = (
-    ("soft", "Soft", "Highest configured dry-road tire grip"),
-    ("medium", "Medium", "Balanced configured tire grip"),
-    ("hard", "Hard", "Lowest configured dry-road tire grip"),
+    ("tarmac", "Tarmac", "Tire grip optimized for tarmac roads"),
+    ("mixed", "Mixed", "Tire grip balanced between tarmac and gravel"),
+    ("gravel", "Gravel", "Tire grip optimized for gravel and loose roads"),
     ("wet", "Wet", "Tire grip optimized for wet roads"),
     ("snow", "Snow", "Studless winter tire grip optimized for snow and ice"),
 )
@@ -3471,7 +3471,7 @@ class CarWheelPresetSettings(PropertyGroup):
         name="Tire Compound",
         description="Tire compound used to determine available grip",
         items=TIRE_TYPE_ITEMS,
-        default="medium",
+        default="mixed",
     )
     pressure: FloatProperty(
         name="Tire Pressure (bar)",
@@ -6121,7 +6121,7 @@ def ensure_default_wheels(settings):
 def default_wheel_preset_values(group):
     front_wheel = group == "front"
     return {
-        "tire_type": "medium",
+        "tire_type": "mixed",
         "pressure": 2.0,
         "camber": -4.0 if front_wheel else -3.0,
         "caster": 6.0 if front_wheel else 0.0,
@@ -6201,7 +6201,7 @@ def ensure_preset_wheels(preset, source_wheels=None):
     }
     legacy = {
         (wheel.group, wheel.key): {
-            "tire_type": "medium",
+            "tire_type": "mixed",
             "pressure": wheel.pressure,
             "camber": wheel.camber,
             "caster": 0.0,
@@ -7169,7 +7169,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                 group_wheels = preset_wheels.get(group) or {}
                 wheel_data = group_wheels.get("l") or group_wheels.get("r") or {}
                 wheel = getattr(preset, group)
-                wheel.tire_type = wheel_data.get("tireType", "medium")
+                wheel.tire_type = wheel_data.get("tireType", "mixed")
                 wheel.pressure = wheel_data.get("pressure", 2.0)
                 wheel.camber = wheel_data.get("camber", -4.0 if group == "front" else -3.0)
                 wheel.caster = wheel_data.get("caster", 0.0)
