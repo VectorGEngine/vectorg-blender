@@ -827,6 +827,32 @@ They light from the outside edges toward the center as RPM rises: green, green,
 amber, amber, then red. At the rev limiter all ten LEDs flash together. Gear is
 centered, lap timing is at the bottom left, and speed is at the bottom right.
 
+## Gauge Needles
+
+**Dashboard > RPM Needle** and **Dashboard > Speed Needle** each take an action
+that sweeps a needle from the dial's zero at the action's first frame to its top
+mark at the last frame. **Dial Max (RPM)**, **Dial Unit** and **Dial Max** give
+the value at that top mark. Both are optional; empty pickers export nothing.
+
+The action must be the active action, or the only unmuted strip on an NLA track,
+of an object under Car Root. The objects it moves always export and anchor mesh
+merging like other moving nodes. Only the picked actions export, each as one
+glTF animation named after the action and sampled every frame; every other
+action, the armature's included, stays out of the GLB.
+
+```json
+{
+  "dashboard": {
+    "rpmNeedle": { "animation": "needle_rpm", "max": 8000 },
+    "speedNeedle": { "animation": "needle_speed", "max": 260, "unit": "km/h" }
+  }
+}
+```
+
+The player's car and replays smooth RPM and speed, then pose each needle at
+`value / max` of its animation's range, held at both ends. Ghosts and
+multiplayer cars leave the needles still.
+
 ## Export
 
 Use `Validate Car` first, then `Export Car Zip`.

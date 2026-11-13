@@ -899,6 +899,7 @@ def car_reference_objects(settings):
     )
     if settings.armature_object:
         refs.append(settings.armature_object)
+    refs.extend(needle_objects(settings))
     return {obj for obj in refs if obj}
 
 
@@ -984,13 +985,132 @@ class glTF2ExportUserExtension:
 
 
 def export_car_gltf(settings, **options):
-    """Blender's glTF export of the scene, leaving out the hidden car objects."""
+    """Blender's glTF export of the scene, leaving out the hidden car objects. The needle actions are the only
+    animations it writes."""
     global car_export_hidden_names
     car_export_hidden_names = {obj.name for obj in hidden_export_objects(settings)}
+    keep = needle_actions(settings)
+    restore_filter = set_gltf_action_filter(keep) if keep else None
     try:
-        return bpy.ops.export_scene.gltf(**options)
+        # The action filter keeps every other action out, the rig's included.
+        return bpy.ops.export_scene.gltf(**{**options, **gltf_animation_export_options(keep)})
     finally:
         car_export_hidden_names = None
+        if restore_filter:
+            restore_filter()
+
+
+def needle_actions(settings):
+    """The picked needle actions, RPM first."""
+    return [action for action in (settings.rpm_needle_action, settings.speed_needle_action) if action]
+
+
+def gltf_animation_export_options(keep):
+    """glTF animation options: off without needle actions; otherwise each kept action becomes one animation
+    named after it, sampled every frame over its own range."""
+    if not keep:
+        return {"export_animations": False}
+    return {
+        "export_animations": True,
+        "export_animation_mode": "ACTIONS",
+        "export_action_filter": True,
+        "export_nla_strips": True,
+        "export_merge_animation": "ACTION",
+        "export_extra_animations": False,
+        "export_bake_animation": False,
+        "export_force_sampling": True,
+        "export_frame_step": 1,
+        "export_frame_range": False,
+        "export_anim_slide_to_zero": False,
+        "export_optimize_animation_keep_anim_object": True,
+        "export_morph_animation": False,
+        "export_pointer_animation": False,
+    }
+
+
+def set_gltf_action_filter(keep):
+    """Marks every action but `keep` as skipped in the glTF add-on's action filter, which it reads from the first
+    scene. Returns a function that puts the filter back as it was."""
+    import io_scene_gltf2
+
+    added = not hasattr(bpy.types.Scene, "gltf_action_filter")
+    if added:
+        bpy.types.Scene.gltf_action_filter = CollectionProperty(type=io_scene_gltf2.GLTF2_filter_action)
+        bpy.types.Scene.gltf_action_filter_active = IntProperty()
+    scene = bpy.data.scenes[0]
+    saved = [(item.action, item.keep) for item in scene.gltf_action_filter]
+    scene.gltf_action_filter.clear()
+    for action in bpy.data.actions:
+        item = scene.gltf_action_filter.add()
+        item.action = action
+        item.keep = action in keep
+
+    def restore():
+        scene.gltf_action_filter.clear()
+        if added:
+            del bpy.types.Scene.gltf_action_filter
+            del bpy.types.Scene.gltf_action_filter_active
+            return
+        for action, kept in saved:
+            item = scene.gltf_action_filter.add()
+            item.action = action
+            item.keep = kept
+
+    return restore
+
+
+def action_animates(obj, action):
+    """Whether the glTF export takes `action` from `obj`: its active action, or the one unmuted strip of one of
+    its NLA tracks."""
+    data = obj.animation_data
+    if not data:
+        return False
+    if data.action == action:
+        return True
+    for track in data.nla_tracks:
+        strips = [strip for strip in track.strips if strip.action and not strip.mute]
+        if len(strips) == 1 and strips[0].action == action:
+            return True
+    return False
+
+
+def needle_objects(settings, actions=None):
+    """Objects under Car Root, the root included, that a needle action moves."""
+    actions = needle_actions(settings) if actions is None else actions
+    if not actions or not settings.car_root_object:
+        return []
+    scene_objects = set(bpy.context.scene.objects)
+    return [obj for obj in hierarchy_objects(settings.car_root_object)
+            if obj in scene_objects and any(action_animates(obj, action) for action in actions)]
+
+
+def validate_needle_actions(settings, errors):
+    picked = (("RPM needle", settings.rpm_needle_action), ("Speed needle", settings.speed_needle_action))
+    if picked[0][1] and picked[0][1] == picked[1][1]:
+        errors.append("RPM and speed needles must use different actions")
+    for label, action in picked:
+        if not action:
+            continue
+        start, end = action.frame_range
+        if end <= start:
+            errors.append(f"{label} action must span more than one frame")
+        if settings.car_root_object and not needle_objects(settings, [action]):
+            errors.append(f"{label} action must be the active action or the only unmuted strip on an NLA track "
+                          f"of an object under Car Root")
+
+
+def import_needle_configs(settings, dashboard):
+    for key, prefix in (("rpmNeedle", "rpm"), ("speedNeedle", "speed")):
+        config = dashboard.get(key)
+        if not isinstance(config, dict):
+            setattr(settings, f"{prefix}_needle_action", None)
+            continue
+        name = config.get("animation")
+        setattr(settings, f"{prefix}_needle_action", bpy.data.actions.get(name) if isinstance(name, str) else None)
+        if isinstance(config.get("max"), (int, float)) and config["max"] >= 1:
+            setattr(settings, f"{prefix}_needle_max", float(config["max"]))
+        if prefix == "speed" and config.get("unit") in ("km/h", "mph"):
+            settings.speed_needle_unit = config["unit"]
 
 
 def validate_hidden_objects(settings, _errors, warnings):
@@ -1173,7 +1293,7 @@ def car_merge_groups(context, settings, ranges=None):
     """Meshes that join into one node each: same materials in use, same UV layer count and color
     layers, same LOD level range, under the same nearest anchor. Anchors are the car root and every node
     the manifest names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
-    dashboard, ghost shadow and shadow plane, shadow mesh, ambient shadow), so each wheel merges on its own
+    dashboard, needles, ghost shadow and shadow plane, shadow mesh, ambient shadow), so each wheel merges on its own
     spin node and moving parts keep moving. Colliders, skinned parts, referenced nodes, meshes with
     children and the body color carrier are never merged."""
     root = settings.car_root_object
@@ -3066,6 +3186,8 @@ def validate_scene(settings):
                     "Dashboard screen local X width and local Z length must be greater than zero"
                 )
 
+    validate_needle_actions(settings, errors)
+
     exported_material_names = {
         material.name
         for material in export_materials(
@@ -3810,6 +3932,41 @@ class CarExporterSettings(PropertyGroup):
         description="Mesh object used as the in-game dashboard display",
         type=bpy.types.Object,
     )
+    rpm_needle_action: PointerProperty(
+        name="RPM Needle",
+        description="Action that sweeps the tachometer needle from the dial's zero at its first frame to its "
+                    "top mark at its last frame; only this and the speed needle's action export",
+        type=bpy.types.Action,
+    )
+    rpm_needle_max: FloatProperty(
+        name="Dial Max (RPM)",
+        description="Engine speed at the tachometer's top mark, where the action's last frame points",
+        default=8000.0,
+        min=1.0,
+        precision=0,
+    )
+    speed_needle_action: PointerProperty(
+        name="Speed Needle",
+        description="Action that sweeps the speedometer needle from the dial's zero at its first frame to its "
+                    "top mark at its last frame; only this and the RPM needle's action export",
+        type=bpy.types.Action,
+    )
+    speed_needle_max: FloatProperty(
+        name="Dial Max",
+        description="Speed at the speedometer's top mark, where the action's last frame points",
+        default=260.0,
+        min=1.0,
+        precision=0,
+    )
+    speed_needle_unit: EnumProperty(
+        name="Dial Unit",
+        description="Unit printed on the speedometer dial",
+        items=(
+            ("km/h", "km/h", "Kilometres per hour"),
+            ("mph", "mph", "Miles per hour"),
+        ),
+        default="km/h",
+    )
     # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
     drag_per_downforce: FloatProperty(
@@ -4504,6 +4661,8 @@ def clear_configuration_settings(settings):
     for _key, prefix in LIGHT_EMISSIONS:
         setattr(settings, f"{prefix}_emissive_intensity", 0.0 if prefix == "tail_brake" else 10.0)
     settings.dashboard_screen_object = None
+    settings.rpm_needle_action = None
+    settings.speed_needle_action = None
     settings.colliders.clear()
     settings.down_force_points.clear()
     settings.wheels.clear()
@@ -4902,12 +5061,16 @@ def build_manifest(settings, lod_object_names=None):
 
     lights = build_lights_config(settings)
 
-    dashboard = None
+    dashboard = {}
     if settings.dashboard_screen_object:
-        dashboard = {
-            "screen": {
-                "obj": object_config_name(settings.dashboard_screen_object),
-            },
+        dashboard["screen"] = {"obj": object_config_name(settings.dashboard_screen_object)}
+    if settings.rpm_needle_action:
+        dashboard["rpmNeedle"] = {"animation": settings.rpm_needle_action.name, "max": settings.rpm_needle_max}
+    if settings.speed_needle_action:
+        dashboard["speedNeedle"] = {
+            "animation": settings.speed_needle_action.name,
+            "max": settings.speed_needle_max,
+            "unit": settings.speed_needle_unit,
         }
 
     body = {
@@ -7067,6 +7230,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             set_object_pointer(settings, "dashboard_screen_object", screen.get("obj", ""))
         else:
             settings.dashboard_screen_object = None
+        import_needle_configs(settings, dashboard if isinstance(dashboard, dict) else {})
 
         cameras = data.get("cameras", {})
         for name, attr in (
@@ -7577,6 +7741,13 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box = layout.box()
         box.label(text="Dashboard")
         draw_split_prop(box, settings, "dashboard_screen_object")
+        draw_split_prop(box, settings, "rpm_needle_action")
+        if settings.rpm_needle_action:
+            draw_split_prop(box, settings, "rpm_needle_max")
+        draw_split_prop(box, settings, "speed_needle_action")
+        if settings.speed_needle_action:
+            draw_split_prop(box, settings, "speed_needle_unit")
+            draw_split_prop(box, settings, "speed_needle_max", label=f"Dial Max ({settings.speed_needle_unit})")
 
         box = layout.box()
         box.label(text="Lights")
