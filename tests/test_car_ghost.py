@@ -1,6 +1,6 @@
-"""Custom ghost contract and export isolation tests; no Blender required."""
+"""LOD levels, ghost default level and ghost shadow contract tests; no host application required."""
 import ast
-import copy
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -8,215 +8,193 @@ import unittest
 
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
 FUNCTIONS = {
-    "find_object", "object_config_name", "set_object_pointer", "is_object_in_tree",
-    "hierarchy_objects", "ghost_wheel_settings", "excluded_ghost_objects",
-    "car_export_objects", "build_ghost_config", "parse_ghost_config",
-    "import_ghost_config", "validate_ghost_scene", "with_helpers_unlinked",
-    "object_with_assigned_material", "material_is_assigned_to_geometry",
+    "find_object", "object_config_name", "set_object_pointer", "hierarchy_objects",
+    "lod_name_level", "lod_level_row", "car_lod_meshes", "exported_lod_levels", "lod_dropped_objects",
+    "lod_part_key", "lod_object_ranges", "ghost_lod_position", "build_lods_config", "parse_lods_config",
+    "import_lods_config", "sync_lod_level_rows", "validate_lods_scene", "build_ghost_config",
+    "parse_ghost_config", "import_ghost_config", "validate_ghost_helper", "validate_ghost_scene",
+    "is_object_in_tree", "in_car_body",
 }
 
 
 class Object:
-    def __init__(self, name, parent=None, material=None):
+    def __init__(self, name, parent=None, mesh=True):
         self.name = name
         self.parent = parent
         self.children = []
-        self.users_collection = []
-        self.type = "MESH" if material else "EMPTY"
-        self.data = SimpleNamespace(polygons=[SimpleNamespace(material_index=0)] if material else [])
-        self.material_slots = [SimpleNamespace(material=material)] if material else []
+        self.type = "MESH" if mesh else "EMPTY"
+        self.data = SimpleNamespace(polygons=[object()] if mesh else [])
         if parent:
             parent.children.append(self)
 
 
-class CollectionObjects(dict):
-    def __init__(self, owner):
-        super().__init__()
-        self.owner = owner
-
-    def link(self, obj):
-        self[obj.name] = obj
-        obj.users_collection.append(self.owner)
-
-    def unlink(self, obj):
-        del self[obj.name]
-        obj.users_collection.remove(self.owner)
+class Rows(list):
+    def add(self):
+        row = SimpleNamespace(level=0, export=True, screen_height=0.0)
+        self.append(row)
+        return row
 
 
-class GhostTests(unittest.TestCase):
+class LodTests(unittest.TestCase):
     def setUp(self):
         self.objects = {}
         self.scene_objects = []
         self.api = {
+            "re": re,
             "bpy": SimpleNamespace(
                 data=SimpleNamespace(objects=self.objects),
                 context=SimpleNamespace(scene=SimpleNamespace(objects=self.scene_objects)),
             ),
-            "guide_objects": lambda: [],
-            "downforce_helper_objects": lambda: [],
-            "light_helper_objects": lambda: [],
+            "car_reference_objects": lambda settings: set(),
         }
         selected = []
         for node in ast.parse(ADDON.read_text(encoding="utf-8")).body:
             if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS:
                 selected.append(node)
-            elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-                if node.targets[0].id in {"WHEEL_KEYS", "WHEEL_LABELS", "GHOST_WHEEL_ROLES", "CAMERA_PREFIXES", "BLENDER_AXIS_TO_GAME", "GAME_AXIS_TO_BLENDER"}:
-                    selected.append(node)
+            elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) \
+                    and node.targets[0].id == "LOD_NAME_PATTERN":
+                selected.append(node)
         exec(compile(ast.Module(body=selected, type_ignores=[]), str(ADDON), "exec"), self.api)
-        self.paint = object()
-        self.root = self.obj("car")
-        self.normal = self.obj("body", self.root, self.paint)
-        self.ghost = self.obj("ghost", self.root)
-        self.ghost_body = self.obj("ghost_body", self.ghost, self.paint)
+        self.root = self.obj("Car", mesh=False)
+        self.spin = self.obj("Spin", self.root, mesh=False)
+        # Three levels: the body has all of them, the wheel ends at LOD1, the badge starts at LOD1.
+        for name, parent in (("Body_LOD0", self.root), ("Body_LOD1", self.root), ("Body_LOD2", self.root),
+                             ("Wheel_LOD0", self.spin), ("Wheel_LOD1", self.spin), ("Badge_LOD1", self.root),
+                             ("Mirror", self.root)):
+            self.obj(name, parent)
+        self.shadow = self.obj("GHOST_SHADOW", self.root)
+        self.plane = self.obj("GHOST_SHADOW_PLANE", self.root)
         self.settings = SimpleNamespace(
-            car_root_object=self.root, ghost_enabled=True, ghost_root_object=self.ghost,
-            center_of_mass_object=None, steering_wheel_object=None, dashboard_screen_object=None,
-            colliders=[], down_force_points=[], wheels=[],
-            body_colors=[SimpleNamespace(material=self.paint)],
-            headlights_material=None, brake_lights_material=None, reverse_lights_material=None,
+            car_root_object=self.root, lods_enabled=True, lod_levels=Rows(), ghost_lod=1, colliders=[],
+            shadow_object=None, ambient_shadow_object=None,
+            ghost_shadow_object=self.shadow, ghost_shadow_plane_object=self.plane,
         )
-        for prefix in self.api["CAMERA_PREFIXES"]:
-            setattr(self.settings, f"{prefix}_camera_object", None)
-        for group, key, _steering in self.api["WHEEL_KEYS"]:
-            mount = self.obj(f"mount_{group}_{key}", self.ghost)
-            joint = self.obj(f"joint_{group}_{key}", mount)
-            spin = self.obj(f"spin_{group}_{key}", joint, self.paint)
-            setattr(self.settings, f"ghost_{group}_{key}", SimpleNamespace(
-                suspension_ref=mount, hub_ref=joint, wheel_ref=spin,
-            ))
+        self.call("sync_lod_level_rows", self.settings)
+        for row, height in zip(self.settings.lod_levels, (50.0, 20.0, 5.0)):
+            row.screen_height = height
 
-    def obj(self, name, parent=None, material=None):
-        result = Object(name, parent, material)
-        self.objects[name] = result
-        self.scene_objects.append(result)
-        return result
+    def obj(self, name, parent=None, mesh=True):
+        obj = Object(name, parent, mesh)
+        self.objects[name] = obj
+        self.scene_objects.append(obj)
+        return obj
 
     def call(self, name, *args):
         return self.api[name](*args)
 
+    def names(self, objects):
+        return sorted(obj.name for obj in objects)
+
+    def ranges(self):
+        return {obj.name: span for obj, span in self.call("lod_object_ranges", self.settings).items()}
+
     def validate(self):
         errors, warnings = [], []
+        self.call("validate_lods_scene", self.settings, errors, warnings)
         self.call("validate_ghost_scene", self.settings, errors, warnings)
         return errors, warnings
 
-    def test_enabled_contract_round_trip(self):
-        config = self.call("build_ghost_config", self.settings)
-        self.assertEqual(config["obj"], "ghost")
-        self.assertEqual(config["wheels"]["front"]["l"]["spin"], {"obj": "spin_front_l"})
-        self.assertEqual(config["wheels"]["front"]["l"]["joint"], {"obj": "joint_front_l"})
-        self.assertEqual(set(config), {"obj", "wheels"})
-        parsed = self.call("parse_ghost_config", config)
-        self.settings.ghost_enabled = False
-        self.settings.ghost_root_object = None
-        self.settings.ghost_front_l.wheel_ref = None
-        self.call("import_ghost_config", self.settings, parsed)
-        self.assertEqual(self.call("build_ghost_config", self.settings), config)
-        self.assertEqual(self.validate(), ([], []))
+    def test_levels_come_from_name_suffixes(self):
+        self.assertEqual(self.call("lod_name_level", "Body_LOD12"), ("Body", 12))
+        self.assertEqual(self.call("lod_name_level", "Body_LOD1.001"), ("Body", 1))
+        self.assertIsNone(self.call("lod_name_level", "Body_LODx"))
+        self.assertIsNone(self.call("lod_name_level", "Mirror"))
+        found = self.call("car_lod_meshes", self.settings)
+        self.assertEqual(list(found), [0, 1, 2])
+        self.assertEqual(self.names(found[1]), ["Badge_LOD1", "Body_LOD1", "Wheel_LOD1"])
+        self.assertEqual([row.level for row in self.settings.lod_levels], [0, 1, 2])
 
-    def test_null_disables_but_preserves_selections(self):
-        self.call("import_ghost_config", self.settings, self.call("parse_ghost_config", None))
-        self.assertFalse(self.settings.ghost_enabled)
-        self.assertIsNone(self.call("build_ghost_config", self.settings))
-        self.assertIs(self.settings.ghost_root_object, self.ghost)
-        self.assertIsNotNone(self.settings.ghost_front_l.wheel_ref)
-        exported = self.call("car_export_objects", self.settings)
-        self.assertEqual(exported, [self.root, self.normal])
-        self.assertEqual(len(self.scene_objects), 16)
-
-    def test_enabled_keeps_full_glb_hierarchy(self):
-        self.assertEqual(self.call("excluded_ghost_objects", self.settings), [])
-        self.assertEqual(self.call("car_export_objects", self.settings), self.scene_objects)
-
-    def test_invalid_manifest_shapes_and_references(self):
-        config = self.call("build_ghost_config", self.settings)
-        invalid = [False, True, "ghost", [], {}, {"obj": " "}, {"obj": "ghost", "wheels": []}]
-        missing = copy.deepcopy(config)
-        del missing["wheels"]["rear"]["r"]["spin"]
-        invalid.append(missing)
-        duplicate = copy.deepcopy(config)
-        duplicate["wheels"]["rear"]["r"] = duplicate["wheels"]["front"]["l"]
-        invalid.append(duplicate)
-        for value in invalid:
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                self.call("parse_ghost_config", value)
-
-    def test_joint_and_spin_can_share_a_node(self):
-        self.settings.ghost_front_l.hub_ref = self.settings.ghost_front_l.wheel_ref
-        config = self.call("build_ghost_config", self.settings)
-        self.assertEqual(self.call("parse_ghost_config", config), config)
-        self.assertEqual(self.validate(), ([], []))
-
-    def test_missing_root_required_only_when_enabled(self):
-        self.settings.ghost_root_object = None
-        self.assertIn("root object is required", " ".join(self.validate()[0]))
-        self.settings.ghost_enabled = False
-        self.assertEqual(self.validate(), ([], []))
-
-    def test_root_must_be_direct_child(self):
-        self.ghost.parent = self.normal
-        self.assertIn("direct child", " ".join(self.validate()[0]))
-
-    def test_normal_references_cannot_be_removed_when_disabled(self):
-        self.settings.ghost_enabled = False
-        self.settings.wheels = [self.settings.ghost_front_l]
-        self.assertIn("normal car", " ".join(self.validate()[0]))
-
-    def test_wheel_references_must_belong_to_ghost(self):
-        self.settings.ghost_front_l.wheel_ref = self.normal
-        self.assertIn("exported ghost hierarchy", " ".join(self.validate()[0]))
-
-    def test_wheel_hierarchies_cannot_overlap(self):
-        self.settings.ghost_front_r = self.settings.ghost_front_l
-        self.assertIn("overlap", " ".join(self.validate()[0]))
-
-    def test_joint_must_belong_to_its_mount(self):
-        self.settings.ghost_front_l.hub_ref.parent = self.ghost
-        self.assertIn("joint must be inside mount", " ".join(self.validate()[0]))
-
-    def test_unlinked_wheel_reference_rejected(self):
-        self.scene_objects.remove(self.settings.ghost_front_l.wheel_ref)
-        self.assertIn("exported ghost hierarchy", " ".join(self.validate()[0]))
-
-    def test_ghost_paint_required_and_lights_warn(self):
-        self.settings.body_colors[0].material = object()
-        self.settings.headlights_material = object()
+    def test_parts_keep_their_last_mesh_and_start_where_their_first_is(self):
+        self.assertEqual(self.ranges(), {
+            "Body_LOD0": (0, 0), "Body_LOD1": (1, 1), "Body_LOD2": (2, 2),
+            "Wheel_LOD0": (0, 0), "Wheel_LOD1": (1, 2), "Badge_LOD1": (1, 2),
+        })
         errors, warnings = self.validate()
-        self.assertIn("Default body color", " ".join(errors))
-        self.assertIn("Headlights", " ".join(warnings))
+        self.assertEqual(errors, [])
+        self.assertIn("Wheel: no LOD2, keeps LOD1", warnings)
+        self.assertIn("Badge: starts at LOD1, not shown at finer levels", warnings)
 
-    def test_authored_materials_are_not_changed(self):
-        material = object()
-        trim = self.obj("trim", self.ghost, material)
-        self.validate()
-        self.call("build_ghost_config", self.settings)
-        self.assertIs(trim.material_slots[0].material, material)
+    def test_unticked_levels_are_skipped_and_dropped(self):
+        self.call("lod_level_row", self.settings, 1).export = False
+        self.assertEqual(self.call("exported_lod_levels", self.settings), [0, 2])
+        self.assertEqual(self.names(self.call("lod_dropped_objects", self.settings)), ["Badge_LOD1", "Body_LOD1", "Wheel_LOD1"])
+        self.assertEqual(self.ranges()["Wheel_LOD0"], (0, 1), "the wheel keeps LOD0 at the next exported level")
+        self.assertEqual(self.ranges()["Body_LOD2"], (1, 1))
+        # LOD0 always exports.
+        self.call("lod_level_row", self.settings, 0).export = False
+        self.assertEqual(self.call("exported_lod_levels", self.settings)[0], 0)
 
-    def test_export_exclusion_restores_all_collections_on_success_and_failure(self):
-        collections = [SimpleNamespace(), SimpleNamespace()]
-        for collection in collections:
-            collection.objects = CollectionObjects(collection)
-            for obj in self.scene_objects:
-                collection.objects.link(obj)
-        self.settings.ghost_enabled = False
-        excluded = self.call("excluded_ghost_objects", self.settings)
-        self.api["guide_objects"] = lambda: [self.ghost_body]  # Exclusion lists can overlap.
+    def test_lods_off_export_lod0_only(self):
+        self.settings.lods_enabled = False
+        self.assertEqual(self.call("exported_lod_levels", self.settings), [0])
+        self.assertEqual(self.names(self.call("lod_dropped_objects", self.settings)),
+                         ["Badge_LOD1", "Body_LOD1", "Body_LOD2", "Wheel_LOD1"])
+        self.assertIsNone(self.call("build_lods_config", self.settings))
+        self.assertEqual(self.call("ghost_lod_position", self.settings), 0)
 
-        def exporting(fail):
-            for collection in collections:
-                self.assertEqual(set(collection.objects), {"car", "body"})
-            if fail:
-                raise RuntimeError("export failed")
-            return "exported"
+    def test_manifest_round_trip(self):
+        config = self.call("build_lods_config", self.settings, {"MERGED_Body_LOD1": (1, 1), "Wheel_LOD1": (1, 2)})
+        self.assertEqual(config, {
+            "levels": [{"level": 0, "screenHeight": 0.5}, {"level": 1, "screenHeight": 0.2},
+                       {"level": 2, "screenHeight": 0.05}],
+            "ghost": 1,
+            "objects": {"MERGED_Body_LOD1": [1, 1], "Wheel_LOD1": [1, 2]},
+        })
+        parsed = self.call("parse_lods_config", config)
+        self.settings.lod_levels = Rows()
+        self.settings.lods_enabled = False
+        self.settings.ghost_lod = 0
+        self.call("import_lods_config", self.settings, parsed)
+        self.assertTrue(self.settings.lods_enabled)
+        self.assertEqual([(row.level, row.export, row.screen_height) for row in self.settings.lod_levels],
+                         [(0, True, 50.0), (1, True, 20.0), (2, True, 5.0)])
+        self.assertEqual(self.settings.ghost_lod, 1)
+        ghost = self.call("build_ghost_config", self.settings)
+        self.assertEqual(ghost, {"shadow": {"obj": "GHOST_SHADOW"}, "shadowPlane": {"obj": "GHOST_SHADOW_PLANE"}})
+        self.settings.ghost_shadow_object = self.settings.ghost_shadow_plane_object = None
+        self.call("import_ghost_config", self.settings, self.call("parse_ghost_config", ghost))
+        self.assertIs(self.settings.ghost_shadow_object, self.shadow)
+        self.assertIs(self.settings.ghost_shadow_plane_object, self.plane)
 
-        self.assertEqual(self.call("with_helpers_unlinked", lambda: exporting(False), excluded), "exported")
-        with self.assertRaisesRegex(RuntimeError, "export failed"):
-            self.call("with_helpers_unlinked", lambda: exporting(True), excluded)
-        for collection in collections:
-            self.assertEqual(set(collection.objects), set(self.objects))
-        for obj in self.scene_objects:
-            self.assertEqual(obj.users_collection, collections)
-        self.assertIs(self.ghost.parent, self.root)
+    def test_invalid_manifest_shapes(self):
+        valid = {"levels": [{"level": 0, "screenHeight": 0.5}, {"level": 1, "screenHeight": 0.2}], "ghost": 1, "objects": {}}
+        self.assertIsNone(self.call("parse_lods_config", None))
+        for change in ({"levels": []}, {"levels": [{"level": 1, "screenHeight": 0.5}]},
+                       {"levels": [{"level": 0, "screenHeight": 0.5}, {"level": 1, "screenHeight": 0.6}]},
+                       {"levels": [{"level": 0, "screenHeight": 0}]}, {"ghost": 2}, {"ghost": True},
+                       {"objects": {"A_LOD0": [1, 0]}}, {"objects": {"A_LOD0": [0, 2]}}, {"objects": []}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.call("parse_lods_config", {**valid, **change})
+        for ghost in ([], {"shadow": {"obj": " "}}, {"shadow": {"obj": "S"}, "shadowPlane": {"obj": "S"}}):
+            with self.subTest(ghost=ghost), self.assertRaises(ValueError):
+                self.call("parse_ghost_config", ghost)
+
+    def test_screen_heights_must_be_set_and_fall(self):
+        self.call("lod_level_row", self.settings, 2).screen_height = 0.0
+        self.assertIn("LOD2 needs a Show Above Screen Height value", self.validate()[0])
+        self.call("lod_level_row", self.settings, 2).screen_height = 30.0
+        self.assertIn("LOD2 must show above a smaller screen height than LOD1", self.validate()[0])
+
+    def test_ghost_level_must_export_and_ghost_shadows_sit_on_the_car_root(self):
+        self.call("lod_level_row", self.settings, 1).export = False
+        self.assertIsNone(self.call("ghost_lod_position", self.settings))
+        self.assertIn("Ghost Default LOD1 is not an exported level", self.validate()[0])
+        self.call("lod_level_row", self.settings, 1).export = True
+        self.shadow.parent = self.spin
+        self.api["car_reference_objects"] = lambda settings: {self.spin}
+        self.assertIn("Ghost shadow must be under Car Root, outside wheels and other moving nodes", self.validate()[0])
+        # A group under Car Root holds the shadows like Car Root itself.
+        shadows = self.obj("shadows", self.root, mesh=False)
+        self.shadow.parent = shadows
+        self.assertEqual([e for e in self.validate()[0] if "Ghost shadow must" in e], [])
+        self.shadow.parent = self.root
+        self.settings.ghost_shadow_plane_object = None
+        self.assertIn("LODs need the ghost Shadow and Shadow Plane; use their refresh buttons", self.validate()[0])
+
+    def test_lods_on_without_lod_meshes_is_an_error(self):
+        for name in [name for name in self.objects if "_LOD" in name]:
+            self.scene_objects.remove(self.objects[name])
+        self.assertIn("LODs is on but no mesh under Car Root is named <part>_LOD<n>", self.validate()[0])
 
 
 if __name__ == "__main__":

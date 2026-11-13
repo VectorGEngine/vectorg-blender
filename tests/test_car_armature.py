@@ -10,7 +10,7 @@ import unittest
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
 FUNCTIONS = {
     "find_object", "object_config_name", "set_object_pointer", "is_object_in_tree",
-    "hierarchy_objects", "excluded_ghost_objects", "car_export_objects",
+    "hierarchy_objects", "car_export_objects",
     "armature_object_poll", "armature_attachment_object", "armature_attachment_offset",
     "parse_armature_config", "blender_position_to_game",
     "build_armature_config", "import_armature_config", "validate_armature_scene",
@@ -93,6 +93,8 @@ class ArmatureTests(unittest.TestCase):
             ),
             "guide_objects": lambda: [], "downforce_helper_objects": lambda: [],
             "light_helper_objects": lambda: [],
+            "lod_dropped_objects": lambda settings: [],
+            "excluded_shadow_objects": lambda settings: [],
         }
         selected = []
         for node in ast.parse(ADDON.read_text(encoding="utf-8")).body:
@@ -104,7 +106,7 @@ class ArmatureTests(unittest.TestCase):
                 selected.append(node)
             elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
                 if node.targets[0].id in {
-                    "WHEEL_KEYS", "WHEEL_LABELS", "GHOST_WHEEL_ROLES", "BLENDER_AXIS_TO_GAME",
+                    "WHEEL_KEYS", "WHEEL_LABELS", "WHEEL_NODE_ROLES", "BLENDER_AXIS_TO_GAME",
                     "ARMATURE_ATTACHMENT_ROLES", "ARMATURE_ATTACHMENT_ITEMS", "ARMATURE_TIP_ITEMS",
                 }:
                     selected.append(node)
@@ -114,7 +116,7 @@ class ArmatureTests(unittest.TestCase):
         self.geometry = self.obj("SuspensionGeometry", self.rig, "MESH")
         self.settings = SimpleNamespace(
             car_root_object=self.root, armature_enabled=True, armature_object=self.rig,
-            ghost_enabled=False, ghost_root_object=None, wheels=[], armature_joints=JointCollection(),
+            wheels=[], armature_joints=JointCollection(),
         )
         for group, key, _steering in self.api["WHEEL_KEYS"]:
             mount = self.obj(f"mount_{group}_{key}", self.root)
@@ -290,15 +292,6 @@ class ArmatureTests(unittest.TestCase):
         self.settings.car_root_object = self.rig
         self.assertIn("below Car Root", " ".join(self.validate()))
 
-    def test_ghost_rig_rejected_whether_ghost_enabled_or_disabled(self):
-        ghost = self.obj("Ghost", self.root)
-        self.settings.ghost_root_object = ghost
-        self.rig.parent = ghost
-        ghost.children.append(self.rig)
-        for enabled in (False, True):
-            self.settings.ghost_enabled = enabled
-            self.assertIn("outside the custom ghost", " ".join(self.validate()))
-
     def test_rig_and_wheel_parenting_cannot_feed_back(self):
         joint = self.settings.wheels[0].hub_ref
         self.rig.parent = joint
@@ -392,8 +385,8 @@ class ArmatureTests(unittest.TestCase):
     def test_manifest_omits_disabled_section_and_keeps_existing_wheels(self):
         settings = self.settings
         defaults = dict(
-            sound_pitch_offset=0, use_custom_sounds=False, headlights_material=None,
-            brake_lights_material=None, reverse_lights_material=None,
+            sound_pitch_offset=0, use_custom_sounds=False, lights_material=None,
+            brake_material=None, reverse_material=None,
             dashboard_screen_object=None, center_of_mass_object=None, colliders=[],
             down_force_points=[], drag_per_downforce=0.2, air_drag=1, body_colors=[], car_id="test",
             package_version="test-rig", display_name="Test", car_class="A",
@@ -412,6 +405,9 @@ class ArmatureTests(unittest.TestCase):
         existing_wheels = {"front": {"l": {"joint": {"obj": "joint_front_l"}}}}
         self.api.update({
             "build_ghost_config": lambda settings: None,
+            "build_lods_config": lambda settings, names=None: None,
+            "build_shadow_config": lambda settings: None,
+            "build_ambient_shadow_config": lambda settings: None,
             "build_lights_config": lambda settings: None,
             "sample_torque_curve": lambda settings: [],
             "build_wheels_config": lambda settings: copy.deepcopy(existing_wheels),

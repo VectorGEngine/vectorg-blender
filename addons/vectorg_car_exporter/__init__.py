@@ -319,203 +319,192 @@ def game_position_to_blender(position):
 
 
 LIGHT_ROLES = (
-    ("headlights", "headlights", "Headlights"),
-    ("brakeLights", "brake_lights", "Tail / Brake Lights"),
-    ("reverseLights", "reverse_lights", "Reverse Lights"),
+    ("lights", "lights", "Headlights / Tail Lights"),
+    ("brake", "brake", "Brake Lights"),
+    ("reverse", "reverse", "Reverse Lights"),
 )
-LIGHT_ROLE_ITEMS = tuple((role, label, "") for role, _prefix, label in LIGHT_ROLES)
-LIGHT_HELPER_PROP = "vectorg_light_helper"
-MAX_LIGHT_SOURCES = 16
+LIGHT_MARKER_PROP = "vectorg_light_marker"
+LIGHT_MARKERS = (("front", "front_light_marker", "LAMP_FRONT", "Front Lamp"), ("rear", "rear_light_marker", "LAMP_REAR", "Rear Lamp"))
 
 
-def light_object_poll(_settings, obj):
-    return obj.type == "LIGHT" and obj.data.type == "SPOT"
+def light_marker_poll(_settings, obj):
+    return obj.type == "EMPTY"
 
 
 def light_helper_objects():
+    """The lamp markers: authoring helpers the manifest carries, left out of the GLB."""
     settings = getattr(bpy.context.scene, "car_exporter", None)
-    assigned = [source.object_ref for source in settings.light_sources if source.object_ref] if settings else []
-    return list(dict.fromkeys([obj for obj in bpy.data.objects if obj.get(LIGHT_HELPER_PROP)] + assigned))
+    assigned = [getattr(settings, prop) for _key, prop, _name, _label in LIGHT_MARKERS] if settings else []
+    owned = [obj for obj in bpy.data.objects if obj.get(LIGHT_MARKER_PROP)]
+    return list(dict.fromkeys(owned + [obj for obj in assigned if obj]))
 
 
 def parse_lights_config(value):
-    """Canonical optional light contract; also accepts existing material-only roles."""
+    """The manifest's lamps: a lamp material and full emission per function, and the front and rear
+    markers; or None. Mirrors the game's reader."""
     if value is None:
         return None
-    roles = {role for role, _prefix, _label in LIGHT_ROLES}
-    if not isinstance(value, dict) or set(value) - roles:
-        raise ValueError("Manifest lights must be null or an object with known light roles")
+    if not isinstance(value, dict) or set(value) != {"materials", "emission", "front", "rear"}:
+        raise ValueError("Manifest lights must be null or have exactly materials, emission, front and rear")
 
-    def number(value, label, minimum=0, maximum=None, positive=False):
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-                or value < minimum or (positive and value <= 0) or (maximum is not None and value > maximum)):
-            raise ValueError(f"{label} is invalid")
-        return value
+    def number(entry, label, minimum=0, maximum=None):
+        if (isinstance(entry, bool) or not isinstance(entry, (int, float)) or not math.isfinite(entry)
+                or entry < minimum or (maximum is not None and entry > maximum)):
+            raise ValueError(f"Manifest lights.{label} is invalid")
+        return entry
 
-    def vector(value, label):
-        if not isinstance(value, (list, tuple)) or len(value) != 3:
-            raise ValueError(f"{label} must have three components")
-        return [number(component, label, minimum=-1e30, maximum=1e30) for component in value]
+    def vector(entry, label):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise ValueError(f"Manifest lights.{label} must have three components")
+        return [number(component, label, minimum=-1e30, maximum=1e30) for component in entry]
 
-    result = {}
-    names = set()
-    for role, _prefix, _label in LIGHT_ROLES:
-        config = value.get(role)
-        if config is None:
-            result[role] = None
-            continue
-        if not isinstance(config, dict) or set(config) - {"material", "emissiveIntensity", "sources"}:
-            raise ValueError(f"Manifest lights.{role} is invalid")
-        material = config.get("material")
-        if material is not None and (not isinstance(material, str) or not material.strip()):
-            raise ValueError(f"Manifest lights.{role}.material must be null or a material name")
-        emission = number(config.get("emissiveIntensity", 10), f"{role}.emissiveIntensity")
-        sources = config.get("sources")
-        if sources is not None and not isinstance(sources, list):
-            raise ValueError(f"Manifest lights.{role}.sources must be null or a list")
-        parsed = []
-        for source in sources or []:
-            fields = {"name", "position", "direction", "color", "intensity", "distance", "angle", "penumbra"}
-            if not isinstance(source, dict) or set(source) != fields:
-                raise ValueError(f"Manifest lights.{role} source fields are invalid")
-            name = source["name"]
-            if not isinstance(name, str) or not name.strip() or name in names:
-                raise ValueError("Light source names must be non-empty and unique across roles")
-            names.add(name)
-            if len(names) > MAX_LIGHT_SOURCES:
-                raise ValueError(f"A car may have at most {MAX_LIGHT_SOURCES} light sources")
-            direction = vector(source["direction"], f"{name}.direction")
-            length = math.sqrt(sum(component * component for component in direction))
-            if length < 1e-8:
-                raise ValueError(f"{name}.direction must be nonzero")
-            color = vector(source["color"], f"{name}.color")
-            if any(component < 0 or component > 1 for component in color):
-                raise ValueError(f"{name}.color components must be in [0, 1]")
-            parsed.append({
-                "name": name,
-                "position": vector(source["position"], f"{name}.position"),
-                "direction": [component / length for component in direction],
-                "color": color,
-                "intensity": number(source["intensity"], f"{name}.intensity"),
-                "distance": number(source["distance"], f"{name}.distance", positive=True),
-                "angle": number(source["angle"], f"{name}.angle", maximum=math.pi / 2, positive=True),
-                "penumbra": number(source["penumbra"], f"{name}.penumbra", maximum=1),
-            })
-        result[role] = {"material": material, "emissiveIntensity": emission, "sources": parsed or None} if material or parsed else None
-    return result if any(result.values()) else None
+    roles = [role for role, _prefix, _label in LIGHT_ROLES]
+    materials, emission, front, rear = value["materials"], value["emission"], value["front"], value["rear"]
+    if not isinstance(materials, dict) or set(materials) != set(roles):
+        raise ValueError(f"Manifest lights.materials must have exactly {', '.join(roles)}")
+    for role in roles:
+        name = materials[role]
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ValueError(f"Manifest lights.materials.{role} must be null or a material name")
+    named = [name for name in materials.values() if name is not None]
+    if not named:
+        raise ValueError("Manifest lights.materials needs at least one lamp material")
+    if len(set(named)) != len(named):
+        raise ValueError("Manifest lights.materials must name a different material per function")
+    if not isinstance(emission, dict) or set(emission) != set(roles):
+        raise ValueError(f"Manifest lights.emission must have exactly {', '.join(roles)}")
+    if not isinstance(front, dict) or set(front) != {"position", "direction"}:
+        raise ValueError("Manifest lights.front must have exactly position and direction")
+    direction = vector(front["direction"], "front.direction")
+    length = math.sqrt(sum(component * component for component in direction))
+    if length < 1e-8:
+        raise ValueError("Manifest lights.front.direction must be nonzero")
+    if direction[2] / length < 0.5:
+        raise ValueError("Manifest lights.front.direction must aim forward")
+    if not isinstance(rear, dict) or set(rear) != {"position"}:
+        raise ValueError("Manifest lights.rear must have exactly position")
+    return {
+        "materials": {role: materials[role] for role in roles},
+        "emission": {role: number(emission[role], f"emission.{role}") for role in roles},
+        "front": {"position": vector(front["position"], "front.position"),
+                  "direction": [component / length for component in direction]},
+        "rear": {"position": vector(rear["position"], "rear.position")},
+    }
+
+
+def light_marker_frame(root, obj):
+    """A marker's car-local position and aim (its local +Z, the way its arrow points), in game axes."""
+    try:
+        local = root.matrix_world.inverted() @ obj.matrix_world
+    except ValueError as error:
+        raise ValueError(f"Light marker {obj.name} has a singular car transform") from error
+    aim = (local.to_3x3() @ Vector((0, 0, 1))).normalized()
+    return blender_position_to_game(local.translation), blender_position_to_game(aim)
+
+
+def lamp_materials(settings):
+    """Each function's lamp material, or None."""
+    return {role: getattr(settings, f"{prefix}_material") for role, prefix, _label in LIGHT_ROLES}
+
+
+def lamp_emission_strength(material):
+    """The emission strength the lamp material is authored with, or None without a Principled BSDF."""
+    if not material or not material.use_nodes:
+        return None
+    principled = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+    return principled.inputs["Emission Strength"].default_value if principled else None
 
 
 def build_lights_config(settings):
+    """The manifest's lights, or None without any lamp material."""
+    materials = lamp_materials(settings)
+    if not any(materials.values()):
+        return None
+    named = [material for material in materials.values() if material]
+    if len(set(named)) != len(named):
+        raise ValueError("Each light function needs its own lamp material")
     root = settings.car_root_object
-    result = {}
-    used = set()
+    markers = {}
+    for key, prop, _name, label in LIGHT_MARKERS:
+        obj = getattr(settings, prop)
+        if not obj:
+            raise ValueError(f"Lights need the {label} marker")
+        if not root or obj == root or not is_object_in_tree(root, obj) or obj not in set(bpy.context.scene.objects):
+            raise ValueError(f"{label} marker {obj.name} must be in the scene beneath the car root")
+        markers[key] = light_marker_frame(root, obj)
+    (front, aim), (rear, _rear_aim) = markers["front"], markers["rear"]
+    return parse_lights_config({
+        "materials": {role: material.name if material else None for role, material in materials.items()},
+        "emission": {role: getattr(settings, f"{prefix}_emissive_intensity") for role, prefix, _label in LIGHT_ROLES},
+        "front": {"position": front, "direction": aim},
+        "rear": {"position": rear},
+    })
+
+
+def validate_lights_scene(settings, exported_material_names, errors, warnings):
+    try:
+        config = build_lights_config(settings)
+    except ValueError as error:
+        errors.append(str(error))
+        return
+    if config is None:
+        return
     for role, prefix, label in LIGHT_ROLES:
-        sources = []
-        for source in settings.light_sources:
-            if source.role != role:
-                continue
-            obj = source.object_ref
-            if not obj or not light_object_poll(None, obj):
-                raise ValueError(f"{label} source requires a Spot light object")
-            if not root or obj == root or not is_object_in_tree(root, obj) or obj not in list(bpy.context.scene.objects):
-                raise ValueError(f"Light {obj.name} must be in the scene beneath the car root")
-            if is_object_in_tree(settings.ghost_root_object, obj):
-                raise ValueError(f"Light {obj.name} must be outside the custom ghost hierarchy")
-            if obj.children:
-                raise ValueError(f"Light helper {obj.name} must not have children")
-            if obj in used:
-                raise ValueError(f"Light object is assigned more than once: {obj.name}")
-            used.add(obj)
-            try:
-                inverse = root.matrix_world.inverted()
-                position = inverse @ obj.matrix_world.translation
-                target = inverse @ (obj.matrix_world @ Vector((0, 0, -1)))
-            except ValueError as error:
-                raise ValueError(f"Light {obj.name} has a singular car transform") from error
-            sources.append({
-                "name": obj.name,
-                "position": blender_position_to_game(position),
-                "direction": blender_position_to_game(target - position),
-                "color": list(obj.data.color),
-                "intensity": source.intensity,
-                "distance": source.distance,
-                "angle": obj.data.spot_size / 2,
-                "penumbra": obj.data.spot_blend,
-            })
         material = getattr(settings, f"{prefix}_material")
-        result[role] = {"material": material.name if material else None,
-                        "emissiveIntensity": getattr(settings, f"{prefix}_emissive_intensity"),
-                        "sources": sources or None}
-    if any(source.role not in {role for role, _prefix, _label in LIGHT_ROLES} for source in settings.light_sources):
-        raise ValueError("Unknown vehicle light role")
-    return parse_lights_config(result)
+        if not material:
+            warnings.append(f"No {label} material: those lamps never light")
+            continue
+        if material.name not in exported_material_names:
+            errors.append(f"{label} material is not used by an exported mesh: {material.name}")
+        strength = lamp_emission_strength(material)
+        if not strength:
+            errors.append(f"{label} material {material.name} needs an Emission Strength above 0; "
+                          "the game scales it by Full Emission")
+    if config["front"]["direction"][1] > 0.2:
+        warnings.append("The front lamp marker aims upward; its arrow should point ahead and slightly down")
 
 
-def remove_owned_light_helper(obj):
-    if obj and obj.get(LIGHT_HELPER_PROP):
-        data = obj.data
-        bpy.data.objects.remove(obj, do_unlink=True)
-        if data.users == 0:
-            bpy.data.lights.remove(data)
-
-
-def clear_light_sources(settings, keep_names=()):
-    helpers = {source.object_ref for source in settings.light_sources if source.object_ref}
-    settings.light_sources.clear()
-    for obj in helpers:
-        if obj.name not in keep_names:
-            remove_owned_light_helper(obj)
-
-
-def create_light_helper(context, settings, name):
-    data = bpy.data.lights.new(name=name, type="SPOT")
-    obj = bpy.data.objects.new(name, data)
-    context.scene.collection.objects.link(obj)
-    obj.parent = settings.car_root_object
-    obj[LIGHT_HELPER_PROP] = True
-    data.show_cone = False
+def create_light_marker(context, settings, key):
+    """An arrow empty under Car Root at the 3D cursor, aimed straight ahead (its arrow, local +Z, along car -Y)."""
+    root = settings.car_root_object
+    _key, prop, name, _label = next(marker for marker in LIGHT_MARKERS if marker[0] == key)
+    previous = getattr(settings, prop)
+    if previous and previous.get(LIGHT_MARKER_PROP):
+        bpy.data.objects.remove(previous, do_unlink=True)
+    obj = bpy.data.objects.new(name, None)
+    (root.users_collection[0] if root.users_collection else context.scene.collection).objects.link(obj)
+    obj[LIGHT_MARKER_PROP] = True
+    obj.empty_display_type = "SINGLE_ARROW" if key == "front" else "PLAIN_AXES"
+    obj.empty_display_size = 0.25
+    obj.parent = root
+    obj.matrix_parent_inverse.identity()
+    obj.rotation_mode = "XYZ"
+    obj.rotation_euler = (math.radians(90), 0, 0)
+    setattr(settings, prop, obj)
     return obj
 
 
-def validate_light_import(root, config):
-    for role in (config or {}).values():
-        for source in (role or {}).get("sources") or []:
-            if root is None:
-                raise ValueError("Manifest car root object is required to import light sources")
-            obj = bpy.data.objects.get(source["name"])
-            if obj and (not light_object_poll(None, obj) or not is_object_in_tree(root, obj) or obj == root or obj.children):
-                raise ValueError(f"Light source name conflicts with an existing object: {source['name']}")
+def place_light_marker(context, settings, key, position, direction=None):
+    obj = create_light_marker(context, settings, key)
+    obj.location = game_position_to_blender(position)
+    if direction is not None:
+        obj.rotation_euler = game_position_to_blender(direction).to_track_quat("Z", "Y").to_euler("XYZ")
+    return obj
 
 
 def import_lights_config(context, settings, config):
-    validate_light_import(settings.car_root_object, config)
-    names = {source["name"] for role in (config or {}).values() for source in (role or {}).get("sources") or []}
-    clear_light_sources(settings, names)
+    """Restores each function's lamp material and full emission, and both markers."""
+    if config is None:
+        for _role, prefix, _label in LIGHT_ROLES:
+            setattr(settings, f"{prefix}_material", None)
+        return
+    if settings.car_root_object is None:
+        raise ValueError("Manifest car root object is required to import lights")
     for role, prefix, _label in LIGHT_ROLES:
-        light = (config or {}).get(role) or {}
-        set_material_pointer(settings, f"{prefix}_material", light.get("material"))
-        setattr(settings, f"{prefix}_emissive_intensity", light.get("emissiveIntensity", 10))
-        for source in light.get("sources") or []:
-            obj = bpy.data.objects.get(source["name"])
-            if obj is None:
-                obj = create_light_helper(context, settings, source["name"])
-            # Imported coordinates are car-local, independent of any previous parenting.
-            obj.parent = settings.car_root_object
-            obj.matrix_parent_inverse.identity()
-            obj.location = game_position_to_blender(source["position"])
-            obj.rotation_mode = "QUATERNION"
-            obj.rotation_quaternion = game_position_to_blender(source["direction"]).to_track_quat('-Z', 'Y')
-            obj.scale = (1, 1, 1)
-            if obj.data.users > 1:
-                obj.data = obj.data.copy()
-            obj.data.color = source["color"]
-            obj.data.spot_size = source["angle"] * 2
-            obj.data.spot_blend = source["penumbra"]
-            entry = settings.light_sources.add()
-            entry.role = role
-            entry.object_ref = obj
-            entry.intensity = source["intensity"]
-            entry.distance = source["distance"]
+        set_material_pointer(settings, f"{prefix}_material", config["materials"][role])
+        setattr(settings, f"{prefix}_emissive_intensity", config["emission"][role])
+    place_light_marker(context, settings, "front", config["front"]["position"], config["front"]["direction"])
+    place_light_marker(context, settings, "rear", config["rear"]["position"])
 
 
 def next_helper_name(prefix):
@@ -724,15 +713,96 @@ def hierarchy_objects(root_obj):
     return objects
 
 
-GHOST_WHEEL_ROLES = (("mount", "suspension_ref"), ("joint", "hub_ref"), ("spin", "wheel_ref"))
+WHEEL_NODE_ROLES = (("mount", "suspension_ref"), ("joint", "hub_ref"), ("spin", "wheel_ref"))
+
+# A mesh named <part>_LOD<n> is level n of that part; a mesh without the suffix shows at every level.
+LOD_NAME_PATTERN = re.compile(r"^(?P<part>.+)_LOD(?P<level>\d+)(?:\.\d+)?$")
 
 
-def ghost_wheel_settings(settings, group, key):
-    return getattr(settings, f"ghost_{group}_{key}")
+def lod_name_level(name):
+    """(part, level) for a name ending in _LOD<n>, otherwise None."""
+    match = LOD_NAME_PATTERN.match(name)
+    return (match["part"], int(match["level"])) if match else None
 
 
-def excluded_ghost_objects(settings):
-    return hierarchy_objects(settings.ghost_root_object) if not settings.ghost_enabled else []
+def lod_level_row(settings, level):
+    return next((row for row in settings.lod_levels if row.level == level), None)
+
+
+def car_lod_meshes(settings):
+    """{level: [mesh]} for the meshes under Car Root named <part>_LOD<n>, finest level first, whatever their
+    viewport visibility: the eyes on the level rows hide them in the viewport only."""
+    root = settings.car_root_object
+    if not root:
+        return {}
+    scene_objects = set(bpy.context.scene.objects)
+    helpers = {collider.object_ref for collider in settings.colliders if collider.object_ref}
+    helpers.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object,
+                                   settings.ghost_shadow_object, settings.ghost_shadow_plane_object) if obj)
+    levels = {}
+    for obj in hierarchy_objects(root):
+        if obj.type != "MESH" or obj not in scene_objects or obj in helpers:
+            continue
+        parsed = lod_name_level(obj.name)
+        if parsed:
+            levels.setdefault(parsed[1], []).append(obj)
+    return dict(sorted(levels.items()))
+
+
+def exported_lod_levels(settings, found=None):
+    """The levels that reach the game, finest first: LOD0 alone with LODs off, otherwise every level found
+    whose export box is ticked. LOD0 always exports."""
+    found = car_lod_meshes(settings) if found is None else found
+    if not settings.lods_enabled:
+        return [0] if 0 in found else []
+    levels = []
+    for level in found:
+        row = lod_level_row(settings, level)
+        if level == 0 or row is None or row.export:
+            levels.append(level)
+    return levels
+
+
+def lod_dropped_objects(settings):
+    """LOD meshes whose level does not reach the game: left out of the export."""
+    found = car_lod_meshes(settings)
+    exported = set(exported_lod_levels(settings, found))
+    return [obj for level, objects in found.items() if level not in exported for obj in objects]
+
+
+def lod_part_key(obj):
+    """A LOD mesh's part: its parent and its name without the level suffix."""
+    return (obj.parent.name if obj.parent else "", lod_name_level(obj.name)[0])
+
+
+def lod_object_ranges(settings):
+    """{mesh: (first, last)}: the exported level positions each exported LOD mesh shows at. A part shows a
+    mesh from its level up to the part's next exported level, and its last mesh at every coarser level."""
+    found = car_lod_meshes(settings)
+    levels = exported_lod_levels(settings, found)
+    position = {level: index for index, level in enumerate(levels)}
+    parts = {}
+    for level, objects in found.items():
+        if level not in position:
+            continue
+        for obj in objects:
+            parts.setdefault(lod_part_key(obj), {}).setdefault(position[level], []).append(obj)
+    ranges = {}
+    for by_position in parts.values():
+        positions = sorted(by_position)
+        for current, following in zip(positions, positions[1:] + [len(levels)]):
+            for obj in by_position[current]:
+                ranges[obj] = (current, following - 1)
+    return ranges
+
+
+def ghost_lod_position(settings):
+    """The ghost default level's position among the exported levels: 0 with LODs off, None when the
+    chosen level does not export."""
+    if not settings.lods_enabled:
+        return 0
+    levels = exported_lod_levels(settings)
+    return levels.index(settings.ghost_lod) if settings.ghost_lod in levels else None
 
 
 def export_visible(obj):
@@ -746,7 +816,7 @@ def export_visible(obj):
 def car_export_objects(settings):
     excluded = set(
         guide_objects() + downforce_helper_objects() + light_helper_objects()
-        + excluded_ghost_objects(settings) + excluded_shadow_objects(settings)
+        + lod_dropped_objects(settings) + excluded_shadow_objects(settings)
     )
     return [obj for obj in bpy.context.scene.objects if obj not in excluded]
 
@@ -822,9 +892,8 @@ def import_ambient_shadow_config(settings, config):
 def car_reference_objects(settings):
     """Objects the manifest names or the game moves at runtime."""
     refs = [settings.car_root_object, settings.center_of_mass_object, settings.steering_wheel_object,
-            settings.dashboard_screen_object, settings.ghost_root_object,
-            settings.ghost_shadow_object, settings.ghost_shadow_plane_object,
-            settings.ghost_lod1_object, settings.ghost_lod2_object]
+            settings.dashboard_screen_object,
+            settings.ghost_shadow_object, settings.ghost_shadow_plane_object]
     refs.extend(getattr(settings, f"{prefix}_camera_object") for prefix in CAMERA_PREFIXES)
     refs.extend(collider.object_ref for collider in settings.colliders)
     refs.extend(point.object_ref for point in settings.down_force_points)
@@ -833,12 +902,37 @@ def car_reference_objects(settings):
         for wheel in settings.wheels
         for prop in ("suspension_ref", "hub_ref", "pivot_ref", "wheel_ref")
     )
-    for group, key, _steering in WHEEL_KEYS:
-        wheel = ghost_wheel_settings(settings, group, key)
-        refs.extend(getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES)
     if settings.armature_object:
         refs.append(settings.armature_object)
     return {obj for obj in refs if obj}
+
+
+def in_car_body(settings, obj):
+    """Whether obj sits under Car Root, directly or in groups, outside the nodes the game moves (wheels,
+    steering wheel, cameras and the other references), so it follows the car body alone."""
+    root = settings.car_root_object
+    if not root or obj == root or not is_object_in_tree(root, obj):
+        return False
+    moving = car_reference_objects(settings) - {root}
+    parent = obj.parent
+    while parent and parent != root:
+        if parent in moving:
+            return False
+        parent = parent.parent
+    return True
+
+
+def refresh_parent(settings, previous):
+    """Where a refresh builds a shadow mesh: in the group the one it replaces was in, else under Car Root."""
+    return previous.parent if previous and in_car_body(settings, previous) else settings.car_root_object
+
+
+def keep_parent(obj, parent):
+    """Moves obj under parent, keeping where it is in the world."""
+    world = obj.matrix_world.copy()
+    obj.parent = parent
+    obj.matrix_parent_inverse.identity()
+    obj.matrix_world = world
 
 
 def validate_shadow_scene(settings, errors, _warnings):
@@ -852,8 +946,8 @@ def validate_shadow_scene(settings, errors, _warnings):
         errors.append("Custom shadow mesh must be a mesh with faces")
     if obj not in set(bpy.context.scene.objects):
         errors.append("Custom shadow mesh must belong to the current scene")
-    if not settings.car_root_object or obj.parent != settings.car_root_object:
-        errors.append("Custom shadow mesh must be a direct child of the car root")
+    if not in_car_body(settings, obj):
+        errors.append("Custom shadow mesh must be under the car root, outside wheels and other moving nodes")
     if obj.children:
         errors.append("Custom shadow mesh must not have children")
     if obj in car_reference_objects(settings) or obj == settings.ambient_shadow_object:
@@ -863,9 +957,10 @@ def validate_shadow_scene(settings, errors, _warnings):
 
 def hidden_export_objects(settings):
     """Objects under Car Root hidden in the viewport, which the export leaves out so the game never draws
-    them. Nodes the manifest names or the game drives, and the objects the add-on generates and hides
-    itself, export whatever their visibility."""
-    kept = car_reference_objects(settings) | ghost_lod_objects(settings)
+    them. Nodes the manifest names or the game drives, the exported LOD meshes, whose eyes hide them in
+    the viewport only, and the objects the add-on generates and hides itself, export whatever their
+    visibility."""
+    kept = car_reference_objects(settings) | set(lod_object_ranges(settings))
     kept.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
     generated = (GENERATED_GHOST_LOD_PROP, GENERATED_SHADOW_PROP, GENERATED_AMBIENT_SHADOW_PROP)
     scene_objects = set(bpy.context.scene.objects)
@@ -918,8 +1013,8 @@ def validate_ambient_shadow_scene(settings, errors, _warnings):
         errors.append("AO plane must be a mesh with faces")
     if obj not in set(bpy.context.scene.objects):
         errors.append("AO plane must belong to the current scene")
-    if not settings.car_root_object or obj.parent != settings.car_root_object:
-        errors.append("AO plane must be a direct child of the car root")
+    if not in_car_body(settings, obj):
+        errors.append("AO plane must be under the car root, outside wheels and other moving nodes")
     if obj.children:
         errors.append("AO plane must not have children")
     if obj in car_reference_objects(settings) or obj == settings.shadow_object:
@@ -938,22 +1033,34 @@ def is_skinned_object(obj):
     )
 
 
-def shadow_source_objects(context, settings, wheels=False):
-    """The car's rendered meshes under the car root, leaving out hidden ones, the ghost, colliders, helpers,
-    the shadow mesh and ambient shadow plane and, unless `wheels`, the wheel mount hierarchies."""
+def shadow_source_objects(context, settings, wheels=False, lod_position=0):
+    """The car's meshes the game shows at exported LOD position `lod_position` (LOD0's by default), under the
+    car root: LOD meshes whose level range covers it, whatever their eyes, and meshes without a LOD suffix
+    unless hidden. Colliders, helpers, the generated shadows and, unless `wheels`, the wheel mount
+    hierarchies are left out."""
     root = settings.car_root_object
     scene_objects = set(context.scene.objects)
-    excluded = set(hierarchy_objects(settings.ghost_root_object))
+    ranges = lod_object_ranges(settings)
+    excluded = set()
     if not wheels:
         for wheel in settings.wheels:
             excluded.update(hierarchy_objects(wheel.suspension_ref))
     excluded.update(collider.object_ref for collider in settings.colliders if collider.object_ref)
     excluded.update(guide_objects() + downforce_helper_objects() + light_helper_objects())
-    excluded.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
+    excluded.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object,
+                                    settings.ghost_shadow_object, settings.ghost_shadow_plane_object) if obj)
+    generated = (GENERATED_SHADOW_PROP, GENERATED_AMBIENT_SHADOW_PROP, GENERATED_GHOST_LOD_PROP)
+
+    def shown(obj):
+        if obj in ranges:
+            first, last = ranges[obj]
+            return first <= lod_position <= last
+        return lod_name_level(obj.name) is None and export_visible(obj)
+
     return [
         obj for obj in hierarchy_objects(root)
-        if obj is not root and obj.type == "MESH" and obj in scene_objects and obj not in excluded and export_visible(obj)
-        and obj.data.polygons and not obj.get(GENERATED_SHADOW_PROP) and not obj.get(GENERATED_AMBIENT_SHADOW_PROP)
+        if obj is not root and obj.type == "MESH" and obj in scene_objects and obj not in excluded and shown(obj)
+        and obj.data.polygons and not any(obj.get(prop) for prop in generated)
         and obj.name != BODY_MATERIAL_CARRIER_NAME
     ]
 
@@ -998,6 +1105,7 @@ def generate_shadow_mesh(context, settings):
     if not sources:
         raise ValueError("No body meshes found under the car root")
     previous = settings.shadow_object
+    parent = refresh_parent(settings, previous)
     if previous and previous.get(GENERATED_SHADOW_PROP):
         previous_mesh = previous.data
         bpy.data.objects.remove(previous, do_unlink=True)
@@ -1018,6 +1126,10 @@ def generate_shadow_mesh(context, settings):
     shadow.parent = root
     shadow.matrix_parent_inverse.identity()
     shadow.matrix_basis.identity()
+    # A refresh rebuilds the mesh in the group the previous one was in.
+    if parent != root:
+        context.view_layer.update()
+        keep_parent(shadow, parent)
     shadow.display_type = "WIRE"
     shadow[GENERATED_SHADOW_PROP] = True
     for orphan in meshes[1:]:
@@ -1033,6 +1145,7 @@ class CarMeshMergeResult:
         self.objects = []
         self.meshes = []
         self.source_states = []
+        self.lod_ranges = {}
 
     @property
     def sources(self):
@@ -1061,25 +1174,25 @@ def align_merge_layers(meshes):
             attribute.name = name
 
 
-def car_merge_groups(context, settings):
+def car_merge_groups(context, settings, ranges=None):
     """Meshes that join into one node each: same materials in use, same UV layer count and color
-    layers, under the same nearest anchor. Anchors are the car root and every node the manifest
-    names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
-    dashboard, ghost nodes, shadow mesh, ambient shadow), so each wheel merges on its own spin node and moving
-    parts keep moving. Colliders, skinned parts, referenced nodes, meshes with children and the
-    body color carrier are never merged."""
+    layers, same LOD level range, under the same nearest anchor. Anchors are the car root and every node
+    the manifest names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
+    dashboard, ghost shadow and shadow plane, shadow mesh, ambient shadow), so each wheel merges on its own
+    spin node and moving parts keep moving. Colliders, skinned parts, referenced nodes, meshes with
+    children and the body color carrier are never merged."""
     root = settings.car_root_object
     anchors = car_reference_objects(settings)
     anchors.update(obj for obj in (settings.shadow_object, settings.ambient_shadow_object) if obj)
     colliders = {collider.object_ref for collider in settings.colliders if collider.object_ref}
-    # The ghost LODs are built per moving part already and must stay apart from the full-detail ghost.
-    lod_objects = ghost_lod_objects(settings)
+    ranges = lod_object_ranges(settings) if ranges is None else ranges
     scene_objects = set(context.scene.objects)
     groups = {}
     for obj in hierarchy_objects(root):
         if obj.type != "MESH" or obj not in scene_objects or obj in anchors or obj in colliders:
             continue
-        if obj in lod_objects or not export_visible(obj):
+        # LOD meshes hidden by their eye still export.
+        if obj not in ranges and not export_visible(obj):
             continue
         if obj.children or obj.name == BODY_MATERIAL_CARRIER_NAME or is_skinned_object(obj) or not obj.data.polygons:
             continue
@@ -1095,17 +1208,20 @@ def car_merge_groups(context, settings):
             len(mesh.uv_layers),
             tuple((attribute.domain, attribute.data_type) for attribute in mesh.color_attributes),
             mesh.color_attributes.render_color_index,
+            ranges.get(obj),
         )
         groups.setdefault(key, (anchor, []))[1].append(obj)
     return [group for group in groups.values() if len(group[1]) > 1]
 
 
-def apply_car_mesh_merge(context, settings):
+def apply_car_mesh_merge(context, settings, ranges=None):
     """Joins each merge group into one temporary object on its anchor, with the evaluated
     geometry in the anchor's space, and unlinks the sources from the scene for the export.
-    The game pays per draw call, so this cuts the car's frame cost."""
+    The game pays per draw call, so this cuts the car's frame cost. A merged LOD group keeps its
+    sources' level range in result.lod_ranges."""
     result = CarMeshMergeResult()
-    groups = car_merge_groups(context, settings)
+    ranges = lod_object_ranges(settings) if ranges is None else ranges
+    groups = car_merge_groups(context, settings, ranges)
     if not groups:
         return result
     depsgraph = context.evaluated_depsgraph_get()
@@ -1120,6 +1236,8 @@ def apply_car_mesh_merge(context, settings):
             merged.matrix_parent_inverse.identity()
             merged.matrix_basis.identity()
             result.objects.append(merged)
+            if objects[0] in ranges:
+                result.lod_ranges[merged] = ranges[objects[0]]
             result.source_states.extend(export_exclusions(objects))
         unlink_export_helpers(result.source_states)
     except Exception:
@@ -1144,8 +1262,6 @@ def restore_car_mesh_merge(result):
     result.source_states.clear()
 
 
-GHOST_LOD1_NAME = "GHOST_LOD1"
-GHOST_LOD2_NAME = "GHOST_LOD2"
 GHOST_SHADOW_NAME = "GHOST_SHADOW"
 GHOST_SHADOW_PLANE_NAME = "GHOST_SHADOW_PLANE"
 # Pixels along the longer side of the top-down silhouette image.
@@ -1156,239 +1272,41 @@ GHOST_SHADOW_PLANE_BORDER = 0.3
 # The plane's colour in Blender only (linear): the game multiplies the ground under the silhouette by
 # each track's own shadow tint. This is roughly how the live shadow looks on Apex Park's asphalt.
 GHOST_SHADOW_PLANE_PREVIEW_COLOR = (0.00665, 0.00961, 0.01197)
-# Every LOD1 part is a child of the LOD1 node named after the moving ghost node it follows.
-GHOST_LOD1_PART_PREFIX = "LOD1_"
-GHOST_LOD1_RATIO = 0.2
-GHOST_LOD2_RATIO = 0.02
+# The silhouette is drawn from a light copy of the ghost.
+GHOST_SHADOW_PLANE_OUTLINE_RATIO = 0.02
 # About the density of a hand-decimated car shadow mesh (the Veyra's casts from 37.7k triangles).
 GHOST_SHADOW_RATIO = 0.1
-GHOST_LOD_ATLAS_NAME = "GHOST_LOD_ATLAS"
-GHOST_LOD_ATLAS_SIZE = 2048
 GENERATED_GHOST_LOD_PROP = "vectorg_generated_ghost_lod"
-GHOST_LOD_BAKE_UV_NAME = "VectorG_GhostLOD"
-# The LOD meshes carry one UV map, written as TEXCOORD_0: three.js derives normal-map tangents from it.
+# Generated planes carry one UV map, written as TEXCOORD_0.
 GHOST_LOD_UV_NAME = "UVMap"
-GHOST_LOD_SMART_PROJECT_ANGLE = math.radians(66.0)
-GHOST_LOD_ISLAND_MARGIN = 0.005
-GHOST_LOD_BAKE_MARGIN_PIXELS = 16
-GHOST_LOD_BAKE_SAMPLES = 1
-# (image, Cycles bake type, color space): the normal pass renders the materials as authored,
-# the others route Principled inputs into emission. glTF packs roughness in G and metallic in B.
-GHOST_LOD_BAKE_PASSES = (
-    ("normal", "NORMAL", "Non-Color"),
-    ("color", "EMIT", "sRGB"),
-    ("metallic_roughness", "EMIT", "Non-Color"),
-)
 
 
-def ghost_lod_objects(settings):
-    """The shadow mesh and the objects under the LOD1 and LOD2 nodes, none of which is full-detail ghost."""
-    objects = set()
-    for lod in (settings.ghost_shadow_object, settings.ghost_shadow_plane_object,
-                settings.ghost_lod1_object, settings.ghost_lod2_object):
-        objects.update(hierarchy_objects(lod))
-    return objects
+def validate_ghost_helper(settings, obj, label, errors):
+    if obj.type != "MESH" or not obj.data.polygons:
+        errors.append(f"Ghost {label} must be a mesh with faces")
+    if not in_car_body(settings, obj):
+        errors.append(f"Ghost {label} must be under Car Root, outside wheels and other moving nodes")
+    if obj.children:
+        errors.append(f"Ghost {label} must not have children")
+    if obj not in set(bpy.context.scene.objects):
+        errors.append(f"Ghost {label} must belong to the current scene")
+    if lod_name_level(obj.name):
+        errors.append(f"Ghost {label} must not be named as a LOD mesh")
 
 
-def ghost_lod_anchors(settings):
-    """The ghost root and every ghost wheel's mount, joint and spin: the nodes the game moves apart."""
-    anchors = [settings.ghost_root_object]
-    for group, key, _steering in WHEEL_KEYS:
-        wheel = ghost_wheel_settings(settings, group, key)
-        anchors.extend(getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES)
-    return list(dict.fromkeys(obj for obj in anchors if obj))
-
-
-def ghost_lod_parts(context, settings):
-    """Full-detail ghost meshes, hidden ones left out as the export leaves them out, grouped by the nearest
-    anchor at or above them. Each group moves as one part in the game, so it gets one LOD1 mesh following
-    that anchor."""
-    anchors = ghost_lod_anchors(settings)
-    anchor_set = set(anchors)
-    scene_objects = set(context.scene.objects)
-    excluded = ghost_lod_objects(settings)
-    parts = {anchor: [] for anchor in anchors}
-    for obj in hierarchy_objects(settings.ghost_root_object):
-        if obj.type != "MESH" or obj not in scene_objects or not obj.data.polygons or obj in excluded:
-            continue
-        if obj.name == BODY_MATERIAL_CARRIER_NAME or obj.get(GENERATED_GHOST_LOD_PROP) or not export_visible(obj):
-            continue
-        anchor = obj
-        while anchor not in anchor_set:
-            anchor = anchor.parent
-        parts[anchor].append(obj)
-    return [(anchor, objects) for anchor, objects in parts.items() if objects]
-
-
-def validate_ghost_shadow(settings, errors):
-    shadow = settings.ghost_shadow_object
-    if not shadow:
-        return
-    if shadow.type != "MESH" or not shadow.data.polygons:
-        errors.append("Ghost shadow must be a mesh with faces")
-    if shadow.parent != settings.ghost_root_object:
-        errors.append("Ghost shadow must be a direct child of Ghost Root")
-    if shadow.children:
-        errors.append("Ghost shadow must not have children")
-    if shadow not in set(bpy.context.scene.objects):
-        errors.append("Ghost shadow must belong to the current scene")
-    lods = (settings.ghost_lod1_object, settings.ghost_lod2_object)
-    if shadow in set(ghost_lod_anchors(settings)) or any(shadow in set(hierarchy_objects(lod)) for lod in lods):
-        errors.append("Ghost shadow must not be a ghost wheel node or part of LOD1 or LOD2")
-
-
-def validate_ghost_shadow_plane(settings, errors):
-    plane = settings.ghost_shadow_plane_object
-    if not plane:
-        return
-    if plane.type != "MESH" or not plane.data.polygons:
-        errors.append("Ghost shadow plane must be a mesh with faces")
-    if plane.parent != settings.ghost_root_object:
-        errors.append("Ghost shadow plane must be a direct child of Ghost Root")
-    if plane.children:
-        errors.append("Ghost shadow plane must not have children")
-    if plane not in set(bpy.context.scene.objects):
-        errors.append("Ghost shadow plane must belong to the current scene")
-    others = (settings.ghost_shadow_object, settings.ghost_lod1_object, settings.ghost_lod2_object)
-    if plane in set(ghost_lod_anchors(settings)) or any(plane in set(hierarchy_objects(other)) for other in others):
-        errors.append("Ghost shadow plane must not be a ghost wheel node, the shadow mesh or part of LOD1 or LOD2")
-
-
-def validate_ghost_lods(settings, errors):
-    lod1, lod2 = settings.ghost_lod1_object, settings.ghost_lod2_object
-    if not lod1 and not lod2:
-        return
-    if not (lod1 and lod2):
-        errors.append("Ghost LOD1 and LOD2 must both be set; use their refresh buttons")
-        return
-    if not settings.ghost_shadow_object or not settings.ghost_shadow_plane_object:
-        errors.append("Ghost LOD1 and LOD2 need the ghost Shadow mesh and Shadow Plane; use their refresh buttons")
-    root = settings.ghost_root_object
-    scene_objects = set(bpy.context.scene.objects)
-    anchors = set(ghost_lod_anchors(settings))
-    for label, lod in (("LOD1", lod1), ("LOD2", lod2)):
-        if lod.parent != root:
-            errors.append(f"Ghost {label} must be a direct child of Ghost Root")
-        if lod not in scene_objects:
-            errors.append(f"Ghost {label} must belong to the current scene")
-        if anchors & set(hierarchy_objects(lod)):
-            errors.append(f"Ghost {label} must not contain Ghost Root or ghost wheel nodes")
-    if lod1 is lod2 or is_object_in_tree(lod1, lod2) or is_object_in_tree(lod2, lod1):
-        errors.append("Ghost LOD1 and LOD2 must be separate hierarchies")
-        return
-    expected = {f"{GHOST_LOD1_PART_PREFIX}{anchor.name}" for anchor, _objects in ghost_lod_parts(bpy.context, settings)}
-    parts = {child.name: child for child in lod1.children}
-    for name in sorted(expected - parts.keys()):
-        errors.append(f"Ghost LOD1 has no part {name}; refresh LOD1")
-    for name in sorted(parts.keys() - expected):
-        errors.append(f"Ghost LOD1 part {name} follows no ghost node with geometry; refresh LOD1")
-    for name in sorted(parts.keys() & expected):
-        if parts[name].type != "MESH" or not parts[name].data.polygons:
-            errors.append(f"Ghost LOD1 part {name} must be a mesh with faces")
-    if not any(obj.type == "MESH" and obj.data.polygons for obj in hierarchy_objects(lod2)):
-        errors.append("Ghost LOD2 must contain mesh geometry")
-
-
-def surface_principled(output):
-    """The Principled BSDF that feeds a material output, searching upstream through mix shaders."""
-    surface = output.inputs["Surface"]
-    pending = [surface.links[0].from_node] if surface.is_linked else []
-    seen = set()
-    while pending:
-        node = pending.pop(0)
-        if node in seen:
-            continue
-        seen.add(node)
-        if node.type == "BSDF_PRINCIPLED":
-            return node
-        pending.extend(link.from_node for socket in node.inputs for link in socket.links)
-    return None
-
-
-def feed_socket(tree, source, target):
-    """Links source's input into target, or copies source's value when nothing is linked to it."""
-    if source.is_linked:
-        tree.links.new(source.links[0].from_socket, target)
-        return
-    value = source.default_value
-    values = tuple(value) if hasattr(value, "__len__") else (value,)
-    current = target.default_value
-    if not hasattr(current, "__len__"):
-        target.default_value = values[0]
-        return
-    size = len(current)
-    target.default_value = (values * size)[:size] if len(values) == 1 else (values + (1.0,) * size)[:size]
-
-
-class GhostLodBakeMaterial:
-    """A temporary copy of one ghost material that the atlas bakes through. The normal pass renders the
-    material as authored; the other passes route Principled BSDF inputs into an emission shader.
-    Materials without a reachable Principled BSDF bake their viewport display values."""
-
-    def __init__(self, source):
-        self.material = source.copy() if source else bpy.data.materials.new("vectorg_ghost_lod_bake")
-        self.material.name = f"{source.name if source else 'default'}_vectorg_ghost_lod_bake"
-        self.constants = {
-            "color": tuple(source.diffuse_color[:3]) + (1.0,) if source else (0.8, 0.8, 0.8, 1.0),
-            "metallic_roughness": (1.0, source.roughness, source.metallic, 1.0) if source else (1.0, 0.5, 0.0, 1.0),
-        }
-        uses_nodes = bool(source and source.use_nodes)
-        self.material.use_nodes = True
-        tree = self.material.node_tree
-        self.tree = tree
-        self.output = tree.get_output_node("CYCLES") or tree.nodes.new("ShaderNodeOutputMaterial")
-        surface = self.output.inputs["Surface"]
-        self.surface = surface.links[0].from_socket if surface.is_linked else None
-        self.principled = surface_principled(self.output) if uses_nodes else None
-        self.emission = tree.nodes.new("ShaderNodeEmission")
-        self.emission.inputs["Strength"].default_value = 1.0
-        self.image_node = tree.nodes.new("ShaderNodeTexImage")
-        tree.nodes.active = self.image_node
-
-    def route(self, name, image):
-        """Prepares one bake pass into image. Base color is darkened by alpha and transmission, so
-        glass bakes as a tinted solid instead of white."""
-        tree = self.tree
-        self.image_node.image = image
-        surface = self.output.inputs["Surface"]
-        for link in list(surface.links):
-            tree.links.remove(link)
-        if name == "normal":
-            if self.surface:
-                tree.links.new(self.surface, surface)
-            return
-        tree.links.new(self.emission.outputs["Emission"], surface)
-        color = self.emission.inputs["Color"]
-        for link in list(color.links):
-            tree.links.remove(link)
-        principled = self.principled
-        if principled is None:
-            color.default_value = self.constants[name]
-            return
-        if name == "metallic_roughness":
-            channels = tree.nodes.new("ShaderNodeCombineColor")
-            channels.inputs["Red"].default_value = 1.0
-            feed_socket(tree, principled.inputs["Roughness"], channels.inputs["Green"])
-            feed_socket(tree, principled.inputs["Metallic"], channels.inputs["Blue"])
-            tree.links.new(channels.outputs["Color"], color)
-            return
-        tint = tree.nodes.new("ShaderNodeVectorMath")
-        tint.operation = "MULTIPLY"
-        feed_socket(tree, principled.inputs["Base Color"], tint.inputs[0])
-        coverage = tree.nodes.new("ShaderNodeMath")
-        coverage.operation = "MULTIPLY"
-        feed_socket(tree, principled.inputs["Alpha"], coverage.inputs[0])
-        transmission = principled.inputs.get("Transmission Weight") or principled.inputs.get("Transmission")
-        if transmission:
-            opaque = tree.nodes.new("ShaderNodeMath")
-            opaque.operation = "SUBTRACT"
-            opaque.inputs[0].default_value = 1.0
-            feed_socket(tree, transmission, opaque.inputs[1])
-            tree.links.new(opaque.outputs[0], coverage.inputs[1])
-        else:
-            coverage.inputs[1].default_value = 1.0
-        tree.links.new(coverage.outputs[0], tint.inputs[1])
-        tree.links.new(tint.outputs["Vector"], color)
+def validate_ghost_scene(settings, errors, _warnings):
+    shadow, plane = settings.ghost_shadow_object, settings.ghost_shadow_plane_object
+    if shadow:
+        validate_ghost_helper(settings, shadow, "shadow", errors)
+    if plane:
+        validate_ghost_helper(settings, plane, "shadow plane", errors)
+    if shadow and plane and shadow == plane:
+        errors.append("Ghost shadow and shadow plane must be different objects")
+    others = {settings.shadow_object, settings.ambient_shadow_object}
+    if any(obj and obj in others for obj in (shadow, plane)):
+        errors.append("Ghost shadow and shadow plane must not be the car's shadow mesh or AO plane")
+    if settings.lods_enabled and len(exported_lod_levels(settings)) > 1 and not (shadow and plane):
+        errors.append("LODs need the ghost Shadow and Shadow Plane; use their refresh buttons")
 
 
 class GhostLodBuild:
@@ -1433,43 +1351,6 @@ def remove_datablocks(datablocks):
                 pass
 
 
-def ghost_lod_cycles_device():
-    preferences = bpy.context.preferences.addons.get("cycles")
-    if preferences and preferences.preferences.has_active_device():
-        return "GPU"
-    return "CPU"
-
-
-def split_mesh_faces(mesh, keep):
-    """Deletes the faces whose material keep() rejects; returns False when none remain."""
-    materials = list(mesh.materials)
-    bm = bmesh.new()
-    try:
-        bm.from_mesh(mesh)
-        rejected = [
-            face for face in bm.faces
-            if not keep(materials[face.material_index] if face.material_index < len(materials) else None)
-        ]
-        bmesh.ops.delete(bm, geom=rejected, context="FACES")
-        bm.to_mesh(mesh)
-    finally:
-        bm.free()
-    mesh.update()
-    return bool(mesh.polygons)
-
-
-def keep_single_uv_layer(mesh, name):
-    """Leaves only the UV map `name` (a fresh one when it is missing), renamed to the LOD UV map."""
-    for other in [layer.name for layer in mesh.uv_layers if layer.name != name]:
-        mesh.uv_layers.remove(mesh.uv_layers[other])
-    layer = mesh.uv_layers.get(name) if name else None
-    if layer is None:
-        layer = mesh.uv_layers.new(name=GHOST_LOD_UV_NAME)
-    layer.name = GHOST_LOD_UV_NAME
-    layer.active = True
-    layer.active_render = True
-
-
 def decimate_ghost_lod(context, build, obj, ratio, keep=True):
     """Replaces obj's mesh with its Collapse-decimated version and returns the triangle count. The new mesh
     is a result to keep, or temporary when obj is."""
@@ -1486,30 +1367,6 @@ def decimate_ghost_lod(context, build, obj, ratio, keep=True):
     mesh.validate(clean_customdata=False)
     mesh.calc_loop_triangles()
     return len(mesh.loop_triangles)
-
-
-def ghost_lod_atlas_material(build, images):
-    material = bpy.data.materials.new(GHOST_LOD_ATLAS_NAME)
-    build.results.append(material)
-    material[GENERATED_GHOST_LOD_PROP] = True
-    material.use_nodes = True
-    tree = material.node_tree
-    principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
-
-    def texture(image):
-        node = tree.nodes.new("ShaderNodeTexImage")
-        node.image = image
-        return node
-
-    tree.links.new(texture(images["color"]).outputs["Color"], principled.inputs["Base Color"])
-    channels = tree.nodes.new("ShaderNodeSeparateColor")
-    tree.links.new(texture(images["metallic_roughness"]).outputs["Color"], channels.inputs["Color"])
-    tree.links.new(channels.outputs["Green"], principled.inputs["Roughness"])
-    tree.links.new(channels.outputs["Blue"], principled.inputs["Metallic"])
-    normal_map = tree.nodes.new("ShaderNodeNormalMap")
-    tree.links.new(texture(images["normal"]).outputs["Color"], normal_map.inputs["Color"])
-    tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
-    return material
 
 
 def box_blur(values, radius, axis):
@@ -1680,8 +1537,8 @@ def strip_mesh_surface(mesh):
         mesh.color_attributes.remove(mesh.color_attributes[0])
 
 
-def ghost_root_child(context, build, collection, root, meshes, name):
-    """meshes, in Ghost Root's space, joined into one new object under Ghost Root."""
+def car_root_child(context, build, collection, root, meshes, name):
+    """meshes, in Car Root's space, joined into one new object under Car Root."""
     obj = join_meshes(context, meshes, collection, f"{name}_new", root)
     build.results.append(obj)
     obj.parent = root
@@ -1690,327 +1547,97 @@ def ghost_root_child(context, build, collection, root, meshes, name):
     return obj
 
 
-GHOST_LOD_TARGETS = (
-    ("SHADOW", "Shadow", "Join Ghost Root's own meshes, without the wheels, into the shadow mesh at "
+GHOST_SHADOW_TARGETS = (
+    ("SHADOW", "Shadow", "Join the ghost default LOD's meshes, without the wheels, into the ghost shadow mesh at "
      f"{round(GHOST_SHADOW_RATIO * 100)}% of their triangles"),
-    ("SHADOW_PLANE", "Shadow Plane", "Bake the whole ghost's top-down silhouette into the shadow plane's texture"),
-    ("LOD1", "LOD1", "Bake the ghost's materials into the LOD texture atlas and build LOD1, one mesh per moving part "
-     f"at {round(GHOST_LOD1_RATIO * 100)}% of its triangles; LOD2 is rebuilt from it, as both use the atlas"),
-    ("LOD2", "LOD2", f"Build LOD2 from LOD1, the whole car as one mesh at {round(GHOST_LOD2_RATIO * 100)}% of "
-     "the ghost's triangles"),
+    ("SHADOW_PLANE", "Shadow Plane", "Bake the ghost default LOD's top-down silhouette, wheels included, into the "
+     "shadow plane's texture"),
 )
 
 
-def iter_generate_ghost_lods(context, settings, build, target, background_bake=False):
-    """Rebuilds one generated part of the custom ghost in the scene, yielding (fraction, message) between
-    steps, and replaces what an earlier refresh made for it. Results are hidden in the viewport.
+def iter_generate_ghost_shadow(context, settings, build, target):
+    """Rebuilds the ghost's shadow mesh or shadow plane under Car Root from the meshes the game shows at the
+    ghost default LOD, yielding (fraction, message) between steps, and replaces what an earlier refresh made.
+    Results are hidden in the viewport.
 
-    SHADOW: Ghost Root's own meshes without wheels, as one material-less mesh at GHOST_SHADOW_RATIO, which
-    the game casts the ghost's shadow from with LOD0.
-    SHADOW_PLANE: a flat quad textured with the whole ghost's top-down silhouette, which the game lays on
-    the ground in place of the shadow from LOD1 on.
-    LOD1: every full-detail ghost mesh is copied into its part's space; all faces except the body paint are
-    unwrapped into one atlas and baked from their own materials (normal, base color, roughness, metallic).
-    An empty under Ghost Root holds one mesh per part at GHOST_LOD1_RATIO, named after the node it follows,
-    so wheels keep moving. LOD2 is rebuilt from it.
-    LOD2: the LOD1 parts as one mesh under Ghost Root at GHOST_LOD2_RATIO, using the same atlas.
-
-    With background_bake, each Cycles pass runs as Blender's bake job and this keeps yielding while it
-    runs, so Blender stays responsive; otherwise the passes bake in place."""
-    root = settings.ghost_root_object
-    if not settings.ghost_enabled or not root:
-        raise ValueError("Enable Custom Ghost and set Ghost Root first")
+    SHADOW: those meshes without the wheels, as one material-less mesh at GHOST_SHADOW_RATIO, which casts
+    the ghost's shadow while it shows its default level.
+    SHADOW_PLANE: a flat quad textured with their top-down silhouette, wheels included, which the game lays
+    on the ground in place of the shadow at coarser levels."""
+    root = settings.car_root_object
+    if not root:
+        raise ValueError("Set Car Root first")
     if context.mode != "OBJECT":
-        raise ValueError("Switch to Object Mode to refresh ghost LODs")
-    parts = ghost_lod_parts(context, settings)
-    if not parts:
-        raise ValueError("The ghost has no mesh geometry")
-    body_objects = next((objects for anchor, objects in parts if anchor == root), [])
-    if target == "SHADOW" and not body_objects:
-        raise ValueError("Ghost Root has no meshes of its own (outside the wheels) to build the shadow mesh from")
-    lod1_parts = [
-        child for child in hierarchy_objects(settings.ghost_lod1_object)[1:]
-        if child.type == "MESH" and child.name.startswith(GHOST_LOD1_PART_PREFIX)
-    ]
-    if target == "LOD2" and not lod1_parts:
-        raise ValueError("LOD2 is built from LOD1: refresh LOD1 first")
-
-    replaced_nodes = {
-        "SHADOW": [settings.ghost_shadow_object],
-        "SHADOW_PLANE": [settings.ghost_shadow_plane_object],
-        "LOD1": [settings.ghost_lod1_object, settings.ghost_lod2_object],
-        "LOD2": [settings.ghost_lod2_object],
-    }[target]
-    previous = previous_generated(replaced_nodes, GENERATED_GHOST_LOD_PROP)
-    previous_set = set(previous)
-    final_names = {
-        "SHADOW": [GHOST_SHADOW_NAME],
-        "SHADOW_PLANE": [GHOST_SHADOW_PLANE_NAME],
-        "LOD1": [GHOST_LOD1_NAME, GHOST_LOD2_NAME] + [f"{GHOST_LOD1_PART_PREFIX}{anchor.name}" for anchor, _objects in parts],
-        "LOD2": [GHOST_LOD2_NAME],
-    }[target]
-    for name in final_names:
-        existing = bpy.data.objects.get(name)
-        if existing and existing not in previous_set:
-            raise ValueError(f"Object name {name} is reserved for the generated ghost LODs; rename that object")
+        raise ValueError("Switch to Object Mode to refresh the ghost shadow")
+    position = ghost_lod_position(settings)
+    if position is None:
+        raise ValueError(f"Ghost Default LOD{settings.ghost_lod} is not exported; pick an exported level")
+    sources = shadow_source_objects(context, settings, wheels=target == "SHADOW_PLANE", lod_position=position)
+    if not sources:
+        raise ValueError("The ghost default LOD has no meshes to build from")
+    field = {"SHADOW": "ghost_shadow_object", "SHADOW_PLANE": "ghost_shadow_plane_object"}[target]
+    name = {"SHADOW": GHOST_SHADOW_NAME, "SHADOW_PLANE": GHOST_SHADOW_PLANE_NAME}[target]
+    previous = previous_generated([getattr(settings, field)], GENERATED_GHOST_LOD_PROP)
+    parent = refresh_parent(settings, getattr(settings, field))
+    existing = bpy.data.objects.get(name)
+    if existing and existing not in set(previous):
+        raise ValueError(f"Object name {name} is reserved for the generated ghost shadow; rename that object")
 
     depsgraph = context.evaluated_depsgraph_get()
-    scene = context.scene
     view_layer = context.view_layer
-    collection = root.users_collection[0] if root.users_collection else scene.collection
-    selected = list(context.selected_objects)
-    active = view_layer.objects.active
-
-    def restore_selection():
-        for obj in view_layer.objects:
-            obj.select_set(obj in selected)
-        view_layer.objects.active = active if active and active.name in view_layer.objects else None
-
-    build.restores.append(restore_selection)
-    root_inverse = root.matrix_world.inverted()
-    # (datablock, final name) for every result, renamed once the earlier ones are gone, and the fields that
-    # take the results only then, so a failed or cancelled refresh leaves them as they were.
+    collection = root.users_collection[0] if root.users_collection else context.scene.collection
+    meshes = []
+    for index, obj in enumerate(sources):
+        yield 0.6 * index / len(sources), f"Copying {obj.name}..."
+        mesh = evaluated_mesh_copy(obj, root, depsgraph)
+        build.temporary.append(mesh)
+        strip_mesh_surface(mesh)
+        meshes.append(mesh)
     renames = []
-    fields = []
-    triangles = {}
-
-    def build_lod2(part_meshes):
-        """LOD2 from LOD1 part meshes and their world matrices: copies in Ghost Root's space, joined."""
-        copies = []
-        for mesh, matrix in part_meshes:
-            copy = mesh.copy()
-            build.temporary.append(copy)
-            copy.transform(root_inverse @ matrix)
-            copies.append(copy)
-        lod2 = ghost_root_child(context, build, collection, root, copies, GHOST_LOD2_NAME)
-        triangles[GHOST_LOD2_NAME] = decimate_ghost_lod(context, build, lod2, GHOST_LOD2_RATIO / GHOST_LOD1_RATIO)
-        renames.append((lod2, GHOST_LOD2_NAME))
-        fields.append(("ghost_lod2_object", lod2))
-
-    if target in {"SHADOW", "SHADOW_PLANE"}:
-        sources = body_objects if target == "SHADOW" else [obj for _anchor, objects in parts for obj in objects]
-        meshes = []
-        for index, obj in enumerate(sources):
-            yield 0.6 * index / len(sources), f"Copying {obj.name}..."
-            mesh = evaluated_mesh_copy(obj, root, depsgraph)
-            build.temporary.append(mesh)
-            strip_mesh_surface(mesh)
-            meshes.append(mesh)
-        if target == "SHADOW":
-            yield 0.7, f"Building {GHOST_SHADOW_NAME}..."
-            shadow = ghost_root_child(context, build, collection, root, meshes, GHOST_SHADOW_NAME)
-            shadow.display_type = "WIRE"
-            triangles[GHOST_SHADOW_NAME] = decimate_ghost_lod(context, build, shadow, GHOST_SHADOW_RATIO)
-            renames.append((shadow, GHOST_SHADOW_NAME))
-            fields.append(("ghost_shadow_object", shadow))
-        else:
-            # The silhouette comes from a light copy of the whole car, wheels included.
-            yield 0.7, "Simplifying the ghost for its silhouette..."
-            outline = join_meshes(context, meshes, collection, f"{GHOST_SHADOW_PLANE_NAME}_outline", root)
-            build.temporary.append(outline)
-            floor = lowest_point(outline.data)
-            decimate_ghost_lod(context, build, outline, GHOST_LOD2_RATIO, keep=False)
-            yield 0.85, f"Building {GHOST_SHADOW_PLANE_NAME}..."
-            plane = build_shadow_plane(
-                build, collection, root, outline.data, floor, GHOST_SHADOW_PLANE_NAME, GENERATED_GHOST_LOD_PROP,
-                (GHOST_SHADOW_PLANE_PIXELS, GHOST_SHADOW_PLANE_SOFTNESS, GHOST_SHADOW_PLANE_BORDER),
-                (1.0, 1.0, 1.0), GHOST_SHADOW_PLANE_PREVIEW_COLOR,
-            )
-            renames.append((plane, GHOST_SHADOW_PLANE_NAME))
-            renames.append((plane.active_material, GHOST_SHADOW_PLANE_NAME))
-            renames.append((plane.active_material.node_tree.nodes["Silhouette"].image, f"{GHOST_SHADOW_PLANE_NAME}_silhouette"))
-            fields.append(("ghost_shadow_plane_object", plane))
-
-    elif target == "LOD2":
-        yield 0.3, f"Building {GHOST_LOD2_NAME}..."
-        build_lod2([(part.data, part.matrix_world) for part in lod1_parts])
-
+    if target == "SHADOW":
+        yield 0.7, f"Building {GHOST_SHADOW_NAME}..."
+        result = car_root_child(context, build, collection, root, meshes, GHOST_SHADOW_NAME)
+        result.display_type = "WIRE"
+        triangles = decimate_ghost_lod(context, build, result, GHOST_SHADOW_RATIO)
+        renames.append((result, GHOST_SHADOW_NAME))
+        summary = f"{triangles} triangles"
     else:
-        paint = {color.material for color in settings.body_colors if color.material}
-        # (anchor, [(mesh, baked)]): baked faces take the atlas, the rest keep the body paint.
-        pieces = []
-        bake_objects = []
-        copied, total = 0, sum(len(objects) for _anchor, objects in parts)
-        for anchor, objects in parts:
-            part_pieces = []
-            for obj in objects:
-                yield 0.1 * copied / total, f"Copying {obj.name}..."
-                copied += 1
-                mesh = evaluated_mesh_copy(obj, anchor, depsgraph)
-                painted = mesh.copy()
-                build.temporary.extend((mesh, painted))
-                if split_mesh_faces(mesh, lambda material: material not in paint):
-                    part_pieces.append((mesh, True))
-                    piece = bpy.data.objects.new(f"{obj.name}_vectorg_ghost_lod_bake", mesh)
-                    # Over the object it copies, as the copy is in its anchor's space.
-                    piece.matrix_world = anchor.matrix_world.copy()
-                    scene.collection.objects.link(piece)
-                    build.temporary.append(piece)
-                    bake_objects.append(piece)
-                if split_mesh_faces(painted, lambda material: material in paint):
-                    part_pieces.append((painted, False))
-            pieces.append((anchor, part_pieces))
+        yield 0.7, "Simplifying the ghost for its silhouette..."
+        outline = join_meshes(context, meshes, collection, f"{GHOST_SHADOW_PLANE_NAME}_outline", root)
+        build.temporary.append(outline)
+        floor = lowest_point(outline.data)
+        decimate_ghost_lod(context, build, outline, GHOST_SHADOW_PLANE_OUTLINE_RATIO, keep=False)
+        yield 0.85, f"Building {GHOST_SHADOW_PLANE_NAME}..."
+        result = build_shadow_plane(
+            build, collection, root, outline.data, floor, GHOST_SHADOW_PLANE_NAME, GENERATED_GHOST_LOD_PROP,
+            (GHOST_SHADOW_PLANE_PIXELS, GHOST_SHADOW_PLANE_SOFTNESS, GHOST_SHADOW_PLANE_BORDER),
+            (1.0, 1.0, 1.0), GHOST_SHADOW_PLANE_PREVIEW_COLOR,
+        )
+        renames.append((result, GHOST_SHADOW_PLANE_NAME))
+        renames.append((result.active_material, GHOST_SHADOW_PLANE_NAME))
+        renames.append((result.active_material.node_tree.nodes["Silhouette"].image, f"{GHOST_SHADOW_PLANE_NAME}_silhouette"))
+        summary = f"from {len(sources)} meshes"
 
-        atlas_material = None
-        if bake_objects:
-            bake_materials = {}
-            for piece in bake_objects:
-                mesh = piece.data
-                if not mesh.materials:
-                    mesh.materials.append(None)
-                # Every slot needs a bake image, including paint slots that no face uses any more.
-                for index, source in enumerate(mesh.materials):
-                    if source not in bake_materials:
-                        bake_materials[source] = GhostLodBakeMaterial(source)
-                        build.temporary.append(bake_materials[source].material)
-                    mesh.materials[index] = bake_materials[source].material
-                layer = mesh.uv_layers.new(name=GHOST_LOD_BAKE_UV_NAME, do_init=False)
-                if layer is None:
-                    raise RuntimeError(f"Ghost mesh {piece.name} has no free UV map slot for the LOD atlas")
-                mesh.uv_layers.active = layer
-
-            yield 0.1, "Unwrapping the LOD texture atlas..."
-            for obj in context.selected_objects:
-                obj.select_set(False)
-            for piece in bake_objects:
-                piece.select_set(True)
-            view_layer.objects.active = bake_objects[0]
-            bpy.ops.object.mode_set(mode="EDIT")
-            try:
-                bpy.ops.mesh.reveal(select=False)
-                bpy.ops.mesh.select_all(action="SELECT")
-                bpy.ops.uv.smart_project(
-                    angle_limit=GHOST_LOD_SMART_PROJECT_ANGLE,
-                    island_margin=GHOST_LOD_ISLAND_MARGIN,
-                    area_weight=0.0,
-                    correct_aspect=True,
-                    scale_to_bounds=False,
-                )
-            finally:
-                bpy.ops.object.mode_set(mode="OBJECT")
-
-            images = {}
-            bake_state = GhostLodBuild()
-            bake_state.succeeded = True
-            try:
-                bake_state.assign(scene.render, "engine", "CYCLES")
-                bake_state.assign(scene.cycles, "device", ghost_lod_cycles_device())
-                bake_state.assign(scene.cycles, "samples", GHOST_LOD_BAKE_SAMPLES)
-                # Each pass syncs every renderable object; the copies bake from their own materials alone.
-                for obj in scene.objects:
-                    if obj not in bake_objects and not obj.hide_render:
-                        bake_state.assign(obj, "hide_render", True)
-                size = GHOST_LOD_ATLAS_SIZE
-                for index, (name, bake_type, colorspace) in enumerate(GHOST_LOD_BAKE_PASSES):
-                    fraction = 0.2 + 0.5 * index / len(GHOST_LOD_BAKE_PASSES)
-                    message = f"Baking {name.replace('_', ' ')} ({index + 1}/{len(GHOST_LOD_BAKE_PASSES)})..."
-                    yield fraction, message
-                    image = bpy.data.images.new(f"{GHOST_LOD_ATLAS_NAME}_{name}_new", size, size, alpha=False)
-                    build.results.append(image)
-                    image[GENERATED_GHOST_LOD_PROP] = True
-                    image.colorspace_settings.name = colorspace
-                    for material in bake_materials.values():
-                        material.route(name, image)
-                    options = {
-                        "type": bake_type,
-                        "margin": GHOST_LOD_BAKE_MARGIN_PIXELS,
-                        "margin_type": "EXTEND",
-                        "use_selected_to_active": False,
-                        "use_clear": True,
-                        "target": "IMAGE_TEXTURES",
-                        "uv_layer": GHOST_LOD_BAKE_UV_NAME,
-                    }
-                    if bake_type == "NORMAL":
-                        options["normal_space"] = "TANGENT"
-                    if background_bake:
-                        # Esc while the job runs cancels it, and Blender reports failures the same way.
-                        stopped = []
-                        on_stop = lambda *_args: stopped.append(True)
-                        bpy.app.handlers.object_bake_cancel.append(on_stop)
-                        try:
-                            outcome = bpy.ops.object.bake("INVOKE_DEFAULT", **options)
-                            if "RUNNING_MODAL" not in outcome and "FINISHED" not in outcome:
-                                raise RuntimeError(f"Cycles {name} bake did not start; see the Info log")
-                            while bpy.app.is_job_running("OBJECT_BAKE"):
-                                yield fraction, message
-                        finally:
-                            bpy.app.handlers.object_bake_cancel.remove(on_stop)
-                        if stopped:
-                            raise RuntimeError(f"Cycles {name} bake was cancelled or failed; see the Info log")
-                    elif "FINISHED" not in bpy.ops.object.bake(**options):
-                        raise RuntimeError(f"Cycles {name} bake did not finish")
-                    # Packed, so the atlas is saved inside the .blend file.
-                    image.pack()
-                    images[name] = image
-                    renames.append((image, f"{GHOST_LOD_ATLAS_NAME}_{name}"))
-            finally:
-                bake_state.finish()
-            atlas_material = ghost_lod_atlas_material(build, images)
-            renames.append((atlas_material, GHOST_LOD_ATLAS_NAME))
-            remove_datablocks(bake_objects)
-
-        yield 0.75, "Building LOD meshes..."
-        for _anchor, part_pieces in pieces:
-            for mesh, baked_faces in part_pieces:
-                if baked_faces:
-                    keep_single_uv_layer(mesh, GHOST_LOD_BAKE_UV_NAME)
-                    while mesh.color_attributes:
-                        mesh.color_attributes.remove(mesh.color_attributes[0])
-                    mesh.materials.clear()
-                    mesh.materials.append(atlas_material)
-                    mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), dtype=np.int32))
-                else:
-                    render_layer = next((layer.name for layer in mesh.uv_layers if layer.active_render), None)
-                    keep_single_uv_layer(mesh, render_layer)
-
-        lod1 = bpy.data.objects.new(f"{GHOST_LOD1_NAME}_new", None)
-        collection.objects.link(lod1)
-        build.results.append(lod1)
-        lod1.parent = root
-        lod1.matrix_parent_inverse.identity()
-        lod1.matrix_basis.identity()
-        renames.append((lod1, GHOST_LOD1_NAME))
-        built = []
-        for index, (anchor, part_pieces) in enumerate(pieces):
-            name = f"{GHOST_LOD1_PART_PREFIX}{anchor.name}"
-            yield 0.75 + 0.15 * index / len(pieces), f"Building {name}..."
-            # The part sits at its anchor's pose under the LOD1 node.
-            part = join_meshes(context, [mesh for mesh, _baked in part_pieces], collection, f"{name}_new", anchor)
-            build.results.append(part)
-            part.parent = lod1
-            part.matrix_world = anchor.matrix_world.copy()
-            triangles[name] = decimate_ghost_lod(context, build, part, GHOST_LOD1_RATIO)
-            renames.append((part, name))
-            built.append((part.data, anchor.matrix_world.copy()))
-        fields.append(("ghost_lod1_object", lod1))
-
-        yield 0.9, f"Building {GHOST_LOD2_NAME}..."
-        build_lod2(built)
-
-    # Done: the results replace what an earlier refresh made and take their names.
+    # Done: the result replaces what an earlier refresh made and takes its name.
     remove_datablocks(previous)
-    # Objects linked without an operator since only show in the view layer, for hiding, after an update.
+    # Objects linked without an operator only show in the view layer, for hiding, after an update.
     view_layer.update()
-    for datablock, name in renames:
-        datablock.name = name
+    if parent != root:
+        keep_parent(result, parent)
+    for datablock, final_name in renames:
+        datablock.name = final_name
         if isinstance(datablock, bpy.types.Object):
             datablock[GENERATED_GHOST_LOD_PROP] = True
             if datablock.data:
-                datablock.data.name = name
+                datablock.data.name = final_name
             if datablock.name in view_layer.objects:
                 datablock.hide_set(True)
-        if datablock.name != name:
-            raise RuntimeError(f"Generated ghost LOD {name} could not take its name")
-    for field, obj in fields:
-        setattr(settings, field, obj)
+        if datablock.name != final_name:
+            raise RuntimeError(f"Generated ghost {final_name} could not take its name")
+    setattr(settings, field, result)
     build.succeeded = True
-    print(f"VectorG ghost {target} triangles {triangles}")
-    label = next(label for key, label, _description in GHOST_LOD_TARGETS if key == target)
-    summary = ", ".join(f"{name} {count}" for name, count in triangles.items() if not name.startswith(GHOST_LOD1_PART_PREFIX))
-    lod1_count = sum(count for name, count in triangles.items() if name.startswith(GHOST_LOD1_PART_PREFIX))
-    if lod1_count:
-        summary = f"LOD1 {lod1_count}, {summary}"
-    yield 1.0, f"{label} refreshed" + (f": {summary} triangles" if summary else "")
+    label = next(label for key, label, _description in GHOST_SHADOW_TARGETS if key == target)
+    yield 1.0, f"Ghost {label} refreshed from LOD{settings.ghost_lod if settings.lods_enabled else 0}: {summary}"
 
 
 def iter_generate_ambient_shadow(context, settings, build):
@@ -2027,6 +1654,7 @@ def iter_generate_ambient_shadow(context, settings, build):
     if not sources:
         raise ValueError("No car meshes found under the car root")
     previous = previous_generated([settings.ambient_shadow_object], GENERATED_AMBIENT_SHADOW_PROP)
+    parent = refresh_parent(settings, settings.ambient_shadow_object)
     existing = bpy.data.objects.get(AMBIENT_SHADOW_NAME)
     if existing and existing not in set(previous):
         raise ValueError(f"Object name {AMBIENT_SHADOW_NAME} is reserved for the generated ambient shadow; rename that object")
@@ -2067,6 +1695,8 @@ def iter_generate_ambient_shadow(context, settings, build):
     remove_datablocks(previous)
     # Objects linked without an operator only show in the view layer, for hiding, after an update.
     view_layer.update()
+    if parent != root:
+        keep_parent(plane, parent)
     for datablock, name in ((plane, AMBIENT_SHADOW_NAME), (plane.data, AMBIENT_SHADOW_NAME),
                             (plane.active_material, AMBIENT_SHADOW_NAME), (image, f"{AMBIENT_SHADOW_NAME}_outline")):
         datablock.name = name
@@ -2095,8 +1725,6 @@ def armature_attachment_object(settings, role):
         obj = getattr(wheel, prop) if wheel else None
     if not obj or obj not in car_export_objects(settings) or not is_object_in_tree(settings.car_root_object, obj):
         raise ValueError(f"Armature attachment {role} requires an exported car object assignment")
-    if is_object_in_tree(settings.ghost_root_object, obj):
-        raise ValueError(f"Armature attachment {role} must be outside the custom ghost hierarchy")
     return obj
 
 
@@ -2208,11 +1836,9 @@ def validate_armature_scene(settings, errors, warnings):
     exported_objects = set(car_export_objects(settings))
     if rig not in exported_objects or rig == settings.car_root_object or not is_object_in_tree(settings.car_root_object, rig):
         errors.append("Armature must be inside the exported car hierarchy below Car Root")
-    if is_object_in_tree(settings.ghost_root_object, rig):
-        errors.append("Armature must be outside the custom ghost hierarchy")
     # Sources and rig must not drive each other through object/bone parenting.
     for wheel in settings.wheels:
-        for _role, prop in GHOST_WHEEL_ROLES:
+        for _role, prop in WHEEL_NODE_ROLES:
             obj = getattr(wheel, prop)
             if obj and (is_object_in_tree(obj, rig) or is_object_in_tree(rig, obj)):
                 errors.append("Armature and normal wheel objects must use independent hierarchies")
@@ -2240,161 +1866,164 @@ def gltf_armature_export_options(settings):
 
 
 def build_ghost_config(settings):
-    if not settings.ghost_enabled:
+    shadow, plane = settings.ghost_shadow_object, settings.ghost_shadow_plane_object
+    if not shadow and not plane:
         return None
-    wheels = {"front": {}, "rear": {}}
-    for group, key, _steering in WHEEL_KEYS:
-        wheel = ghost_wheel_settings(settings, group, key)
-        wheels[group][key] = {
-            role: {"obj": object_config_name(getattr(wheel, prop))}
-            for role, prop in GHOST_WHEEL_ROLES
-        }
-    lods = None
-    if settings.ghost_lod1_object and settings.ghost_lod2_object:
-        lods = [{"obj": object_config_name(lod)} for lod in (settings.ghost_lod1_object, settings.ghost_lod2_object)]
-    shadow = {"obj": object_config_name(settings.ghost_shadow_object)} if settings.ghost_shadow_object else None
-    plane = settings.ghost_shadow_plane_object
-    shadow_plane = {"obj": object_config_name(plane)} if plane else None
-    return {"obj": object_config_name(settings.ghost_root_object), "wheels": wheels, "shadow": shadow,
-            "shadowPlane": shadow_plane, "lods": lods}
+    return {
+        "shadow": {"obj": object_config_name(shadow)} if shadow else None,
+        "shadowPlane": {"obj": object_config_name(plane)} if plane else None,
+    }
+
+
+def build_lods_config(settings, object_names=None):
+    """The exported levels, finest first, with the share of the screen height above which each shows, the
+    ghost default level's position among them, and the level positions every exported LOD mesh shows at,
+    by the node name it exports under. object_names maps the exported names to (first, last); by default
+    every exported LOD mesh exports under its own name."""
+    if not settings.lods_enabled:
+        return None
+    levels = exported_lod_levels(settings)
+    if object_names is None:
+        object_names = {obj.name: span for obj, span in lod_object_ranges(settings).items()}
+    return {
+        "levels": [
+            {"level": level, "screenHeight": lod_level_row(settings, level).screen_height / 100.0}
+            for level in levels
+        ],
+        "ghost": ghost_lod_position(settings),
+        "objects": {name: [first, last] for name, (first, last) in sorted(object_names.items())},
+    }
 
 
 def parse_ghost_config(value):
     if value is None:
         return None
-
-    def node_name(record, path):
+    if not isinstance(value, dict):
+        raise ValueError("Manifest ghost must be an object or null")
+    result = {}
+    for key in ("shadow", "shadowPlane"):
+        record = value.get(key)
+        if record is None:
+            result[key] = None
+            continue
         name = record.get("obj") if isinstance(record, dict) else None
         if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"Manifest {path}.obj must be a non-empty string")
-        return name
-
-    root_name = node_name(value, "ghost")
-    wheels = value.get("wheels")
-    if not isinstance(wheels, dict):
-        raise ValueError("Manifest ghost.wheels must be an object")
-    result = {"obj": root_name, "wheels": {"front": {}, "rear": {}}}
-    used_names = {root_name}
-    for group, key, _steering in WHEEL_KEYS:
-        axle = wheels.get(group)
-        wheel = axle.get(key) if isinstance(axle, dict) else None
-        if not isinstance(wheel, dict):
-            raise ValueError(f"Manifest ghost.wheels.{group}.{key} must be an object")
-        nodes = {}
-        for role, _prop in GHOST_WHEEL_ROLES:
-            name = node_name(wheel.get(role), f"ghost.wheels.{group}.{key}.{role}")
-            nodes[role] = {"obj": name}
-        # A wheel may share its own joint/spin node, as normal wheels can.
-        names = {node["obj"] for node in nodes.values()}
-        if names & used_names:
-            raise ValueError("Manifest ghost wheel nodes must not overlap the root or another wheel")
-        used_names.update(names)
-        result["wheels"][group][key] = nodes
-    shadow = value.get("shadow")
-    if shadow is not None:
-        shadow = {"obj": node_name(shadow, "ghost.shadow")}
-        if shadow["obj"] in used_names:
-            raise ValueError("Manifest ghost.shadow must not be the ghost root or a ghost wheel node")
-        used_names.add(shadow["obj"])
-    result["shadow"] = shadow
-    shadow_plane = value.get("shadowPlane")
-    if shadow_plane is not None:
-        shadow_plane = {"obj": node_name(shadow_plane, "ghost.shadowPlane")}
-        if shadow_plane["obj"] in used_names:
-            raise ValueError("Manifest ghost.shadowPlane must not be the ghost root, its shadow or a ghost wheel node")
-        used_names.add(shadow_plane["obj"])
-    result["shadowPlane"] = shadow_plane
-    lods = value.get("lods")
-    if lods is not None:
-        if not isinstance(lods, list) or len(lods) != 2:
-            raise ValueError("Manifest ghost.lods must list LOD1 and LOD2")
-        if shadow is None or shadow_plane is None:
-            raise ValueError("Manifest ghost.lods needs ghost.shadow and ghost.shadowPlane")
-        lods = [{"obj": node_name(lod, f"ghost.lods[{index}]")} for index, lod in enumerate(lods)]
-        if len({lod["obj"] for lod in lods} | used_names) != len(used_names) + 2:
-            raise ValueError("Manifest ghost LOD nodes must be distinct from each other, the shadow and the ghost wheel nodes")
-    result["lods"] = lods
+            raise ValueError(f"Manifest ghost.{key}.obj must be a non-empty string")
+        result[key] = {"obj": name}
+    if result["shadow"] and result["shadowPlane"] and result["shadow"]["obj"] == result["shadowPlane"]["obj"]:
+        raise ValueError("Manifest ghost.shadow and ghost.shadowPlane must be different nodes")
     return result
 
 
+def parse_lods_config(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Manifest lods must be an object or null")
+    levels = value.get("levels")
+    if not isinstance(levels, list) or not levels:
+        raise ValueError("Manifest lods.levels must be a non-empty list")
+    parsed = []
+    for index, level in enumerate(levels):
+        number = level.get("level") if isinstance(level, dict) else None
+        height = level.get("screenHeight") if isinstance(level, dict) else None
+        if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+            raise ValueError(f"Manifest lods.levels[{index}].level must be a non-negative integer")
+        if not isinstance(height, (int, float)) or isinstance(height, bool) or not 0.0 < height <= 1.0:
+            raise ValueError(f"Manifest lods.levels[{index}].screenHeight must be above 0 and at most 1")
+        parsed.append({"level": number, "screenHeight": float(height)})
+    if parsed[0]["level"] != 0:
+        raise ValueError("Manifest lods.levels must start with LOD0")
+    for finer, coarser in zip(parsed, parsed[1:]):
+        if coarser["level"] <= finer["level"] or coarser["screenHeight"] >= finer["screenHeight"]:
+            raise ValueError("Manifest lods.levels must rise in level and fall in screenHeight")
+    ghost = value.get("ghost")
+    if not isinstance(ghost, int) or isinstance(ghost, bool) or not 0 <= ghost < len(parsed):
+        raise ValueError("Manifest lods.ghost must be the position of an exported level")
+    objects = value.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("Manifest lods.objects must be an object")
+    for name, span in objects.items():
+        if (not isinstance(span, list) or len(span) != 2 or not all(isinstance(v, int) and not isinstance(v, bool) for v in span)
+                or not 0 <= span[0] <= span[1] < len(parsed)):
+            raise ValueError(f"Manifest lods.objects.{name} must be [first, last] level positions")
+    return {"levels": parsed, "ghost": ghost}
+
+
 def import_ghost_config(settings, config):
-    settings.ghost_enabled = config is not None
-    # Preserve disabled authoring selections so the subtree can still be excluded.
+    set_object_pointer(settings, "ghost_shadow_object", config["shadow"]["obj"] if config and config["shadow"] else None)
+    set_object_pointer(settings, "ghost_shadow_plane_object",
+                       config["shadowPlane"]["obj"] if config and config["shadowPlane"] else None)
+
+
+def import_lods_config(settings, config):
+    """Restores the level rows from the manifest: exported levels with their screen heights. Levels the
+    manifest leaves out are unticked, as they did not export."""
+    settings.lods_enabled = config is not None
     if config is None:
         return
-    set_object_pointer(settings, "ghost_root_object", config["obj"])
-    for group, key, _steering in WHEEL_KEYS:
-        wheel = ghost_wheel_settings(settings, group, key)
-        for role, prop in GHOST_WHEEL_ROLES:
-            set_object_pointer(wheel, prop, config["wheels"][group][key][role]["obj"])
-    set_object_pointer(settings, "ghost_shadow_object", config["shadow"]["obj"] if config["shadow"] else None)
-    set_object_pointer(settings, "ghost_shadow_plane_object",
-                       config["shadowPlane"]["obj"] if config["shadowPlane"] else None)
-    lods = config["lods"] or [{"obj": None}, {"obj": None}]
-    for prop, lod in zip(("ghost_lod1_object", "ghost_lod2_object"), lods):
-        set_object_pointer(settings, prop, lod["obj"])
+    exported = {level["level"]: level["screenHeight"] for level in config["levels"]}
+    for row in settings.lod_levels:
+        row.export = row.level in exported
+    for level, height in exported.items():
+        row = lod_level_row(settings, level) or settings.lod_levels.add()
+        row.level = level
+        row.export = True
+        row.screen_height = height * 100.0
+    settings.ghost_lod = config["levels"][config["ghost"]]["level"]
 
 
-def validate_ghost_scene(settings, errors, warnings):
-    root = settings.ghost_root_object
-    if not root:
-        if settings.ghost_enabled:
-            errors.append("Custom ghost root object is required")
+def sync_lod_level_rows(settings):
+    """Adds a row for every level found that has none yet, ticked and without a screen height. Rows of
+    levels no longer found are kept, so their settings return with the meshes."""
+    for level in car_lod_meshes(settings):
+        if lod_level_row(settings, level) is None:
+            row = settings.lod_levels.add()
+            row.level = level
+            row.export = True
+            row.screen_height = 0.0
+
+
+def validate_lods_scene(settings, errors, warnings):
+    found = car_lod_meshes(settings)
+    if settings.lods_enabled and not found:
+        errors.append("LODs is on but no mesh under Car Root is named <part>_LOD<n>")
         return
-    if not settings.car_root_object or root.parent != settings.car_root_object:
-        errors.append("Ghost root must be a direct child of the car root")
-    ghost_objects = set(hierarchy_objects(root))
-    scene_objects = set(bpy.context.scene.objects)
-    if root not in scene_objects:
-        errors.append("Ghost root must belong to the current scene")
-    normal_refs = [settings.center_of_mass_object, settings.steering_wheel_object,
-                   settings.dashboard_screen_object]
-    normal_refs.extend(getattr(settings, f"{prefix}_camera_object") for prefix in CAMERA_PREFIXES)
-    normal_refs.extend(collider.object_ref for collider in settings.colliders)
-    normal_refs.extend(point.object_ref for point in settings.down_force_points)
-    normal_refs.extend(getattr(wheel, prop) for wheel in settings.wheels for _role, prop in GHOST_WHEEL_ROLES)
-    if any(obj in ghost_objects for obj in normal_refs if obj):
-        errors.append("Ghost hierarchy must not contain normal car wheel, camera, dashboard or physics references")
-    if not settings.ghost_enabled:
+    if found and 0 not in found:
+        errors.append("LOD meshes need a LOD0 level")
+    for level, objects in found.items():
+        for obj in objects:
+            if obj.children:
+                errors.append(f"LOD mesh {obj.name} must not have children")
+            if obj in car_reference_objects(settings):
+                errors.append(f"LOD mesh {obj.name} must not also be a wheel, camera or other car reference")
+    if not settings.lods_enabled:
         return
-    if not any(obj.type == "MESH" and obj.data.polygons for obj in ghost_objects):
-        errors.append("Ghost hierarchy must contain mesh geometry")
-    validate_ghost_shadow(settings, errors)
-    validate_ghost_shadow_plane(settings, errors)
-    validate_ghost_lods(settings, errors)
-    used_nodes = {root}
-    mounts = []
-    for group, key, _steering in WHEEL_KEYS:
-        label = f"Ghost {WHEEL_LABELS[(group, key)]}"
-        wheel = ghost_wheel_settings(settings, group, key)
-        nodes = [getattr(wheel, prop) for _role, prop in GHOST_WHEEL_ROLES]
-        for (role, _prop), obj in zip(GHOST_WHEEL_ROLES, nodes):
-            if not obj or obj not in ghost_objects or obj not in scene_objects:
-                errors.append(f"{label} {role} must be inside the exported ghost hierarchy")
-        unique_nodes = {obj for obj in nodes if obj}
-        if unique_nodes & used_nodes:
-            errors.append(f"{label} nodes must not overlap the ghost root or another wheel")
-        used_nodes.update(unique_nodes)
-        mount, joint, spin = nodes
-        if mount and joint and not is_object_in_tree(mount, joint):
-            errors.append(f"{label} joint must be inside mount hierarchy")
-        if joint and spin and not is_object_in_tree(joint, spin):
-            errors.append(f"{label} spin must be inside joint hierarchy")
-        if mount:
-            if any(is_object_in_tree(other, mount) or is_object_in_tree(mount, other) for other in mounts):
-                errors.append("Ghost wheel mount hierarchies must not overlap")
-            mounts.append(mount)
-        if spin and not any(obj.type == "MESH" and obj.data.polygons for obj in hierarchy_objects(spin)):
-            errors.append(f"{label} spin hierarchy must contain mesh geometry")
-    if settings.body_colors:
-        material = settings.body_colors[0].material
-        if material and not material_is_assigned_to_geometry(material, ghost_objects):
-            errors.append("Default body color material must be assigned to ghost geometry")
-    for label, prop in (("Headlights", "headlights_material"), ("Brake lights", "brake_lights_material"),
-                        ("Reverse lights", "reverse_lights_material")):
-        material = getattr(settings, prop)
-        if material and not material_is_assigned_to_geometry(material, ghost_objects):
-            warnings.append(f"{label} material is not assigned to ghost geometry; custom ghost will not display this light")
+    levels = exported_lod_levels(settings, found)
+    previous = None
+    for level in levels:
+        row = lod_level_row(settings, level)
+        height = row.screen_height if row else 0.0
+        if height <= 0.0:
+            errors.append(f"LOD{level} needs a Show Above Screen Height value")
+        elif previous is not None and height >= previous[1]:
+            errors.append(f"LOD{level} must show above a smaller screen height than LOD{previous[0]}")
+        if height > 0.0:
+            previous = (level, height)
+    if ghost_lod_position(settings) is None:
+        errors.append(f"Ghost Default LOD{settings.ghost_lod} is not an exported level")
+    # Parts that end early keep their last mesh at coarser levels; parts that start late show nothing before.
+    position = {level: index for index, level in enumerate(levels)}
+    parts = {}
+    for level, objects in found.items():
+        if level in position:
+            for obj in objects:
+                parts.setdefault(lod_part_key(obj), set()).add(level)
+    for (_parent, part), part_levels in sorted(parts.items()):
+        if max(part_levels) < levels[-1]:
+            warnings.append(f"{part}: no LOD{levels[-1]}, keeps LOD{max(part_levels)}")
+        if min(part_levels) > levels[0]:
+            warnings.append(f"{part}: starts at LOD{min(part_levels)}, not shown at finer levels")
 
 
 def objects_with_unapplied_scale(root_obj):
@@ -3217,6 +2846,8 @@ def validate_scene(settings):
 
     ensure_default_wheels(settings)
     ensure_default_presets(settings)
+    sync_lod_level_rows(settings)
+    validate_lods_scene(settings, errors, warnings)
     validate_ghost_scene(settings, errors, warnings)
     validate_shadow_scene(settings, errors, warnings)
     validate_ambient_shadow_scene(settings, errors, warnings)
@@ -3458,8 +3089,8 @@ def validate_scene(settings):
             car_export_objects(settings)
         )
     }
-    ghost_objects = set(hierarchy_objects(settings.ghost_root_object))
-    car_objects = [obj for obj in hierarchy_objects(car_obj) if obj not in ghost_objects]
+    dropped_objects = set(lod_dropped_objects(settings))
+    car_objects = [obj for obj in hierarchy_objects(car_obj) if obj not in dropped_objects]
     body_color_names = set()
     body_color_material_names = set()
     for index, body_color in enumerate(settings.body_colors):
@@ -3482,19 +3113,7 @@ def validate_scene(settings):
         if index == 0 and not material_is_assigned_to_geometry(material, car_objects):
             errors.append(f"Default body color material is not assigned to car geometry: {material.name}")
 
-    try:
-        build_lights_config(settings)
-    except ValueError as error:
-        errors.append(str(error))
-
-    for label, prop_name in (
-        ("Headlights", "headlights_material"),
-        ("Brake lights", "brake_lights_material"),
-        ("Reverse lights", "reverse_lights_material"),
-    ):
-        material = getattr(settings, prop_name)
-        if material and material.name not in exported_material_names:
-            errors.append(f"{label} material is not used by an exported mesh: {material.name}")
+    validate_lights_scene(settings, exported_material_names, errors, warnings)
 
     if settings.use_custom_sounds:
         for slot in SOUND_SLOTS:
@@ -3606,15 +3225,6 @@ class CarDownForcePointSettings(PropertyGroup):
     )
 
 
-class CarLightSourceSettings(PropertyGroup):
-    role: EnumProperty(name="Role", items=LIGHT_ROLE_ITEMS, default="headlights")
-    object_ref: PointerProperty(name="Spot Light", type=bpy.types.Object, poll=light_object_poll)
-    intensity: FloatProperty(name="Full Game Intensity (cd)", default=100.0, min=0.0,
-                             description="Full-strength game light output in candela; independent of Blender Power")
-    distance: FloatProperty(name="Game Range (m)", default=40.0, min=0.01,
-                            description="Finite light cutoff in game meters")
-
-
 class CarWheelSettings(PropertyGroup):
     group: StringProperty(name="Group", default="front")
     key: StringProperty(name="Key", default="l")
@@ -3717,16 +3327,24 @@ class CarArmatureJointSettings(PropertyGroup):
     )
 
 
-class CarGhostWheelSettings(PropertyGroup):
-    suspension_ref: PointerProperty(
-        name="Mount", description="Ghost suspension attachment inside Ghost Root", type=bpy.types.Object,
+class CarLodLevelSettings(PropertyGroup):
+    level: IntProperty(name="Level", min=0)
+    export: BoolProperty(
+        name="Export",
+        description="Export this level; the car skips to the next ticked level when it is off",
+        default=True,
     )
-    hub_ref: PointerProperty(
-        name="Joint", description="Ghost steering and alignment node inside the mount", type=bpy.types.Object,
+    screen_height: FloatProperty(
+        name="Show Above Screen Height (%)",
+        description="The level shows while the car is taller on screen than this share of the screen height; "
+                    "below the last exported level's share the car is not drawn",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        precision=1,
+        subtype="PERCENTAGE",
     )
-    wheel_ref: PointerProperty(
-        name="Spin", description="Ghost wheel geometry or parent that rotates inside the joint", type=bpy.types.Object,
-    )
+    expanded: BoolProperty(name="Show Meshes", default=False)
 
 
 class CarWheelPresetSettings(PropertyGroup):
@@ -4084,42 +3702,33 @@ class CarExporterSettings(PropertyGroup):
         description="Root object containing the complete vehicle hierarchy",
         type=bpy.types.Object,
     )
-    ghost_enabled: BoolProperty(
-        name="Enable Custom Ghost",
-        description="Export a dedicated ghost subtree in the car GLB; otherwise export ghost as null",
+    lods_enabled: BoolProperty(
+        name="LODs",
+        description="Export the levels found from mesh names ending in _LOD<n>; when off, only LOD0 and meshes "
+                    "without the suffix export",
         default=False,
     )
-    ghost_root_object: PointerProperty(
-        name="Ghost Root",
-        description="Direct child of Car Root containing all custom ghost geometry and wheel nodes",
-        type=bpy.types.Object,
+    lod_levels: CollectionProperty(type=CarLodLevelSettings)
+    ghost_lod: IntProperty(
+        name="Ghost Default LOD",
+        description="The finest level ghosts and multiplayer opponents show; coarser levels still take over "
+                    "as they get smaller on screen",
+        default=0,
+        min=0,
     )
-    ghost_front_l: PointerProperty(type=CarGhostWheelSettings)
-    ghost_front_r: PointerProperty(type=CarGhostWheelSettings)
-    ghost_rear_l: PointerProperty(type=CarGhostWheelSettings)
-    ghost_rear_r: PointerProperty(type=CarGhostWheelSettings)
     ghost_shadow_object: PointerProperty(
         name="Shadow",
-        description="Mesh, a direct child of Ghost Root, that casts the ghost's shadow until LOD2; it never renders in the game",
+        description="Mesh under Car Root, outside wheels and other moving nodes, that casts the ghost's shadow while it shows its default LOD; "
+                    "it never renders in the game",
         type=bpy.types.Object,
         poll=shadow_mesh_poll,
     )
     ghost_shadow_plane_object: PointerProperty(
         name="Shadow Plane",
-        description="Flat mesh, a direct child of Ghost Root, textured with the ghost's top-down shadow; "
-                    "the game lays it on the ground in place of the shadow from LOD1 on",
+        description="Flat mesh under Car Root, outside wheels and other moving nodes, textured with the ghost's top-down shadow; "
+                    "the game lays it on the ground in place of the shadow at coarser levels",
         type=bpy.types.Object,
         poll=shadow_mesh_poll,
-    )
-    ghost_lod1_object: PointerProperty(
-        name="LOD1",
-        description="Node under Ghost Root whose children are the LOD1 parts, each named LOD1_ and the ghost node it follows",
-        type=bpy.types.Object,
-    )
-    ghost_lod2_object: PointerProperty(
-        name="LOD2",
-        description="Node under Ghost Root holding the whole-car LOD2",
-        type=bpy.types.Object,
     )
     shadow_enabled: BoolProperty(
         name="Enable Custom Shadow",
@@ -4128,13 +3737,13 @@ class CarExporterSettings(PropertyGroup):
     )
     shadow_object: PointerProperty(
         name="Shadow Mesh",
-        description="Mesh, a direct child of Car Root, that casts the car's shadow; it never renders in the game",
+        description="Mesh under Car Root, outside wheels and other moving nodes, that casts the car's shadow; it never renders in the game",
         type=bpy.types.Object,
         poll=shadow_mesh_poll,
     )
     ambient_shadow_object: PointerProperty(
         name="AO Plane",
-        description="Flat mesh, a direct child of Car Root, textured with the car's blurred top-down outline; "
+        description="Flat mesh under Car Root, outside wheels and other moving nodes, textured with the car's blurred top-down outline; "
                     "the game keeps it on the ground under the car as its ambient shadow",
         type=bpy.types.Object,
         poll=shadow_mesh_poll,
@@ -4169,25 +3778,40 @@ class CarExporterSettings(PropertyGroup):
     )
     # Retained as hidden migration sources for blend files saved with preset schema 4.
     max_degrees_of_rotation: FloatProperty(default=540.0, min=90.0, max=2160.0, options={"HIDDEN"})
-    headlights_material: PointerProperty(
-        name="Headlights",
-        description="Emissive material controlled by the vehicle headlights",
+    lights_material: PointerProperty(
+        name="Headlights / Tail Lights",
+        description="Material of the headlamps and tail lamps: glows with the light switch",
         type=bpy.types.Material,
     )
-    brake_lights_material: PointerProperty(
-        name="Tail / Brake Lights",
-        description="Half emission with headlights on; full emission while braking",
+    brake_material: PointerProperty(
+        name="Brake Lights",
+        description="Material of the brake lamps: glows while braking",
         type=bpy.types.Material,
     )
-    reverse_lights_material: PointerProperty(
+    reverse_material: PointerProperty(
         name="Reverse Lights",
-        description="Emissive material illuminated while reversing",
+        description="Material of the reverse lamps: glows in reverse gear",
         type=bpy.types.Material,
     )
-    headlights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
-    brake_lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
-    reverse_lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0)
-    light_sources: CollectionProperty(type=CarLightSourceSettings)
+    front_light_marker: PointerProperty(
+        name="Front Lamp",
+        description="Empty on one headlamp, its arrow (local +Z) aimed the way the headlight shines; the game "
+                    "mirrors it to the other side and shines one beam from the centre line at its height",
+        type=bpy.types.Object,
+        poll=light_marker_poll,
+    )
+    rear_light_marker: PointerProperty(
+        name="Rear Lamp",
+        description="Empty on one tail lamp; the game mirrors it to the other side",
+        type=bpy.types.Object,
+        poll=light_marker_poll,
+    )
+    lights_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                             description="Headlamp and tail lamp glow with the light switch on")
+    brake_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                            description="Brake lamp glow while braking")
+    reverse_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                              description="Reverse lamp glow in reverse gear")
     dashboard_screen_object: PointerProperty(
         name="Screen",
         description="Mesh object used as the in-game dashboard display",
@@ -4838,7 +4462,11 @@ class CarExporterSettings(PropertyGroup):
 
 
 def clear_configuration_settings(settings):
-    clear_light_sources(settings)
+    for _key, prop, _name, _label in LIGHT_MARKERS:
+        marker = getattr(settings, prop)
+        setattr(settings, prop, None)
+        if marker and marker.get(LIGHT_MARKER_PROP):
+            bpy.data.objects.remove(marker, do_unlink=True)
     center_of_mass = settings.center_of_mass_object
     if center_of_mass and center_of_mass.get(CENTER_OF_MASS_HELPER_PROP):
         bpy.data.objects.remove(center_of_mass, do_unlink=True)
@@ -4861,32 +4489,25 @@ def clear_configuration_settings(settings):
     settings.esc_max_level = 5
     settings.traction_control_max_level = 5
     settings.car_root_object = None
-    settings.ghost_enabled = False
-    settings.ghost_root_object = None
+    settings.lods_enabled = False
+    settings.lod_levels.clear()
+    settings.ghost_lod = 0
     settings.ghost_shadow_object = None
     settings.ghost_shadow_plane_object = None
-    settings.ghost_lod1_object = None
-    settings.ghost_lod2_object = None
     settings.shadow_enabled = False
     settings.shadow_object = None
     settings.ambient_shadow_object = None
     settings.armature_enabled = False
     settings.armature_object = None
     settings.armature_joints.clear()
-    for group, key, _steering in WHEEL_KEYS:
-        wheel = ghost_wheel_settings(settings, group, key)
-        for _role, prop in GHOST_WHEEL_ROLES:
-            setattr(wheel, prop, None)
     settings.center_of_mass_object = None
     settings.steering_wheel_object = None
     settings.steering_wheel_spin_axis = "y"
     settings.max_degrees_of_rotation = 540.0
     settings.body_colors.clear()
     settings.active_body_color_index = 0
-    settings.headlights_material = None
-    settings.brake_lights_material = None
-    settings.reverse_lights_material = None
     for _role, prefix, _label in LIGHT_ROLES:
+        setattr(settings, f"{prefix}_material", None)
         setattr(settings, f"{prefix}_emissive_intensity", 10.0)
     settings.dashboard_screen_object = None
     settings.colliders.clear()
@@ -5265,7 +4886,7 @@ def compact_manifest_floats(value):
     return value
 
 
-def build_manifest(settings):
+def build_manifest(settings, lod_object_names=None):
     sounds = {"pitchOffset": settings.sound_pitch_offset}
     if settings.use_custom_sounds:
         for slot in SOUND_SLOTS:
@@ -5326,6 +4947,7 @@ def build_manifest(settings):
         "id": settings.car_id,
         "packageVersion": settings.package_version,
         "model": f"{settings.car_id}.glb",
+        "lods": build_lods_config(settings, lod_object_names),
         "ghost": build_ghost_config(settings),
         "shadow": build_shadow_config(settings),
         "ambientShadow": build_ambient_shadow_config(settings),
@@ -5444,11 +5066,11 @@ EXPORT_PROGRESS_TITLES = {
     "FAILED": "Export Failed",
     "CANCELLED": "Export Cancelled",
 }
-GHOST_LOD_PROGRESS_TITLES = {
-    "RUNNING": "Refreshing Ghost LOD",
-    "SUCCESS": "Ghost LOD Refreshed",
-    "FAILED": "Ghost LOD Refresh Failed",
-    "CANCELLED": "Ghost LOD Refresh Cancelled",
+GHOST_SHADOW_PROGRESS_TITLES = {
+    "RUNNING": "Refreshing Ghost Shadow",
+    "SUCCESS": "Ghost Shadow Refreshed",
+    "FAILED": "Ghost Shadow Refresh Failed",
+    "CANCELLED": "Ghost Shadow Refresh Cancelled",
 }
 AMBIENT_SHADOW_PROGRESS_TITLES = {
     "RUNNING": "Refreshing Ambient Shadow",
@@ -5596,7 +5218,8 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             sounds_path.mkdir()
 
         yield 0.05, "Preparing export scene..."
-        states = export_helper_states(excluded_ghost_objects(settings) + excluded_shadow_objects(settings))
+        lod_ranges = lod_object_ranges(settings)
+        states = export_helper_states(lod_dropped_objects(settings) + excluded_shadow_objects(settings))
         carrier = None
         merge_result = None
         restored_nodes, temp_images = [], []
@@ -5605,7 +5228,12 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             carrier = create_body_material_export_carrier(context)
             if settings.merge_meshes:
                 yield 0.05, "Merging same-material meshes..."
-                merge_result = apply_car_mesh_merge(context, settings)
+                merge_result = apply_car_mesh_merge(context, settings, lod_ranges)
+            # The level ranges by the names the LOD meshes export under, merged or not.
+            merged_sources = set(merge_result.sources) if merge_result else set()
+            lod_object_names = {obj.name: span for obj, span in lod_ranges.items() if obj not in merged_sources}
+            if merge_result:
+                lod_object_names.update((obj.name, span) for obj, span in merge_result.lod_ranges.items())
             for index, total, name in iter_export_texture_optimization(
                 list(context.scene.objects),
                 int(settings.max_texture_size),
@@ -5638,7 +5266,7 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             relink_export_helpers(states)
 
         yield 0.85, "Writing manifest..."
-        manifest = compact_manifest_floats(build_manifest(settings))
+        manifest = compact_manifest_floats(build_manifest(settings, lod_object_names))
         (temp_path / "manifest.json").write_text(json.dumps(manifest, indent=4), encoding="utf-8")
 
         if settings.use_custom_sounds:
@@ -5853,27 +5481,77 @@ class GeneratorProgressOperator:
             return self.close(context)
 
 
-class CAR_EXPORTER_OT_generate_ghost_lods(GeneratorProgressOperator, Operator):
-    bl_idname = "car_exporter.generate_ghost_lods"
+class CAR_EXPORTER_OT_generate_ghost_shadow(GeneratorProgressOperator, Operator):
+    bl_idname = "car_exporter.generate_ghost_shadow"
     bl_label = "Refresh"
     bl_options = {"REGISTER", "UNDO"}
-    progress_titles = GHOST_LOD_PROGRESS_TITLES
-    cancelled_report = "Ghost LOD refresh cancelled"
+    progress_titles = GHOST_SHADOW_PROGRESS_TITLES
+    cancelled_report = "Ghost shadow refresh cancelled"
 
     target: EnumProperty(
         name="Target",
-        items=[(key, label, description) for key, label, description in GHOST_LOD_TARGETS],
-        default="LOD1",
+        items=[(key, label, description) for key, label, description in GHOST_SHADOW_TARGETS],
+        default="SHADOW",
     )
 
     @classmethod
     def description(cls, _context, properties):
-        return next(description for key, _label, description in GHOST_LOD_TARGETS if key == properties.target) \
+        return next(description for key, _label, description in GHOST_SHADOW_TARGETS if key == properties.target) \
             + ". Replaces what an earlier refresh made"
 
-    def make_steps(self, context, interactive):
-        return iter_generate_ghost_lods(context, scene_settings(context), self.build, self.target,
-                                        background_bake=interactive)
+    def make_steps(self, context, _interactive):
+        return iter_generate_ghost_shadow(context, scene_settings(context), self.build, self.target)
+
+
+class CAR_EXPORTER_OT_toggle_lod_visibility(Operator):
+    bl_idname = "car_exporter.toggle_lod_visibility"
+    bl_label = "Show or Hide LOD"
+    bl_description = "Show or hide this level's meshes in the viewport only; Ctrl+click shows this level alone"
+    bl_options = {"REGISTER", "UNDO"}
+
+    level: IntProperty(min=0)
+    solo: BoolProperty(default=False, options={"SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        self.solo = event.ctrl
+        return self.execute(context)
+
+    def execute(self, context):
+        found = car_lod_meshes(scene_settings(context))
+        view_layer = context.view_layer
+        if self.solo:
+            for level, objects in found.items():
+                for obj in objects:
+                    if obj.name in view_layer.objects:
+                        obj.hide_set(level != self.level)
+            return {"FINISHED"}
+        objects = [obj for obj in found.get(self.level, ()) if obj.name in view_layer.objects]
+        show = not any(obj.visible_get() for obj in objects)
+        for obj in objects:
+            obj.hide_set(not show)
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_set_ghost_lod(Operator):
+    bl_idname = "car_exporter.set_ghost_lod"
+    bl_label = "Set Ghost Default LOD"
+    bl_description = "Ghosts and multiplayer opponents show this level and coarser ones"
+    bl_options = {"REGISTER", "UNDO"}
+
+    level: IntProperty(min=0)
+
+    def execute(self, context):
+        scene_settings(context).ghost_lod = self.level
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_MT_ghost_lod(bpy.types.Menu):
+    bl_idname = "CAR_EXPORTER_MT_ghost_lod"
+    bl_label = "Ghost Default LOD"
+
+    def draw(self, context):
+        for level in exported_lod_levels(scene_settings(context)):
+            self.layout.operator("car_exporter.set_ghost_lod", text=f"LOD{level}").level = level
 
 
 class CAR_EXPORTER_OT_generate_ambient_shadow(GeneratorProgressOperator, Operator):
@@ -5966,73 +5644,31 @@ class CAR_EXPORTER_OT_remove_center_of_mass(Operator):
         return {"FINISHED"}
 
 
-class CAR_EXPORTER_OT_add_light_source(Operator):
-    bl_idname = "car_exporter.add_light_source"
-    bl_label = "Add Light Source"
+class CAR_EXPORTER_OT_add_light_marker(Operator):
+    bl_idname = "car_exporter.add_light_marker"
+    bl_label = "Add Lamp Marker"
+    bl_description = "Add the marker at the 3D cursor under Car Root, replacing the one added before"
     bl_options = {"REGISTER", "UNDO"}
 
-    role: EnumProperty(name="Role", items=LIGHT_ROLE_ITEMS, default="headlights")
-    use_selected: BoolProperty(default=False, options={"HIDDEN"})
+    marker: EnumProperty(items=(("front", "Front", ""), ("rear", "Rear", "")), options={"HIDDEN"})
 
     def execute(self, context):
         settings = scene_settings(context)
         root = settings.car_root_object
         if not root:
-            self.report({"ERROR"}, "Select Car Root before adding a light")
+            self.report({"ERROR"}, "Select Car Root before adding a lamp marker")
             return {"CANCELLED"}
-        if len(settings.light_sources) >= MAX_LIGHT_SOURCES:
-            self.report({"ERROR"}, f"A car may have at most {MAX_LIGHT_SOURCES} light sources")
+        try:
+            position = root.matrix_world.inverted() @ context.scene.cursor.location
+        except ValueError:
+            self.report({"ERROR"}, "Car Root has a singular transform; correct its scale before adding a marker")
             return {"CANCELLED"}
-        if self.use_selected:
-            obj = context.active_object
-            if (not obj or not light_object_poll(None, obj) or obj == root or not is_object_in_tree(root, obj)
-                    or is_object_in_tree(settings.ghost_root_object, obj) or obj.children):
-                self.report({"ERROR"}, "Select a childless Spot light beneath Car Root, outside the ghost hierarchy")
-                return {"CANCELLED"}
-            if any(source.object_ref == obj for source in settings.light_sources):
-                self.report({"ERROR"}, "Selected light is already assigned")
-                return {"CANCELLED"}
-        else:
-            try:
-                position = root.matrix_world.inverted() @ context.scene.cursor.location
-            except ValueError:
-                self.report({"ERROR"}, "Car Root has a singular transform; correct its scale before adding a light")
-                return {"CANCELLED"}
-            obj = create_light_helper(context, settings, next_helper_name(self.role))
-            obj.location = position
-            # Blender -Y maps to game +Z (forward); each spotlight emits along local -Z.
-            downward_angle = math.radians(2)
-            direction = (Vector((0, -math.cos(downward_angle), -math.sin(downward_angle)))
-                         if self.role == "headlights" else Vector((0, 1, 0)))
-            obj.rotation_mode = "QUATERNION"
-            obj.rotation_quaternion = direction.to_track_quat('-Z', 'Y')
-            obj.data.color = (1, 0, 0) if self.role == "brakeLights" else (1, 1, 1)
-            obj.data.spot_size = math.radians(40 if self.role == "headlights" else 140)
-            obj.data.spot_blend = 0.5
-        source = settings.light_sources.add()
-        source.role = self.role
-        source.object_ref = obj
-        source.intensity = 100.0 if self.role == "headlights" else 5.0 if self.role == "brakeLights" else 10.0
-        source.distance = 40.0 if self.role == "headlights" else 5.0
+        obj = create_light_marker(context, settings, self.marker)
+        obj.location = position
+        for selected in context.selected_objects:
+            selected.select_set(False)
         context.view_layer.objects.active = obj
         obj.select_set(True)
-        return {"FINISHED"}
-
-
-class CAR_EXPORTER_OT_remove_light_source(Operator):
-    bl_idname = "car_exporter.remove_light_source"
-    bl_label = "Remove Light Source"
-    bl_options = {"REGISTER", "UNDO"}
-
-    index: IntProperty()
-
-    def execute(self, context):
-        settings = scene_settings(context)
-        if 0 <= self.index < len(settings.light_sources):
-            obj = settings.light_sources[self.index].object_ref
-            settings.light_sources.remove(self.index)
-            if not any(source.object_ref == obj for source in settings.light_sources):
-                remove_owned_light_helper(obj)
         return {"FINISHED"}
 
 
@@ -6660,7 +6296,7 @@ class CAR_EXPORTER_OT_remove_configuration(Operator):
 
 def create_body_material_export_carrier(context):
     settings = scene_settings(context)
-    excluded = set(excluded_ghost_objects(settings))
+    excluded = set(lod_dropped_objects(settings))
     car_objects = [obj for obj in hierarchy_objects(settings.car_root_object) if obj not in excluded]
     carrier_materials = [
         body_color.material
@@ -6920,6 +6556,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             self.report({"ERROR"}, "Vehicle manifest must be an object")
             return {"CANCELLED"}
         try:
+            lods_config = parse_lods_config(data.get("lods"))
             ghost_config = parse_ghost_config(data.get("ghost"))
             shadow_config = parse_shadow_config(data.get("shadow"))
             ambient_shadow_config = parse_ambient_shadow_config(data.get("ambientShadow"))
@@ -6927,7 +6564,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             lights_config = parse_lights_config(data.get("lights"))
             import_body = data.get("body")
             import_root = find_object(import_body.get("obj", "")) if isinstance(import_body, dict) else None
-            validate_light_import(import_root, lights_config)
+            if lights_config and import_root is None:
+                raise ValueError("Manifest car root object is required to import lights")
         except ValueError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -7270,6 +6908,7 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             return {"CANCELLED"}
 
         settings.is_configured = True
+        import_lods_config(settings, lods_config)
         import_ghost_config(settings, ghost_config)
         import_shadow_config(settings, shadow_config)
         import_ambient_shadow_config(settings, ambient_shadow_config)
@@ -7609,29 +7248,81 @@ def draw_armature(layout, settings):
     layout.label(text="Bone head and tail define the attachment offsets", icon="INFO")
 
 
-def draw_custom_ghost(layout, settings):
+def mesh_triangle_count(mesh):
+    loops = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_total", loops)
+    return int(loops.sum()) - 2 * len(loops)
+
+
+def sync_lod_level_rows_later():
+    """Draw code may not change data: the rows for newly found levels are added from a timer."""
+    for scene in bpy.data.scenes:
+        settings = getattr(scene, "car_exporter", None)
+        if settings and settings.is_configured:
+            sync_lod_level_rows(settings)
+    return None
+
+
+def draw_lods(layout, settings):
     header = layout.row(align=True)
     header.alignment = "LEFT"
     header.use_property_split = False
     header.use_property_decorate = False
-    header.label(text="Custom Ghost")
+    header.label(text="LODs")
     header.separator(factor=0.5)
-    header.prop(settings, "ghost_enabled", text="")
-    if not settings.ghost_enabled:
+    header.prop(settings, "lods_enabled", text="")
+    if not settings.lods_enabled:
         return
-    layout.separator()
-    inputs = layout.column()
-    draw_split_prop(inputs, settings, "ghost_root_object")
-    for group, key, _steering in WHEEL_KEYS:
-        box = inputs.box()
-        box.label(text=WHEEL_LABELS[(group, key)])
-        wheel = ghost_wheel_settings(settings, group, key)
-        for _role, prop in GHOST_WHEEL_ROLES:
-            draw_split_prop(box, wheel, prop)
-    inputs.separator(factor=1.5)
-    for prop, target in (("ghost_shadow_object", "SHADOW"), ("ghost_shadow_plane_object", "SHADOW_PLANE"),
-                         ("ghost_lod1_object", "LOD1"), ("ghost_lod2_object", "LOD2")):
-        draw_refresh_prop(inputs, settings, prop, "car_exporter.generate_ghost_lods").target = target
+    found = car_lod_meshes(settings)
+    if not found:
+        layout.label(text="No mesh under Car Root is named <part>_LOD<n>", icon="INFO")
+        return
+    if any(lod_level_row(settings, level) is None for level in found):
+        if not bpy.app.timers.is_registered(sync_lod_level_rows_later):
+            bpy.app.timers.register(sync_lod_level_rows_later, first_interval=0.0)
+    columns = layout.row(align=True)
+    for text, factor in (("", 0.06), ("", 0.06), ("", 0.06), ("Level", 0.14), ("Show Above Screen Height (%)", 0.4),
+                         ("Meshes", 0.12), ("Triangles", 0.16)):
+        cell = columns.row()
+        cell.ui_units_x = factor * 20
+        cell.label(text=text)
+    exported = set(exported_lod_levels(settings, found))
+    for level, objects in found.items():
+        row_settings = lod_level_row(settings, level)
+        if row_settings is None:
+            continue
+        row = layout.row(align=True)
+        row.prop(row_settings, "expanded", text="", emboss=False,
+                 icon="TRIA_DOWN" if row_settings.expanded else "TRIA_RIGHT")
+        visible = any(obj.visible_get() for obj in objects)
+        row.operator("car_exporter.toggle_lod_visibility", text="", emboss=False,
+                     icon="HIDE_OFF" if visible else "HIDE_ON").level = level
+        export = row.row(align=True)
+        export.enabled = level != 0
+        export.prop(row_settings, "export", text="")
+        values = row.row(align=True)
+        values.active = level in exported
+        values.label(text=f"LOD{level}")
+        values.prop(row_settings, "screen_height", text="")
+        values.label(text=str(len(objects)))
+        values.label(text=f"{sum(mesh_triangle_count(obj.data) for obj in objects):,}")
+        if row_settings.expanded:
+            meshes = layout.box().column(align=True)
+            for obj in objects:
+                meshes.label(text=f"{obj.name} · {obj.parent.name if obj.parent else 'no parent'}")
+    last = next((level for level in reversed(list(found)) if level in exported), None)
+    if last is not None:
+        layout.label(text=f"Culled below LOD{last}'s screen height")
+
+
+def draw_ghost(layout, settings):
+    layout.label(text="Ghost")
+    if settings.lods_enabled:
+        split = layout.split(factor=0.4)
+        split.label(text="Ghost Default LOD")
+        split.menu("CAR_EXPORTER_MT_ghost_lod", text=f"LOD{settings.ghost_lod}")
+    for prop, target in (("ghost_shadow_object", "SHADOW"), ("ghost_shadow_plane_object", "SHADOW_PLANE")):
+        draw_refresh_prop(layout, settings, prop, "car_exporter.generate_ghost_shadow").target = target
 
 
 def draw_custom_shadow(layout, settings):
@@ -7783,36 +7474,22 @@ def draw_body_physics(layout, settings):
 
 
 def draw_vehicle_lights(layout, settings):
-    for role, prefix, label in LIGHT_ROLES:
+    for _role, prefix, label in LIGHT_ROLES:
         box = layout.box()
         box.label(text=label)
-        box.label(text="Material and sources are optional")
-        draw_split_prop(box, settings, f"{prefix}_material")
+        draw_split_prop(box, settings, f"{prefix}_material", label="Material")
         emission = box.column()
         emission.enabled = getattr(settings, f"{prefix}_material") is not None
         draw_split_prop(emission, settings, f"{prefix}_emissive_intensity")
-        if role == "brakeLights":
-            box.label(text="Lights on: 50% | Braking: 100%")
-        for index, source in enumerate(settings.light_sources):
-            if source.role != role:
-                continue
-            item = box.box()
-            row = item.row(align=True)
-            row.prop(source, "object_ref", text="Spot")
-            row.operator("car_exporter.remove_light_source", text="", icon="X").index = index
-            obj = source.object_ref
-            if obj and light_object_poll(None, obj):
-                draw_split_prop(item, obj.data, "color")
-                draw_split_prop(item, obj.data, "spot_size")
-                draw_split_prop(item, obj.data, "spot_blend")
-            draw_split_prop(item, source, "intensity")
-            draw_split_prop(item, source, "distance")
-        row = box.row(align=True)
-        row.enabled = len(settings.light_sources) < MAX_LIGHT_SOURCES
-        row.operator("car_exporter.add_light_source", text="Add Spot", icon="ADD").role = role
-        assign = row.operator("car_exporter.add_light_source", text="Use Selected")
-        assign.role = role
-        assign.use_selected = True
+    if not any(lamp_materials(settings).values()):
+        layout.label(text="No lamp materials: the car exports without lights")
+        return
+    markers = layout.box()
+    markers.label(text="Markers (mirrored to the other side)")
+    for key, prop, _name, label in LIGHT_MARKERS:
+        row = markers.row(align=True)
+        row.prop(settings, prop, text=label)
+        row.operator("car_exporter.add_light_marker", text="", icon="ADD").marker = key
 
 
 class CAR_EXPORTER_PT_car_export(Panel):
@@ -7896,6 +7573,8 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.separator(type="LINE")
         draw_body_colors(box, settings)
 
+        draw_lods(layout.box(), settings)
+
         box = layout.box()
         box.label(text="Colliders")
         draw_colliders(box, settings)
@@ -7926,7 +7605,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
 
         draw_armature(layout.box(), settings)
 
-        draw_custom_ghost(layout.box(), settings)
+        draw_ghost(layout.box(), settings)
 
         draw_custom_shadow(layout.box(), settings)
 
@@ -7974,10 +7653,9 @@ classes = (
     CarBodyColorSettings,
     CarColliderSettings,
     CarDownForcePointSettings,
-    CarLightSourceSettings,
     CarWheelSettings,
     CarArmatureJointSettings,
-    CarGhostWheelSettings,
+    CarLodLevelSettings,
     CarWheelPresetSettings,
     CarPresetSettings,
     CarExporterSettings,
@@ -7988,7 +7666,10 @@ classes = (
     CAR_EXPORTER_OT_add_armature_joint,
     CAR_EXPORTER_OT_remove_armature_joint,
     CAR_EXPORTER_OT_generate_shadow_mesh,
-    CAR_EXPORTER_OT_generate_ghost_lods,
+    CAR_EXPORTER_OT_generate_ghost_shadow,
+    CAR_EXPORTER_OT_toggle_lod_visibility,
+    CAR_EXPORTER_OT_set_ghost_lod,
+    CAR_EXPORTER_MT_ghost_lod,
     CAR_EXPORTER_OT_generate_ambient_shadow,
     CAR_EXPORTER_OT_add_collider,
     CAR_EXPORTER_OT_remove_collider,
@@ -7996,8 +7677,7 @@ classes = (
     CAR_EXPORTER_OT_remove_center_of_mass,
     CAR_EXPORTER_OT_add_downforce_point,
     CAR_EXPORTER_OT_remove_downforce_point,
-    CAR_EXPORTER_OT_add_light_source,
-    CAR_EXPORTER_OT_remove_light_source,
+    CAR_EXPORTER_OT_add_light_marker,
     CAR_EXPORTER_OT_add_body_color,
     CAR_EXPORTER_OT_remove_body_color,
     CAR_EXPORTER_OT_move_body_color,

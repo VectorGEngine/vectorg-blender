@@ -344,8 +344,7 @@ With **Tilt With Arm** enabled, the Joint and wheel rotate with the arm as it
 swings, so camber or caster changes with travel; otherwise the wheel only moves.
 The exporter rejects travel the arm cannot follow: every length between the bump
 stop and full droop must be reachable, with at least 0.1 m of spring length change
-per metre of wheel travel. Ghost wheels reuse the car's pivot, carried to the
-ghost Mount. The manifest records the pivot as:
+per metre of wheel travel. The manifest records the pivot as:
 
 ```json
 "pivot": { "obj": "Pivot_RL", "tilt": false }
@@ -524,7 +523,7 @@ point and its tail at the wheel-side mounting point. Weight the entire rod to
 
 Each driven bone must be unique, have non-zero rest length, and have
 **Connected** disabled so it can translate. Authored bone parenting is preserved.
-The rig must be outside the Custom Ghost subtree, and the attachment objects
+The attachment objects
 must exist in the exported car. Wheel/armature parenting must not create feedback.
 
 The enabled section adds this optional field to manifest version 8:
@@ -580,140 +579,104 @@ from the attachment roles while preserving their authored relative offsets. Blen
 constraints and drivers do not become live game constraints.
 
 The game applies following, aiming and stretching after updating wheel objects,
-including during replay and ordinary ghosts. A separate custom ghost subtree
-does not use the normal car's armature. The export setup targets Blender 4.5.
+including during replay and ghosts. The export setup targets Blender 4.5.
 
-## Custom Ghost
+## LODs
 
-Open **Custom Ghost**, check **Enable Custom Ghost**, and select **Ghost Root**.
-This must be a direct child of the configured Car Root. Put all ghost body,
-trim, glass, light meshes, and four wheel hierarchies inside it:
+Name each mesh `<part>_LOD<n>` to make it level `n` of that part, for example
+`Body_LOD0`, `Body_LOD1` and `Body_LOD2`. A mesh without the suffix shows at every
+level. Keep each part's LOD meshes under the node that moves it, so they follow
+the wheel's Mount, Joint and Spin, the steering wheel or a door:
 
 ```text
 Car Root
-|-- Normal car geometry and wheel nodes
-`-- Ghost Root
-    |-- Ghost body, trim, glass, and light geometry
-    |-- Ghost front-left mount
-    |   `-- Ghost front-left joint
-    |       `-- Ghost front-left spin and wheel geometry
-    `-- Other three ghost wheel hierarchies
+|-- Body_LOD0, Body_LOD1, ...
+`-- Mount_FL
+    `-- Joint_FL
+        |-- Caliper_FL_LOD0, Caliper_FL_LOD1, ...
+        `-- Spin_FL
+            |-- Wheel_FL_LOD0, Wheel_FL_LOD1, ...
+            `-- Rotor_FL_LOD0, Rotor_FL_LOD1, ...
 ```
 
-Assign **Mount**, **Joint**, and **Spin** for each ghost wheel. These inputs use
-the same conventions as the normal Wheels section. Match the corresponding
-normal wheel's rest placement and local axes: ghost wheels inherit its steering,
-radius, up/spin axes, and preset parameters. The inherited Up Local Axis is used
-in the ghost Joint's own orientation for steering. Each wheel needs its own hierarchy;
-do not reference normal wheel nodes or nest one wheel under another. A wheel
-may use the same object for its joint and spin, as normal wheels can.
+Check **LODs** in the panel header to export levels. The section lists one row
+per level found under Car Root:
 
-Ghost geometry keeps its authored materials. Assign the existing default
-**Body Colors** material to paintable ghost surfaces. Assign the existing
-Headlights, Brake Lights, and Reverse Lights materials to the corresponding
-ghost light meshes. No white material or additional ghost light material inputs
-are required. Missing ghost light assignments produce warnings.
+- The arrow lists the level's meshes and the node each sits under.
+- The eye shows or hides the level in the viewport only; Ctrl+click shows that
+  level alone. Hidden LOD meshes still export.
+- The checkbox exports the level; an unticked level is skipped and its meshes stay
+  in the `.blend`. LOD0 always exports.
+- **Show Above Screen Height (%)**: the level shows while the car's bounding
+  sphere spans at least this share of the screen height. Each level needs a value
+  smaller than the level before; below the last exported level's value the car is
+  not drawn.
 
-The exporter writes either `"ghost": null` when unchecked, or this structure
-in manifest version 8 when checked (all four wheel entries are required):
+A part that has no mesh at a coarser level keeps showing its last mesh; a part
+whose first mesh is at a coarser level shows nothing before it. Validate Car warns
+about both. With **LODs** unchecked only LOD0 and meshes without the suffix
+export. **Merge Meshes** never joins meshes of different levels.
+
+The manifest lists the exported levels, finest first, with their screen height as
+a fraction, the ghost default level's position among them, and the level positions
+every exported LOD node shows at, by the name it exports under. It is `null` with
+LODs unchecked:
 
 ```json
-"ghost": {
-  "obj": "ghost_root",
-  "wheels": {
-    "front": {
-      "l": {
-        "mount": { "obj": "ghost_mount_fl" },
-        "joint": { "obj": "ghost_joint_fl" },
-        "spin": { "obj": "ghost_spin_fl" }
-      },
-      "r": {
-        "mount": { "obj": "ghost_mount_fr" },
-        "joint": { "obj": "ghost_joint_fr" },
-        "spin": { "obj": "ghost_spin_fr" }
-      }
-    },
-    "rear": {
-      "l": {
-        "mount": { "obj": "ghost_mount_rl" },
-        "joint": { "obj": "ghost_joint_rl" },
-        "spin": { "obj": "ghost_spin_rl" }
-      },
-      "r": {
-        "mount": { "obj": "ghost_mount_rr" },
-        "joint": { "obj": "ghost_joint_rr" },
-        "spin": { "obj": "ghost_spin_rr" }
-      }
-    }
-  },
-  "shadow": { "obj": "GHOST_SHADOW" },
-  "shadowPlane": { "obj": "GHOST_SHADOW_PLANE" },
-  "lods": [{ "obj": "GHOST_LOD1" }, { "obj": "GHOST_LOD2" }]
+"lods": {
+  "levels": [
+    { "level": 0, "screenHeight": 0.6 },
+    { "level": 1, "screenHeight": 0.25 },
+    { "level": 2, "screenHeight": 0.08 }
+  ],
+  "ghost": 1,
+  "objects": {
+    "MERGED_Body_LOD1": [1, 1],
+    "Wheel_FL_LOD1": [1, 2]
+  }
 }
 ```
 
-`shadow`, `shadowPlane` and `lods` are `null` when **Shadow**, **Shadow Plane**,
-and **LOD1** with **LOD2** are empty. `lods` requires `shadow` and `shadowPlane`.
+The player car and watched replays show LOD0 only.
 
-### Ghost LODs
+## Ghost
 
-Below the wheel boxes, **Shadow**, **Shadow Plane**, **LOD1** and **LOD2** each
-have a refresh button that builds that object inside the `.blend`, so export does
-no LOD work. Refresh what changed; each replaces what it built before and fills
-its field:
+Ghosts and multiplayer opponents are the car itself. **Ghost Default LOD** is the
+finest level they show; coarser levels still take over as they get smaller on
+screen. Finer levels are left out of a ghost when it loads.
 
-- **Shadow** and **Shadow Plane** take seconds and bake nothing.
-- **LOD1** bakes the texture atlas and also rebuilds **LOD2**, as both use it.
-- **LOD2** rebuilds from the current LOD1 without baking.
+**Shadow** and **Shadow Plane** each have a refresh button that builds the object
+under Car Root from the meshes shown at the ghost default level, replaces what it
+built before and hides it in the viewport:
 
-- Every ghost face except the body paint is unwrapped into one 2048 px atlas and
-  baked with Cycles from its own material: base color (darkened by alpha and
-  transmission, so glass is a tinted solid), roughness and metallic, and the
-  normal map. Light materials are baked as plain color: LODs do not glow.
-- **LOD1** (`GHOST_LOD1`, an empty under Ghost Root) holds one mesh per moving
-  part at 20% of its triangles: the body and each wheel's mount, joint and spin.
-  Each part is named `LOD1_` plus the node it follows and sits at that node's
-  pose; the game attaches it there, so wheels keep spinning and steering.
-- **LOD2** (`GHOST_LOD2`) is the whole car as one mesh at 2% of its triangles,
-  wheels included.
-- Each LOD draws the atlas material plus the body paint, so body colors still
-  apply. The atlas images are packed into the `.blend`; the LODs are hidden in
-  the viewport.
-- **Shadow** (`GHOST_SHADOW`) joins Ghost Root's own meshes, without the wheels,
-  into one mesh without materials at 10% of its triangles.
+- **Shadow** (`GHOST_SHADOW`) joins those meshes, without the wheels, into one
+  mesh without materials at 10% of their triangles. The ghost casts its live
+  shadow from it at its default level, and it never renders.
 - **Shadow Plane** (`GHOST_SHADOW_PLANE`) is a flat, single-sided quad on the
-  floor, at the ghost's lowest point (where its tyres touch the ground), textured
-  with the whole car's top-down silhouette, wheels included: a packed PNG, white,
-  with the blurred silhouette as alpha. The game takes only the alpha, as the
-  shadow's shape and softness, and darkens the ground under it by each track's
-  own shadow tint (the sky's share of the sun and sky light), so edit the PNG's
-  alpha to change the shape. Its dark blue-grey colour shows in Blender only.
+  floor, at the lowest point (where the tyres touch the ground), textured with the
+  top-down silhouette, wheels included: a packed PNG, white, with the blurred
+  silhouette as alpha. The game takes only the alpha and darkens the ground under
+  it by each track's own shadow tint, so edit the PNG's alpha to change the shape.
+  Its dark blue-grey colour shows in Blender only. At coarser levels it lies on the
+  track under the ghost in place of the shadow, aligned to the road and shifted
+  away from the sun; Today's Track shows it at every level.
 
-**Shadow**, **Shadow Plane**, **LOD1** and **LOD2** can also point at hand-made
-objects under Ghost Root with the same layout. Validation requires childless
-meshes with faces as Shadow and Shadow Plane, LOD1 and LOD2 both or neither and
-both shadows with them, one `LOD1_` part for each moving node that has ghost
-geometry, and mesh geometry in LOD2.
+Both can also point at hand-made childless meshes under Car Root. Like the shadow
+mesh and AO plane, they may sit in a group under Car Root, such as `shadows`, but
+not under a wheel or other node the game moves. With more than one exported level both are required. A ghost casts its own
+shadow mesh in place of the car's **Custom Shadow** mesh and drops the AO plane;
+past 100 m from the player nothing of a ghost casts.
 
-In the game, LOD1 shows from 50 m and LOD2 from 100 m. The ghost's shadow has its
-own LOD: up to 50 m the shadow mesh casts the live shadow, like the car's
-**Custom Shadow**, and never renders; from 50 m the shadow plane lies on the
-track under the ghost instead, aligned to the road and shifted away from the
-sun. A ghost with neither shadow mesh nor LODs casts from every part.
+```json
+"ghost": {
+  "shadow": { "obj": "GHOST_SHADOW" },
+  "shadowPlane": { "obj": "GHOST_SHADOW_PLANE" }
+}
+```
 
-The enabled hierarchy is embedded in the same `<car_id>.glb`. Unchecking keeps
-the selections and source objects in the `.blend`, but excludes the configured
-ghost subtree from GLB export. Importing a null or missing `ghost` disables the
-feature while preserving existing authoring selections; importing a structure
-restores its object selections. Run **Validate Car** after import to check them
-against the scene. Preserve **Package Version** unless the user explicitly
-requests a change.
-
-Game integration is pending. The runtime contract is to retain only Ghost Root
-and the car-root transform for custom ghosts, remove Ghost Root for normal cars
-and ordinary replays, and use existing ghost behavior for null/missing `ghost`.
-Body paint, wheel animation, fading, and emission-based lights will be applied
-by that integration.
+`ghost` is `null` when both are empty. Run **Validate Car** after import to check
+the selections against the scene. Preserve **Package Version** unless the user
+explicitly requests a change.
 
 ## Custom Shadow
 
@@ -726,18 +689,22 @@ receiving shadows. Shadow cost is per draw call, so one shadow mesh replaces
 the car's many parts in the shadow pass. With the section off, every part casts
 as before, and an assigned shadow mesh is left out of the export.
 
-The shadow mesh must be a mesh with faces, a direct child of Car Root, without
-children, and not used as a wheel, camera, collider, ghost or other reference.
+The shadow mesh must be a mesh with faces under Car Root, directly or in a group
+outside wheels and other moving nodes, without children, and not used as a wheel, camera, collider, ghost or other reference.
+
+Every shadow refresh button (shadow mesh, AO plane, ghost **Shadow** and **Shadow
+Plane**) builds its object in the group the object it replaces was in, or directly
+under Car Root.
 
 The refresh button joins the evaluated geometry of every mesh under Car
 Root into one object named `SHADOW_MESH`, without materials, UV maps or color
-layers, shown as wireframe. It leaves out the wheel mount hierarchies, the
-custom ghost, colliders and helpers. Generating again
+layers, shown as wireframe. It uses the meshes shown at LOD0 and leaves out
+the wheel mount hierarchies, the ghost shadows, colliders and helpers. Generating again
 replaces the previously generated mesh; a picked mesh is never deleted. The
 result is an ordinary object: decimate or edit it to lower its cost further.
 
 The manifest records it as `"shadow": { "obj": "SHADOW_MESH" }`, or `null`.
-A custom ghost casts with its own geometry.
+A ghost casts from its own ghost **Shadow** mesh when it has one.
 
 ### AO Plane
 
@@ -745,11 +712,11 @@ Below **Shadow Mesh**, the refresh button at the end of **AO Plane** builds the
 car's ambient shadow, `AMBIENT_SHADOW`, inside the `.blend` in a few seconds,
 without baking, and replaces what an earlier refresh made.
 
-- It copies every mesh under Car Root, wheels included, leaving out the custom
-  ghost, colliders, helpers and the shadow mesh, at 2% of their triangles, and
+- It copies every mesh shown at LOD0 under Car Root, wheels included, leaving
+  out the ghost shadows, colliders, helpers and the shadow mesh, at 2% of their triangles, and
   draws their outline seen from straight above into a 128 px image, blurred by
   0.5 m on each side with a 0.6 m clear border.
-- `AMBIENT_SHADOW` is a flat, single-sided quad, a direct child of Car Root, at
+- `AMBIENT_SHADOW` is a flat, single-sided quad under Car Root, at
   the car's lowest point (where the tyres touch the ground), hidden in the
   viewport. Its packed PNG is black with the blurred outline as alpha, and its
   material shows exactly that, so Blender and the game look the same.
@@ -761,8 +728,8 @@ track. It fades out as the car rises above its resting height and is gone 1 m
 up. The player car and replays show it; ghosts and the garage preview do not.
 It never casts or receives shadows.
 
-The plane can also be a hand-made mesh with the same layout: a direct child of
-Car Root, without children, not used as any other reference, with a material
+The plane can also be a hand-made mesh with the same layout: under Car Root,
+directly or in a group outside wheels and other moving nodes, without children, not used as any other reference, with a material
 whose image texture holds the outline in alpha. Its height under Car Root is
 read as the ground at rest. With **Custom Shadow** off, an assigned plane is
 left out of the export like the shadow mesh.
@@ -772,94 +739,57 @@ The manifest records it as `"ambientShadow": { "obj": "AMBIENT_SHADOW" }`, or
 
 ## Lights
 
-Lights are optional. The Lights panel has **Headlights**, **Tail / Brake Lights**,
-and **Reverse Lights** sections. Leave all materials and source lists empty to
-export `"lights": null`. When only some roles are configured, unused roles are
-`null`. A role can contain a material, actual light sources, or both; an absent
-material or source list is also `null`.
+Lights are optional. Leave all three lamp materials empty to export
+`"lights": null`.
 
-For each role:
+Each light function has its own lamp material. The game turns the material's
+emission up and down by the function, so every mesh using it lights together,
+every LOD level included:
 
-1. Optionally assign an emissive material used by an exported mesh. Set its
-   emission color/texture in Blender. **Full Emission** controls the game's
-   full-strength emission multiplier, independently of the actual light output;
-   its default is `10`.
-2. Click **Add Spot** to create a spotlight at the 3D cursor beneath Car Root,
-   or select an existing spotlight beneath Car Root and click **Use Selected**.
-   Multiple sources can share a role, for example left and right headlights.
-3. Move and rotate the spotlight in the viewport. The light emits along its
-   local **-Z** axis. New headlights aim toward car-local Blender -Y (game +Z),
-   tilted 2 degrees downward;
-   new tail/brake and reverse lights aim backward. Aim the source outward from
-   the lamp surface. Use Blender's **Spot Size** and **Blend** controls for the
-   beam cone and softness. Default full cone angles are 40 degrees for headlights
-   and 140 degrees for rear lights, with Blend set to 0.5.
-4. Set the source color, **Full Game Intensity (cd)** and **Game Range (m)**.
-   Blender's native Power value is not exported or converted to game intensity.
-   Tail/brake sources default to red; headlights and reverse sources to white.
-   Initial intensity/range defaults are 100 cd / 40 m for headlights, 5 cd / 5 m
-   for tail/brake lights, and 10 cd / 5 m for reverse lights. Tune these in game.
+| Material | Glows at its Full Emission |
+| --- | --- |
+| **Headlights / Tail Lights** | with the light switch on |
+| **Brake Lights** | while braking |
+| **Reverse Lights** | in reverse gear |
 
-Sources must be childless Spot light objects in the active scene, beneath Car
-Root and outside the custom ghost hierarchy. Each object can be assigned once;
-there is a maximum of 16 sources per car. Removing an addon-created source also
-deletes its helper; removing a user-assigned source only removes the assignment.
+Lamps on any other material (indicators, fog lights) never light. A function
+without a material is allowed; Validate Car warns about it.
 
-Assigned sources are authoring helpers: they are temporarily excluded from GLB
-export and restored afterward, including on export failure. Native glTF light
-export is disabled to avoid duplicate or uncontrolled runtime lights. Their
-car-local transforms and settings are instead exported in `manifest.json`:
+1. Assign the three materials to the lamp meshes, on every LOD level, and pick
+   them in the Lights panel. Each material needs an **Emission Strength** above
+   0 and its emission colour or texture; the game multiplies it by **Full
+   Emission**.
+2. Click **+** beside **Front Lamp** to add an arrow empty at the 3D cursor
+   beneath Car Root, then move it onto one headlamp. Its arrow (local +Z) is
+   the way the headlight shines; it starts straight ahead, so tilt it slightly
+   down. Click **+** beside **Rear Lamp** and move it onto one tail lamp. The
+   game mirrors both markers across the car's centre line; any empty beneath
+   Car Root can be picked instead.
+3. Set each function's **Full Emission**.
+
+The markers are authoring helpers and are left out of the GLB. The game lights
+the road with one shaped spotlight on the car's centre line at the front
+marker's height, 0.9 m behind it, aimed straight ahead at the marker's pitch;
+its strength follows how dark the track is. On Today's Track each lamp also
+gets a glow halo at night, at the mirrored markers, on every car including
+ghosts.
 
 ```json
 {
   "lights": {
-    "headlights": null,
-    "brakeLights": {
-      "material": "brake_emission",
-      "emissiveIntensity": 10,
-      "sources": [{
-        "name": "tail_left",
-        "position": [-0.7, 0.8, -2.0],
-        "direction": [0, 0, -1],
-        "color": [1, 0, 0],
-        "intensity": 5,
-        "distance": 5,
-        "angle": 1.2217304763960306,
-        "penumbra": 0.5
-      }]
-    },
-    "reverseLights": null
+    "materials": { "lights": "Lamp_Lights", "brake": "Lamp_Brake", "reverse": "Lamp_Reverse" },
+    "emission": { "lights": 10, "brake": 4, "reverse": 4 },
+    "front": { "position": [0.645, 0.552, 1.7], "direction": [0, -0.06, 0.998] },
+    "rear": { "position": [0.52, 0.743, -1.85] }
   }
 }
 ```
 
-Source positions use car-local game coordinates `(Blender X, Blender Z,
--Blender Y)`. Directions use the same basis and are normalized. `color` is a
-linear RGB triplet, `intensity` is in candela, `distance` is a positive cutoff
-in meters, `angle` is the cone half-angle in radians (half Blender Spot Size),
-and `penumbra` is in `[0, 1]` from Blender Spot Blend. Blender and game beam
-falloff are not guaranteed to look identical.
-
-Manifest import recreates missing source helpers and restores materials,
-emission levels, source positions/directions and beam settings. Existing
-material-only version 8 roles import with full emission `10` and no sources.
-Unknown fields, invalid values, duplicate names and conflicting existing
-objects are rejected. Preserve `packageVersion` when re-exporting unless the
-user explicitly requests a change.
-
-The runtime contract for the corresponding game update is:
-
-| Input | Headlights | Tail / brake | Reverse |
-| --- | --- | --- | --- |
-| Lights off, no brake | 0% | 0% | 100% only in reverse gear |
-| Lights on, no brake | 100% | 50% | 100% only in reverse gear |
-| Lights off, braking | 0% | 100% | 100% only in reverse gear |
-| Lights on, braking | 100% | 100% | 100% only in reverse gear |
-
-These percentages multiply both source intensity and material emission.
-Tail/brake and reverse lamps should have separate red and white materials.
-The addon exports this contract; the game loader/controller update is a separate
-step and is required to consume the new nullable definitions and source data.
+Positions are car-local game coordinates `(Blender X, Blender Z, -Blender Y)`;
+`front.direction` uses the same basis, is normalized and must aim forward.
+Manifest import restores the materials, the full emissions and both markers.
+Preserve `packageVersion` when re-exporting unless the user explicitly requests
+a change.
 
 ## Dashboard Screen
 
@@ -899,10 +829,10 @@ Objects under Car Root that are hidden in the viewport (the eye, the monitor or
 a hidden collection) are left out of the GLB, so the game never draws them;
 their visible children export where they are. **Validate Car** lists them as a
 warning. Nodes the manifest names or the game drives (Car Root, wheels,
-cameras, colliders, the ghost root, the shadow mesh, the AO plane and the like)
-and the objects the refresh buttons generate and hide always export. Hidden
-meshes are also left out of mesh merging, the shadow mesh, the AO plane and the
-ghost LODs.
+cameras, colliders, the shadow mesh, the AO plane and the like), LOD meshes,
+whose eyes hide them in the viewport only, and the objects the refresh buttons
+generate and hide always export. Hidden meshes without a LOD suffix are also
+left out of mesh merging, the shadow mesh, the AO plane and the ghost shadows.
 
 When the configured car root or any object below it has non-unit scale, export
 asks whether to apply hierarchy scales. Leaving **Apply scales** checked
@@ -920,10 +850,10 @@ the GLB.
 
 **Merge Same-Material Meshes** (on by default) joins meshes during export
 because the game pays per draw call, not per triangle. Meshes join when their
-faces use the same materials and they have the same UV layer count and color
-layers, under the same nearest anchor: the car root or a node the manifest
+faces use the same materials, they have the same UV layer count and color
+layers and the same LOD level range, under the same nearest anchor: the car root or a node the manifest
 names or the game moves (wheel mount, joint, pivot and spin, steering wheel,
-cameras, dashboard screen, ghost root and ghost wheel nodes, shadow mesh). Each
+cameras, dashboard screen, ghost shadow and shadow plane, shadow mesh). Each
 wheel therefore merges on its own spin node and moving parts keep moving.
 Colliders, skinned meshes, referenced objects, meshes with children and the
 body color carrier are never merged. Modifiers are applied and transforms baked
