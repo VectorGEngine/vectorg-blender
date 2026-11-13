@@ -830,9 +830,9 @@ centered, lap timing is at the bottom left, and speed is at the bottom right.
 ## Gauge Needles
 
 **Dashboard > RPM Needle** and **Dashboard > Speed Needle** each take an action
-that sweeps a needle from the dial's zero at the action's first frame to its top
-mark at the last frame. **Dial Max (RPM)**, **Dial Unit** and **Dial Max** give
-the value at that top mark. Both are optional; empty pickers export nothing.
+that sweeps a needle from zero at the action's first frame to the car's maximum
+at its last frame: **Max RPM** for the tachometer, and the top-gear speed at
+Max RPM for the speedometer. Both are optional; empty pickers export nothing.
 
 The action must be the active action, or the only unmuted strip on an NLA track,
 of an object under Car Root. The objects it moves always export and anchor mesh
@@ -843,15 +843,16 @@ action, the armature's included, stays out of the GLB.
 ```json
 {
   "dashboard": {
-    "rpmNeedle": { "animation": "needle_rpm", "max": 8000 },
-    "speedNeedle": { "animation": "needle_speed", "max": 260, "unit": "km/h" }
+    "rpmNeedle": { "animation": "needle_rpm" },
+    "speedNeedle": { "animation": "needle_speed" }
   }
 }
 ```
 
-The player's car and replays smooth RPM and speed, then pose each needle at
-`value / max` of its animation's range, held at both ends. Ghosts and
-multiplayer cars leave the needles still.
+The player's car and replays smooth RPM and speed, then pose each needle at the
+reading's share of that maximum, held at both ends. The speedometer's top mark
+follows the selected setup's gearing. Ghosts and multiplayer cars leave the
+needles still.
 
 ## Export
 

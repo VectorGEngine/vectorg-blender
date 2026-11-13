@@ -1107,10 +1107,6 @@ def import_needle_configs(settings, dashboard):
             continue
         name = config.get("animation")
         setattr(settings, f"{prefix}_needle_action", bpy.data.actions.get(name) if isinstance(name, str) else None)
-        if isinstance(config.get("max"), (int, float)) and config["max"] >= 1:
-            setattr(settings, f"{prefix}_needle_max", float(config["max"]))
-        if prefix == "speed" and config.get("unit") in ("km/h", "mph"):
-            settings.speed_needle_unit = config["unit"]
 
 
 def validate_hidden_objects(settings, _errors, warnings):
@@ -3934,38 +3930,15 @@ class CarExporterSettings(PropertyGroup):
     )
     rpm_needle_action: PointerProperty(
         name="RPM Needle",
-        description="Action that sweeps the tachometer needle from the dial's zero at its first frame to its "
-                    "top mark at its last frame; only this and the speed needle's action export",
+        description="Action that sweeps the tachometer needle from 0 RPM at its first frame to the car's Max RPM "
+                    "at its last frame; only this and the speed needle's action export",
         type=bpy.types.Action,
-    )
-    rpm_needle_max: FloatProperty(
-        name="Dial Max (RPM)",
-        description="Engine speed at the tachometer's top mark, where the action's last frame points",
-        default=8000.0,
-        min=1.0,
-        precision=0,
     )
     speed_needle_action: PointerProperty(
         name="Speed Needle",
-        description="Action that sweeps the speedometer needle from the dial's zero at its first frame to its "
-                    "top mark at its last frame; only this and the RPM needle's action export",
+        description="Action that sweeps the speedometer needle from standstill at its first frame to the car's top "
+                    "speed in top gear at Max RPM at its last frame; only this and the RPM needle's action export",
         type=bpy.types.Action,
-    )
-    speed_needle_max: FloatProperty(
-        name="Dial Max",
-        description="Speed at the speedometer's top mark, where the action's last frame points",
-        default=260.0,
-        min=1.0,
-        precision=0,
-    )
-    speed_needle_unit: EnumProperty(
-        name="Dial Unit",
-        description="Unit printed on the speedometer dial",
-        items=(
-            ("km/h", "km/h", "Kilometres per hour"),
-            ("mph", "mph", "Miles per hour"),
-        ),
-        default="km/h",
     )
     # Retained as a hidden migration source for vehicle manifest version 6.
     down_force: FloatProperty(name="Downforce", default=3000.0)
@@ -5065,13 +5038,9 @@ def build_manifest(settings, lod_object_names=None):
     if settings.dashboard_screen_object:
         dashboard["screen"] = {"obj": object_config_name(settings.dashboard_screen_object)}
     if settings.rpm_needle_action:
-        dashboard["rpmNeedle"] = {"animation": settings.rpm_needle_action.name, "max": settings.rpm_needle_max}
+        dashboard["rpmNeedle"] = {"animation": settings.rpm_needle_action.name}
     if settings.speed_needle_action:
-        dashboard["speedNeedle"] = {
-            "animation": settings.speed_needle_action.name,
-            "max": settings.speed_needle_max,
-            "unit": settings.speed_needle_unit,
-        }
+        dashboard["speedNeedle"] = {"animation": settings.speed_needle_action.name}
 
     body = {
         "obj": object_config_name(settings.car_root_object),
@@ -7742,12 +7711,7 @@ class CAR_EXPORTER_PT_car_export(Panel):
         box.label(text="Dashboard")
         draw_split_prop(box, settings, "dashboard_screen_object")
         draw_split_prop(box, settings, "rpm_needle_action")
-        if settings.rpm_needle_action:
-            draw_split_prop(box, settings, "rpm_needle_max")
         draw_split_prop(box, settings, "speed_needle_action")
-        if settings.speed_needle_action:
-            draw_split_prop(box, settings, "speed_needle_unit")
-            draw_split_prop(box, settings, "speed_needle_max", label=f"Dial Max ({settings.speed_needle_unit})")
 
         box = layout.box()
         box.label(text="Lights")
