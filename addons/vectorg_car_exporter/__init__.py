@@ -7396,15 +7396,22 @@ def sync_lod_level_rows_later():
     return None
 
 
-# Width of each LODs table column in UI units: unfold, eye, export, level, screen size, meshes, triangles.
-LOD_COLUMN_UNITS = (1.2, 1.2, 1.2, 2.8, 8.0, 2.4, 3.2)
+# Share of the panel width for each LODs table column: unfold, eye, export, level, screen size, meshes, triangles.
+LOD_COLUMN_SHARES = (0.06, 0.06, 0.06, 0.16, 0.26, 0.18, 0.22)
 
 
-def lod_cell(row, index):
-    """One LODs table cell, as wide as its column, so the header and level rows line up."""
-    cell = row.row(align=True)
-    cell.ui_units_x = LOD_COLUMN_UNITS[index]
-    return cell
+def lod_cells(layout):
+    """One LODs table row's cells, split by fixed shares of the row, so the header and level rows line up
+    at any panel width."""
+    cells = []
+    rest = layout
+    remaining = sum(LOD_COLUMN_SHARES)
+    for share in LOD_COLUMN_SHARES[:-1]:
+        rest = rest.split(factor=share / remaining, align=True)
+        cells.append(rest.row(align=True))
+        remaining -= share
+    cells.append(rest.row(align=True))
+    return cells
 
 
 def draw_lods(layout, settings):
@@ -7424,40 +7431,34 @@ def draw_lods(layout, settings):
     if any(lod_level_row(settings, level) is None for level in found):
         if not bpy.app.timers.is_registered(sync_lod_level_rows_later):
             bpy.app.timers.register(sync_lod_level_rows_later, first_interval=0.0)
-    columns = layout.row(align=True)
-    for index, text in enumerate(("", "", "", "Level", "Screen Size (%)", "Meshes", "Triangles")):
-        lod_cell(columns, index).label(text=text)
+    for cell, text in zip(lod_cells(layout), ("", "", "", "Level", "Screen Size (%)", "Meshes", "Triangles")):
+        cell.label(text=text)
     exported = set(exported_lod_levels(settings, found))
     for level, objects in found.items():
         row_settings = lod_level_row(settings, level)
         if row_settings is None:
             continue
-        row = layout.row(align=True)
-        lod_cell(row, 0).prop(row_settings, "expanded", text="", emboss=False,
-                              icon="TRIA_DOWN" if row_settings.expanded else "TRIA_RIGHT")
+        unfold, eye, export, name, screen_size, meshes, triangles = lod_cells(layout)
+        unfold.prop(row_settings, "expanded", text="", emboss=False,
+                    icon="TRIA_DOWN" if row_settings.expanded else "TRIA_RIGHT")
         visible = any(obj.visible_get() for obj in objects)
-        lod_cell(row, 1).operator("car_exporter.toggle_lod_visibility", text="", emboss=False,
-                                  icon="HIDE_OFF" if visible else "HIDE_ON").level = level
-        export = lod_cell(row, 2)
+        eye.operator("car_exporter.toggle_lod_visibility", text="", emboss=False,
+                     icon="HIDE_OFF" if visible else "HIDE_ON").level = level
         export.enabled = level != 0
         export.prop(row_settings, "export", text="")
-        active = level in exported
-        for index, draw in (
-            (3, lambda cell: cell.label(text=f"LOD{level}")),
-            (4, lambda cell: cell.prop(row_settings, "screen_height", text="")),
-            (5, lambda cell: cell.label(text=str(len(objects)))),
-            (6, lambda cell: cell.label(text=f"{sum(mesh_triangle_count(obj.data) for obj in objects):,}")),
-        ):
-            cell = lod_cell(row, index)
-            cell.active = active
-            draw(cell)
+        for cell in (name, screen_size, meshes, triangles):
+            cell.active = level in exported
+        name.label(text=f"LOD{level}")
+        screen_size.prop(row_settings, "screen_height", text="")
+        meshes.label(text=str(len(objects)))
+        triangles.label(text=f"{sum(mesh_triangle_count(obj.data) for obj in objects):,}")
         if row_settings.expanded:
             meshes = layout.box().column(align=True)
             for obj in objects:
                 meshes.label(text=f"{obj.name} · {obj.parent.name if obj.parent else 'no parent'}")
     last = next((level for level in reversed(list(found)) if level in exported), None)
     if last is not None:
-        layout.label(text=f"Culled below LOD{last}'s screen height")
+        layout.label(text=f"Culled below LOD{last}'s Screen Size")
 
 
 def draw_ghost(layout, settings):
