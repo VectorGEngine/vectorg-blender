@@ -15,8 +15,10 @@ FUNCTIONS = {
 CONSTANTS = {"LIGHT_ROLES", "LIGHT_EMISSIONS", "LIGHT_MARKER_PROP", "LIGHT_MARKERS"}
 
 LIGHTS = {
-    "materials": {"headlights": "heads", "tail": "tails", "brake": "brake", "reverse": "reverse"},
-    "emission": {"headlights": 8, "tail": 3, "tailBrake": 0, "brake": 12, "reverse": 6},
+    "materials": {"headlights": "heads", "tail": "tails", "brake": "brake", "reverse": "reverse",
+                  "indicatorLeft": "blink_left", "indicatorRight": "blink_right"},
+    "emission": {"headlights": 8, "tail": 3, "tailBrake": 0, "brake": 12, "reverse": 6,
+                 "indicatorLeft": 5, "indicatorRight": 7},
     "front": {"position": [0.62, 0.7, 1.9], "direction": [0, -0.1, 1]},
     "rear": {"position": [0.58, 0.8, -1.95]},
 }
@@ -48,6 +50,8 @@ class LightTests(unittest.TestCase):
             brake_material=material("brake"), reverse_material=material("reverse"),
             headlights_emissive_intensity=8, tail_emissive_intensity=3, tail_brake_emissive_intensity=0,
             brake_emissive_intensity=12, reverse_emissive_intensity=6,
+            indicator_left_material=material("blink_left"), indicator_right_material=material("blink_right"),
+            indicator_left_emissive_intensity=5, indicator_right_emissive_intensity=7,
         )
         self.api = {
             "math": math,
@@ -65,7 +69,7 @@ class LightTests(unittest.TestCase):
     def call(self, name, *args):
         return self.api[name](*args)
 
-    def validate(self, exported=("heads", "tails", "brake", "reverse")):
+    def validate(self, exported=("heads", "tails", "brake", "reverse", "blink_left", "blink_right")):
         errors, warnings = [], []
         self.call("validate_lights_scene", self.settings, set(exported), errors, warnings)
         return errors, warnings
@@ -82,7 +86,11 @@ class LightTests(unittest.TestCase):
 
     def test_malformed_manifests_are_rejected(self):
         broken = [{**LIGHTS, "extra": 1}, {**LIGHTS, "materials": {**LIGHTS["materials"], "headlights": ""}},
-                  {**LIGHTS, "materials": {"headlights": None, "tail": None, "brake": None, "reverse": None}},
+                  {**LIGHTS, "materials": {key: None for key in LIGHTS["materials"]}},
+                  {**LIGHTS, "materials": {"headlights": "heads", "tail": "tails", "brake": "brake", "reverse": "reverse"}},
+                  {**LIGHTS, "emission": {"headlights": 8, "tail": 3, "tailBrake": 0, "brake": 12, "reverse": 6}},
+                  {**LIGHTS, "emission": {**LIGHTS["emission"], "indicatorLeft": -1}},
+                  {**LIGHTS, "materials": {**LIGHTS["materials"], "indicatorRight": "blink_left"}},
                   {**LIGHTS, "materials": {**LIGHTS["materials"], "brake": "tails"}},
                   {**LIGHTS, "materials": {"lights": "heads", "brake": "brake", "reverse": "reverse"}},
                   {**LIGHTS, "emission": {"headlights": 1, "tail": 1, "brake": 1, "reverse": 1}},
@@ -100,6 +108,7 @@ class LightTests(unittest.TestCase):
     def test_a_car_without_lamp_materials_exports_no_lights(self):
         self.settings.headlights_material = self.settings.tail_material = None
         self.settings.brake_material = self.settings.reverse_material = None
+        self.settings.indicator_left_material = self.settings.indicator_right_material = None
         self.assertIsNone(self.call("build_lights_config", self.settings))
         self.assertEqual(self.validate(), ([], []))
 
@@ -110,6 +119,16 @@ class LightTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("No Reverse Lights material: those lamps never light", warnings)
 
+    def test_a_car_without_indicators_exports_null_indicator_materials(self):
+        self.settings.indicator_left_material = self.settings.indicator_right_material = None
+        built = self.call("build_lights_config", self.settings)
+        self.assertEqual((built["materials"]["indicatorLeft"], built["materials"]["indicatorRight"]), (None, None))
+        self.assertEqual(built["emission"]["indicatorLeft"], 5)
+        errors, warnings = self.validate(exported=("heads", "tails", "brake", "reverse"))
+        self.assertEqual(errors, [])
+        self.assertIn("No Left Indicators material: those lamps never light", warnings)
+        self.assertIn("No Right Indicators material: those lamps never light", warnings)
+
     def test_functions_need_their_own_materials_markers_and_an_emission_to_scale(self):
         self.settings.brake_material = self.settings.tail_material
         self.assertIn("Each light function needs its own lamp material", self.validate()[0])
@@ -118,7 +137,7 @@ class LightTests(unittest.TestCase):
         self.assertIn("Lights need the Rear Lamp marker", self.validate()[0])
         self.settings.rear_light_marker = self.marker
         self.settings.headlights_material = material("heads", strength=0.0)
-        errors, _warnings = self.validate(exported=("heads", "tails", "brake"))
+        errors, _warnings = self.validate(exported=("heads", "tails", "brake", "blink_left", "blink_right"))
         self.assertIn("Headlights material heads needs an Emission Strength above 0; "
                       "the game scales it by Full Emission", errors)
         self.assertIn("Reverse Lights material is not used by an exported mesh: reverse", errors)

@@ -94,7 +94,8 @@ the collider. Shadow objects may sit in a group but never under a wheel or other
 ## 8. Lights
 
 - Use a separate material for each function (**Headlights**, **Tail Lights**, **Brake Lights**,
-  **Reverse Lights**). A shared lamp material lights every lamp at once.
+  **Reverse Lights**, **Left Indicators**, **Right Indicators**). A shared lamp material lights
+  every lamp at once. Left indicators sit on the car's +X side.
 - Lamp materials need Emission Strength > 0 in Blender; the game scales it.
 - Tail lamps that double as brake lamps use the Tail Lights material's **Brake Lights** emission.
   Large rear lamp meshes are often the brake lamps and need the brake material to glow.
@@ -105,6 +106,11 @@ the collider. Shadow objects may sit in a group but never under a wheel or other
 Key each needle from zero (first frame) to maximum (last frame) and push the action to an NLA
 track. Pick the actions in **Dashboard > RPM Needle / Speed Needle**. The game takes the maximums
 from Max RPM and the top-gear speed.
+
+Wipers and a convertible roof work the same way in **Animations**: the wiper action is one full
+cycle at rest on its first and last frames; the roof action is closed on its first frame and open on
+its last (2 frames with Constant interpolation swap instantly). Animate the node above the LOD
+meshes, and model the car with the roof closed.
 
 ## 10. LODs and shadows
 

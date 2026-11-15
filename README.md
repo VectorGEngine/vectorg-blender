@@ -389,6 +389,7 @@ Engine Start
 Gear Grinding
 Gear Change
 Brake Squeal
+Horn
 ```
 
 The game decides which samples loop. Engine Start, Gear Grinding, Gear Change,
@@ -403,6 +404,11 @@ Traction Control loops while traction control cuts power. Its pitch and speed
 follow the vehicle's normalized engine RPM around its RPM reference, so one
 sample fits every rev range.
 Gear Change plays each time the gear changes, including into neutral and reverse.
+Horn loops while the driver holds the horn and stops when it is released. Like
+the other slots, an enabled Horn without a datablock uses the game's default
+horn, and a disabled Horn leaves the car silent. The player's car and replays
+sound it, from the recorded horn in replays; ghosts and multiplayer cars play
+no car sounds.
 
 **Pitch Offset (cents)** adjusts all loaded and off-throttle engine samples for
 the vehicle. It defaults to `0`; positive values raise pitch and negative values
@@ -739,7 +745,7 @@ The manifest records it as `"ambientShadow": { "obj": "AMBIENT_SHADOW" }`, or
 
 ## Lights
 
-Lights are optional. Leave all four lamp materials empty to export
+Lights are optional. Leave all six lamp materials empty to export
 `"lights": null`.
 
 Each light function has its own lamp material. The game turns the material's
@@ -752,16 +758,26 @@ every LOD level included:
 | **Tail Lights** | with the light switch on (its **Tail Lights** emission) |
 | **Brake Lights** | while braking |
 | **Reverse Lights** | in reverse gear |
+| **Left Indicators** | while the left indicator or the hazard lights flash on |
+| **Right Indicators** | while the right indicator or the hazard lights flash on |
+
+Left and right are the car's own sides: Left Indicators on the Blender +X side,
+Right Indicators on -X. Indicators flash 85 times a minute, lit half of each
+flash, starting lit the moment they are switched on; each car keeps its own
+phase. The hazard lights flash both sides together. A car without indicators
+leaves both materials empty: the manifest writes them as `null` and the car
+ignores the indicator controls. The player's car, replays, ghosts and
+multiplayer cars all flash them from the driver's or the recorded switches.
 
 The Tail Lights material has a second emission, **Brake Lights**, added to its
 glow while braking, for tail lamps that double as brake lamps. It starts at 0,
 which leaves the tail lamps to the light switch. With the lights on while
 braking the tail lamps glow at the sum of both.
 
-Lamps on any other material (indicators, fog lights) never light. A function
+Lamps on any other material (fog lights, side markers) never light. A function
 without a material is allowed; Validate Car warns about it.
 
-1. Assign the four materials to the lamp meshes, on every LOD level, and pick
+1. Assign the six materials to the lamp meshes, on every LOD level, and pick
    them in the Lights panel. Each material needs an **Emission Strength** above
    0 and its emission colour or texture; the game multiplies it by **Full
    Emission**.
@@ -784,14 +800,22 @@ ghosts.
 ```json
 {
   "lights": {
-    "materials": { "headlights": "Lamp_Head", "tail": "Lamp_Tail", "brake": "Lamp_Brake", "reverse": "Lamp_Reverse" },
-    "emission": { "headlights": 10, "tail": 2, "tailBrake": 0, "brake": 4, "reverse": 4 },
+    "materials": {
+      "headlights": "Lamp_Head", "tail": "Lamp_Tail", "brake": "Lamp_Brake", "reverse": "Lamp_Reverse",
+      "indicatorLeft": "Lamp_Indicator_L", "indicatorRight": "Lamp_Indicator_R"
+    },
+    "emission": {
+      "headlights": 10, "tail": 2, "tailBrake": 0, "brake": 4, "reverse": 4,
+      "indicatorLeft": 6, "indicatorRight": 6
+    },
     "front": { "position": [0.645, 0.552, 1.7], "direction": [0, -0.06, 0.998] },
     "rear": { "position": [0.52, 0.743, -1.85] }
   }
 }
 ```
 
+`materials` and `emission` always carry all six functions; a function without a
+lamp material is `null` in `materials`.
 Positions are car-local game coordinates `(Blender X, Blender Z, -Blender Y)`;
 `front.direction` uses the same basis, is normalized and must aim forward.
 Manifest import restores the materials, the full emissions and both markers.
@@ -855,6 +879,48 @@ reading's share of that maximum, held at both ends. The speedometer's top mark
 follows the selected setup's gearing. Ghosts and multiplayer cars leave the
 needles still.
 
+## Animations
+
+The **Animations** section, below Dashboard, takes two optional actions,
+**Wipers** and **Roof**. Each follows the gauge needles' rules: the action must
+be the active action, or the only unmuted strip on an NLA track, of an object
+under Car Root; the objects it moves always export and anchor mesh merging;
+only picked actions export, each as one glTF animation named after the action
+and sampled every frame. The wipers, the roof and the needles each need their
+own action.
+
+- **Wipers**: one full cycle. The arms rest on the first frame, sweep out and
+  back, and rest again on the last frame, so the cycle loops seamlessly. The
+  game loops it while the wipers are on; switched off, the arms finish the
+  current sweep and park at rest.
+- **Roof**: closed on the first frame, open on the last. The game plays it
+  forward to open and backward to close, from wherever it is, at the scene's
+  frame rate: the action's length in frames is how long the roof takes. A
+  2-frame action with Constant interpolation is an instant swap, for example a
+  hardtop scaled to 0 on its last frame. A car without a Roof action ignores
+  the roof control.
+
+Animate the node that carries a part, not its meshes: put every LOD mesh of a
+wiper arm or roof panel under that node (`wiper_arm_LOD0`, `wiper_arm_LOD1`,
+...). Ghosts drop the finer LOD meshes, so Validate Car rejects an action that
+moves a LOD mesh directly. The colliders, shadow mesh, AO plane, ghost shadows
+and cameras are built from the car as modelled, so model it with the roof
+closed and the wipers at rest.
+
+```json
+{
+  "animations": {
+    "wipers": { "animation": "wipers_cycle" },
+    "roof": { "animation": "roof_open" }
+  }
+}
+```
+
+`animations` is left out when neither action is picked. The player's car,
+replays, ghosts and multiplayer cars all play both from the driver's or the
+recorded switches; a car shown or a replay sought puts the roof straight where
+its switch is and the wipers at rest.
+
 ## Export
 
 Use `Validate Car` first, then `Export Car Zip`.
@@ -887,7 +953,8 @@ because the game pays per draw call, not per triangle. Meshes join when their
 faces use the same materials, they have the same UV layer count and color
 layers and the same LOD level range, under the same nearest anchor: the car root or a node the manifest
 names or the game moves (wheel mount, joint, pivot and spin, steering wheel,
-cameras, dashboard screen, ghost shadow and shadow plane, shadow mesh). Each
+cameras, dashboard screen, needles, wipers and roof, ghost shadow and shadow
+plane, shadow mesh). Each
 wheel therefore merges on its own spin node and moving parts keep moving.
 Colliders, skinned meshes, referenced objects, meshes with children and the
 body color carrier are never merged. Modifiers are applied and transforms baked

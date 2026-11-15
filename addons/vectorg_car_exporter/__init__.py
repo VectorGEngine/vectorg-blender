@@ -114,6 +114,7 @@ SOUND_SLOTS = {
     "gear_grinding": {"label": "Gear Grinding", "default": "", "volume": 0.8},
     "gear_change": {"label": "Gear Change", "default": "", "volume": 1.0},
     "brake_squeal": {"label": "Brake Squeal", "default": "", "volume": 0.5},
+    "horn": {"label": "Horn", "default": "", "volume": 1.0},
 }
 SOUND_RPM_SLOTS = {"idle", "on_high", "on_mid", "on_low", "off_high", "off_mid", "off_low", "traction_control"}
 
@@ -323,6 +324,8 @@ LIGHT_ROLES = (
     ("tail", "tail", "Tail Lights"),
     ("brake", "brake", "Brake Lights"),
     ("reverse", "reverse", "Reverse Lights"),
+    ("indicatorLeft", "indicator_left", "Left Indicators"),
+    ("indicatorRight", "indicator_right", "Right Indicators"),
 )
 # Each lamp material's full emission (manifest key, setting prefix); the tail lamps also glow while braking.
 LIGHT_EMISSIONS = (
@@ -331,6 +334,8 @@ LIGHT_EMISSIONS = (
     ("tailBrake", "tail_brake"),
     ("brake", "brake"),
     ("reverse", "reverse"),
+    ("indicatorLeft", "indicator_left"),
+    ("indicatorRight", "indicator_right"),
 )
 LIGHT_MARKER_PROP = "vectorg_light_marker"
 LIGHT_MARKERS = (("front", "front_light_marker", "LAMP_FRONT", "Front Lamp"), ("rear", "rear_light_marker", "LAMP_REAR", "Rear Lamp"))
@@ -899,7 +904,7 @@ def car_reference_objects(settings):
     )
     if settings.armature_object:
         refs.append(settings.armature_object)
-    refs.extend(needle_objects(settings))
+    refs.extend(animated_objects(settings))
     return {obj for obj in refs if obj}
 
 
@@ -985,11 +990,11 @@ class glTF2ExportUserExtension:
 
 
 def export_car_gltf(settings, **options):
-    """Blender's glTF export of the scene, leaving out the hidden car objects. The needle actions are the only
-    animations it writes."""
+    """Blender's glTF export of the scene, leaving out the hidden car objects. The picked needle, wiper and roof
+    actions are the only animations it writes."""
     global car_export_hidden_names
     car_export_hidden_names = {obj.name for obj in hidden_export_objects(settings)}
-    keep = needle_actions(settings)
+    keep = exported_actions(settings)
     restore_filter = set_gltf_action_filter(keep) if keep else None
     try:
         # The action filter keeps every other action out, the rig's included.
@@ -1005,8 +1010,19 @@ def needle_actions(settings):
     return [action for action in (settings.rpm_needle_action, settings.speed_needle_action) if action]
 
 
+def car_animation_picks(settings):
+    """The Animations section's (manifest key, picked action or None) pairs."""
+    return (("wipers", settings.wipers_action), ("roof", settings.roof_action))
+
+
+def exported_actions(settings):
+    """Every picked action, each once: the needles, then the wipers and the roof."""
+    picked = needle_actions(settings) + [action for _key, action in car_animation_picks(settings) if action]
+    return list(dict.fromkeys(picked))
+
+
 def gltf_animation_export_options(keep):
-    """glTF animation options: off without needle actions; otherwise each kept action becomes one animation
+    """glTF animation options: off without picked actions; otherwise each kept action becomes one animation
     named after it, sampled every frame over its own range."""
     if not keep:
         return {"export_animations": False}
@@ -1074,9 +1090,9 @@ def action_animates(obj, action):
     return False
 
 
-def needle_objects(settings, actions=None):
-    """Objects under Car Root, the root included, that a needle action moves."""
-    actions = needle_actions(settings) if actions is None else actions
+def animated_objects(settings, actions=None):
+    """Objects under Car Root, the root included, that a picked action moves."""
+    actions = exported_actions(settings) if actions is None else actions
     if not actions or not settings.car_root_object:
         return []
     scene_objects = set(bpy.context.scene.objects)
@@ -1094,9 +1110,38 @@ def validate_needle_actions(settings, errors):
         start, end = action.frame_range
         if end <= start:
             errors.append(f"{label} action must span more than one frame")
-        if settings.car_root_object and not needle_objects(settings, [action]):
+        if settings.car_root_object and not animated_objects(settings, [action]):
             errors.append(f"{label} action must be the active action or the only unmuted strip on an NLA track "
                           f"of an object under Car Root")
+
+
+def validate_car_animations(settings, errors):
+    """The wiper and roof actions follow the needles' rules, and each part has its own action."""
+    picked = [(key.capitalize(), action) for key, action in car_animation_picks(settings) if action]
+    needles = set(needle_actions(settings))
+    if len(picked) == 2 and picked[0][1] == picked[1][1]:
+        errors.append("Wipers and roof must use different actions")
+    for label, action in picked:
+        if action in needles:
+            errors.append(f"{label} action must not also drive a gauge needle")
+        start, end = action.frame_range
+        if end <= start:
+            errors.append(f"{label} action must span more than one frame")
+        moved = animated_objects(settings, [action]) if settings.car_root_object else []
+        if settings.car_root_object and not moved:
+            errors.append(f"{label} action must be the active action or the only unmuted strip on an NLA track "
+                          f"of an object under Car Root")
+        # Ghosts drop the finer LOD meshes, so the action moves the node above them.
+        for obj in moved:
+            if LOD_NAME_PATTERN.match(obj.name):
+                errors.append(f"{label} action must move the node above its LOD meshes, not LOD mesh {obj.name}")
+
+
+def import_animation_configs(settings, animations):
+    for key, prop in (("wipers", "wipers_action"), ("roof", "roof_action")):
+        config = animations.get(key)
+        name = config.get("animation") if isinstance(config, dict) else None
+        setattr(settings, prop, bpy.data.actions.get(name) if isinstance(name, str) else None)
 
 
 def import_needle_configs(settings, dashboard):
@@ -1289,8 +1334,8 @@ def car_merge_groups(context, settings, ranges=None):
     """Meshes that join into one node each: same materials in use, same UV layer count and color
     layers, same LOD level range, under the same nearest anchor. Anchors are the car root and every node
     the manifest names or the game moves (wheel mount, joint, pivot and spin, steering wheel, cameras,
-    dashboard, needles, ghost shadow and shadow plane, shadow mesh, ambient shadow), so each wheel merges on its own
-    spin node and moving parts keep moving. Colliders, skinned parts, referenced nodes, meshes with
+    dashboard, needles, wipers, roof, ghost shadow and shadow plane, shadow mesh, ambient shadow), so each
+    wheel merges on its own spin node and moving parts keep moving. Colliders, skinned parts, referenced nodes, meshes with
     children and the body color carrier are never merged."""
     root = settings.car_root_object
     anchors = car_reference_objects(settings)
@@ -3193,6 +3238,7 @@ def validate_scene(settings):
                 )
 
     validate_needle_actions(settings, errors)
+    validate_car_animations(settings, errors)
 
     exported_material_names = {
         material.name
@@ -3909,6 +3955,18 @@ class CarExporterSettings(PropertyGroup):
         description="Material of the reverse lamps: glows in reverse gear",
         type=bpy.types.Material,
     )
+    indicator_left_material: PointerProperty(
+        name="Left Indicators",
+        description="Material of the indicator lamps on the car's left side (Blender +X): flashes with the left "
+                    "indicator or the hazard lights",
+        type=bpy.types.Material,
+    )
+    indicator_right_material: PointerProperty(
+        name="Right Indicators",
+        description="Material of the indicator lamps on the car's right side (Blender -X): flashes with the right "
+                    "indicator or the hazard lights",
+        type=bpy.types.Material,
+    )
     front_light_marker: PointerProperty(
         name="Front Lamp",
         description="Empty on one headlamp, its arrow (local +Z) aimed the way the headlight shines; the game "
@@ -3933,6 +3991,10 @@ class CarExporterSettings(PropertyGroup):
                                             description="Brake lamp glow while braking")
     reverse_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
                                               description="Reverse lamp glow in reverse gear")
+    indicator_left_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                                     description="Left indicator lamp glow while it flashes on")
+    indicator_right_emissive_intensity: FloatProperty(name="Full Emission", default=10.0, min=0.0,
+                                                      description="Right indicator lamp glow while it flashes on")
     dashboard_screen_object: PointerProperty(
         name="Screen",
         description="Mesh object used as the in-game dashboard display",
@@ -3948,6 +4010,18 @@ class CarExporterSettings(PropertyGroup):
         name="Speed Needle",
         description="Action that sweeps the speedometer needle from standstill at its first frame to the car's top "
                     "speed in top gear at Max RPM at its last frame; only this and the RPM needle's action export",
+        type=bpy.types.Action,
+    )
+    wipers_action: PointerProperty(
+        name="Wipers",
+        description="Action of one full wiper cycle: at rest on its first frame, sweeping out and back, at rest on "
+                    "its last frame; the game loops it while the wipers are on",
+        type=bpy.types.Action,
+    )
+    roof_action: PointerProperty(
+        name="Roof",
+        description="Action that opens the roof: closed on its first frame, open on its last; the game plays it "
+                    "forward to open and backward to close at the scene frame rate",
         type=bpy.types.Action,
     )
     # Retained as a hidden migration source for vehicle manifest version 6.
@@ -4413,6 +4487,23 @@ class CarExporterSettings(PropertyGroup):
         min=0.0,
         soft_max=1.0,
     )
+    sound_horn: PointerProperty(
+        name="Horn",
+        description="Horn sound datablock looped while the horn is held; leave empty to use the game's default horn",
+        type=bpy.types.Sound,
+    )
+    sound_horn_enabled: BoolProperty(
+        name="Horn Enabled",
+        description="Use the assigned custom sound, or turn off to disable it",
+        default=True,
+    )
+    sound_horn_volume: FloatProperty(
+        name="Volume",
+        description="Playback volume multiplier for the horn sound",
+        default=1.0,
+        min=0.0,
+        soft_max=1.0,
+    )
     sound_tranny_on_volume: FloatProperty(
         name="Volume",
         description="Playback volume multiplier for the transmission-on sound",
@@ -4592,6 +4683,11 @@ class CarExporterSettings(PropertyGroup):
         description="Use this volume instead of the default volume",
         default=False,
     )
+    sound_horn_override_volume: BoolProperty(
+        name="Override Volume",
+        description="Use this volume instead of the default volume",
+        default=False,
+    )
 
 
 def clear_configuration_settings(settings):
@@ -4646,6 +4742,8 @@ def clear_configuration_settings(settings):
     settings.dashboard_screen_object = None
     settings.rpm_needle_action = None
     settings.speed_needle_action = None
+    settings.wipers_action = None
+    settings.roof_action = None
     settings.colliders.clear()
     settings.down_force_points.clear()
     settings.wheels.clear()
@@ -5052,6 +5150,8 @@ def build_manifest(settings, lod_object_names=None):
     if settings.speed_needle_action:
         dashboard["speedNeedle"] = {"animation": settings.speed_needle_action.name}
 
+    animations = {key: {"animation": action.name} for key, action in car_animation_picks(settings) if action}
+
     body = {
         "obj": object_config_name(settings.car_root_object),
         "centerOfMass": object_config_name(settings.center_of_mass_object),
@@ -5155,6 +5255,8 @@ def build_manifest(settings, lod_object_names=None):
     }
     if dashboard:
         manifest["dashboard"] = dashboard
+    if animations:
+        manifest["animations"] = animations
     armature = build_armature_config(settings)
     if armature is not None:
         manifest["armature"] = armature
@@ -7210,6 +7312,8 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         else:
             settings.dashboard_screen_object = None
         import_needle_configs(settings, dashboard if isinstance(dashboard, dict) else {})
+        animations = data.get("animations", {})
+        import_animation_configs(settings, animations if isinstance(animations, dict) else {})
 
         cameras = data.get("cameras", {})
         for name, attr in (
@@ -7735,6 +7839,11 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_split_prop(box, settings, "dashboard_screen_object")
         draw_split_prop(box, settings, "rpm_needle_action")
         draw_split_prop(box, settings, "speed_needle_action")
+
+        box = layout.box()
+        box.label(text="Animations")
+        draw_split_prop(box, settings, "wipers_action")
+        draw_split_prop(box, settings, "roof_action")
 
         box = layout.box()
         box.label(text="Lights")

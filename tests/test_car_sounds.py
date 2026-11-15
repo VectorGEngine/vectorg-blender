@@ -10,7 +10,7 @@ import unittest
 
 
 ADDON = Path(__file__).resolve().parents[1] / "addons/vectorg_car_exporter/__init__.py"
-NEW_SLOTS = ("idle", "on_mid", "off_mid", "backfire", "traction_control", "engine_start", "gear_grinding", "gear_change", "brake_squeal")
+NEW_SLOTS = ("idle", "on_mid", "off_mid", "backfire", "traction_control", "engine_start", "gear_grinding", "gear_change", "brake_squeal", "horn")
 SOUND_HELPERS = {
     "sound_sample_path", "sound_export_name", "validate_sound_sample",
     "export_sound_samples", "load_manifest_sound_samples",
@@ -115,6 +115,28 @@ class CarSoundTests(unittest.TestCase):
         self.assertEqual(self.export(self.settings()),
                          {"pitchOffset": 0, **{slot: {} for slot in self.constants["SOUND_SLOTS"]}})
 
+    def test_horn_exports_custom_default_or_disabled(self):
+        for mode in ("custom", "omitted", "disabled"):
+            with self.subTest(mode=mode):
+                settings = self.settings(override_volume=True)
+                if mode != "omitted":
+                    settings.sound_horn = sound_datablock("//horn.wav", packed=b"audio")
+                settings.sound_horn_enabled = mode != "disabled"
+                settings.sound_horn_volume = 0.7
+                sounds = self.export(settings)
+                if mode == "custom":
+                    self.assertEqual(sounds["horn"], {"source": "horn.wav", "volume": 0.7})
+                elif mode == "disabled":
+                    self.assertIsNone(sounds["horn"])
+                else:
+                    self.assertEqual(sounds["horn"], {"volume": 0.7}, "an unassigned horn keeps the game's default sample")
+                namespace = self.execute([])
+                namespace["export_sound_samples"](settings, self.sound_dir)
+                loaded = namespace["load_manifest_sound_samples"](sounds, self.root / "manifest.json")
+                imported = self.settings(override_volume=True)
+                self.execute([self.import_loop], settings=imported, sounds=sounds, loaded_sounds=loaded)
+                self.assertEqual(self.export(imported), sounds)
+
     def test_engine_reference_rpm_must_be_positive(self):
         for slot in self.constants["SOUND_RPM_SLOTS"]:
             for rpm in [0, -1, float("nan"), float("inf"), True]:
@@ -147,7 +169,7 @@ class CarSoundTests(unittest.TestCase):
         self.assertEqual(list(self.constants["SOUND_SLOTS"]), [
             "idle", "off_low", "off_mid", "off_high", "on_low", "on_mid", "on_high",
             "tranny_off", "tranny_on", "limiter", "turbo", "backfire", "traction_control",
-            "engine_start", "gear_grinding", "gear_change", "brake_squeal",
+            "engine_start", "gear_grinding", "gear_change", "brake_squeal", "horn",
         ])
         self.assertEqual({node.target.id for node in self.pointers},
                          {f"sound_{slot}" for slot in self.constants["SOUND_SLOTS"]})
