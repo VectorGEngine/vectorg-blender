@@ -37,6 +37,9 @@ exporter derives them from the Blender camera and the scene render aspect ratio.
   "packageVersion": "1",
   "model": "<car_id>.glb",
   "class": "A",
+  "family": "<car_id>",
+  "stage": 0,
+  "unlockPrice": 0,
   "engine": {
     "torqueFactor": 1.0,
     "idleRPM": 1000,
@@ -453,12 +456,30 @@ one octave down, and double RPM contributes one octave up. The game then adds
 the configured Pitch Offset; redline RPM does not add a pitch shift. On High also receives
 a 4.5 dB presence boost at 2600 Hz (Q 0.8); cockpit filtering still applies.
 
+## Family, Stage and Unlock Price
+
+Set these under **Package**. The game groups cars into families and sells each
+car for XP:
+
+- **Family**: the car family, 1-64 letters, numbers, underscores or dashes.
+  Empty exports the car id. Every stage of one car uses the same family.
+- **Stage**: `0` is the stock car; `1`, `2`, `3`... are its upgrade stages, up
+  to `9`. A stage unlocks only after the stage before it.
+- **Unlock Price**: the XP the car costs, `0` to `1000000`. `0` means the car
+  is owned from the start.
+
+Every manifest carries `family`, `stage` and `unlockPrice`; the game refuses a
+car package without them, and **Import Car Manifest** requires them.
+
 ## Body Colors
 
 Add selectable paint materials under **Body > Body Colors**. Each entry has a
 display name and a Blender material. Entry `0` is the default; use the list
-arrows to change the order. The default material must be assigned to geometry
-inside the car hierarchy. The exporter embeds configured alternative materials
+arrows to change the order. Selecting an entry puts its material on every
+material slot of the car that holds a body color material, so the viewport
+shows that paint. A body color material must be assigned to geometry inside the
+car hierarchy; export always writes the car in the default color and puts the
+selected color back afterwards. The exporter embeds configured alternative materials
 in the GLB even when they are not currently assigned to visible geometry.
 
 Body colors are optional. When configured, their order is exported as:
@@ -467,8 +488,8 @@ Body colors are optional. When configured, their order is exported as:
 {
   "body": {
     "colors": [
-      { "name": "White", "material": "Body_White" },
-      { "name": "Red", "material": "Body_Red" }
+      { "name": "White", "material": "Body_White", "swatch": ["#f2f2f0"] },
+      { "name": "Red Stripe", "material": "Body_Red_Stripe", "swatch": ["#f2f2f0", "#c3202b"] }
     ]
   }
 }
@@ -476,6 +497,12 @@ Body colors are optional. When configured, their order is exported as:
 
 The game can use the exported names for color selection. Runtime color
 selection is not configured by the Blender addon.
+
+Each body color has a **Swatch** of one to three picked colors on one row: a
+square per color, **+** to add a color and **-** to remove the last one. They
+export as `#rrggbb` values. The game shows them flat, side by side in a circle:
+one color fills it, two split it in halves, three in thirds. Pick colors that read as the paint
+at a glance, such as the base color and the stripe color of a livery.
 
 ## Armature
 

@@ -34,6 +34,7 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    FloatVectorProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -133,6 +134,12 @@ NEWTONS_PER_KILOGRAM = 9.81
 BRAKE_LOCK_MARGIN = 1.15
 CENTER_OF_MASS_HELPER_PROP = "vectorg_center_of_mass_helper"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+# Family uses the car ID character rule; an empty panel value exports the car ID.
+CAR_FAMILY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MAX_CAR_STAGE = 9
+MAX_UNLOCK_PRICE = 1_000_000
+SWATCH_COLOR_PATTERN = re.compile(r"^#[0-9a-f]{6}$")
+MAX_SWATCH_COLORS = 3
 # Mirrors the canonical class registry in vectorg/vehicleClasses.js.
 VEHICLE_CLASS_ITEMS = (
     ("K", "K Kart", "Kart class"),
@@ -2594,6 +2601,39 @@ def object_with_assigned_material(material, objects):
     return None
 
 
+def body_paint_slots(settings):
+    """The car's material slots that hold one of its body color materials: where its paint shows."""
+    materials = {body_color.material for body_color in settings.body_colors if body_color.material}
+    return [
+        slot
+        for obj in hierarchy_objects(settings.car_root_object)
+        for slot in obj.material_slots
+        if slot.material in materials
+    ]
+
+
+def paint_body_color(settings, material):
+    """Put `material` on every body paint slot; returns the slots and their previous materials."""
+    slots = [(slot, slot.material) for slot in body_paint_slots(settings)]
+    for slot, _previous in slots:
+        if slot.material != material:
+            slot.material = material
+    return slots
+
+
+def restore_body_paint(slots):
+    for slot, material in slots:
+        if slot.material != material:
+            slot.material = material
+
+
+def update_active_body_color(settings, _context):
+    """Selecting a body color shows its material on the car."""
+    index = settings.active_body_color_index
+    if 0 <= index < len(settings.body_colors) and settings.body_colors[index].material:
+        paint_body_color(settings, settings.body_colors[index].material)
+
+
 def material_is_assigned_to_geometry(material, objects):
     return object_with_assigned_material(material, objects) is not None
 
@@ -2913,6 +2953,12 @@ def validate_scene(settings):
         errors.append("Package version may only contain letters, numbers, dot, underscore, plus, and dash")
     if settings.car_class not in VEHICLE_CLASS_CODES:
         errors.append(f"Class must be one of {', '.join(code for code, _label, _description in VEHICLE_CLASS_ITEMS)}")
+    if settings.family.strip() and not CAR_FAMILY_PATTERN.fullmatch(settings.family.strip()):
+        errors.append("Family must be 1-64 letters, numbers, underscores, or dashes")
+    if not 0 <= settings.stage <= MAX_CAR_STAGE:
+        errors.append(f"Stage must be between 0 and {MAX_CAR_STAGE}")
+    if not 0 <= settings.unlock_price <= MAX_UNLOCK_PRICE:
+        errors.append(f"Unlock Price must be between 0 and {MAX_UNLOCK_PRICE}")
 
     car_obj = settings.car_root_object
     required = [
@@ -3267,8 +3313,14 @@ def validate_scene(settings):
         if material.name in body_color_material_names:
             errors.append(f"Body color material is used more than once: {material.name}")
         body_color_material_names.add(material.name)
-        if index == 0 and not material_is_assigned_to_geometry(material, car_objects):
-            errors.append(f"Default body color material is not assigned to car geometry: {material.name}")
+
+
+    # The selected body color shows on the car; export puts the default color there.
+    if settings.body_colors and not any(
+        body_color.material and material_is_assigned_to_geometry(body_color.material, car_objects)
+        for body_color in settings.body_colors
+    ):
+        errors.append("No body color material is assigned to car geometry")
 
     validate_lights_scene(settings, exported_material_names, errors, warnings)
 
@@ -3324,6 +3376,56 @@ class CarBodyColorSettings(PropertyGroup):
         description="Body material associated with this selectable color",
         type=bpy.types.Material,
     )
+    swatch_color_count: IntProperty(
+        name="Swatch Colors",
+        description="Colors the game shows for this paint, side by side in its swatch",
+        min=1,
+        max=MAX_SWATCH_COLORS,
+        default=1,
+    )
+    swatch_color_a: FloatVectorProperty(
+        name="Swatch Color 1",
+        description="First swatch color the game shows for this paint",
+        subtype="COLOR_GAMMA",
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 1.0, 1.0),
+    )
+    swatch_color_b: FloatVectorProperty(
+        name="Swatch Color 2",
+        description="Second swatch color the game shows for this paint",
+        subtype="COLOR_GAMMA",
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.0, 0.0, 0.0),
+    )
+    swatch_color_c: FloatVectorProperty(
+        name="Swatch Color 3",
+        description="Third swatch color the game shows for this paint",
+        subtype="COLOR_GAMMA",
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.5, 0.5, 0.5),
+    )
+
+
+SWATCH_COLOR_PROPS = ("swatch_color_a", "swatch_color_b", "swatch_color_c")
+
+
+def swatch_hex(color):
+    return "#" + "".join(f"{round(min(max(channel, 0.0), 1.0) * 255):02x}" for channel in color)
+
+
+def hex_swatch(value):
+    return tuple(int(value[index:index + 2], 16) / 255 for index in (1, 3, 5))
+
+
+def body_color_swatch(body_color):
+    """One to three #rrggbb colors the game shows side by side as the paint's swatch."""
+    return [swatch_hex(getattr(body_color, prop)) for prop in SWATCH_COLOR_PROPS[:body_color.swatch_color_count]]
 
 
 class CarColliderSettings(PropertyGroup):
@@ -3823,6 +3925,25 @@ class CarExporterSettings(PropertyGroup):
         items=VEHICLE_CLASS_ITEMS,
         default=DEFAULT_VEHICLE_CLASS,
     )
+    family: StringProperty(
+        name="Family",
+        description="Shared identifier of the stock car and its upgrade stages; empty exports the Car ID",
+        default="",
+    )
+    stage: IntProperty(
+        name="Stage",
+        description="0 is the stock car; 1, 2, 3 and up are upgrade stages of the same family",
+        default=0,
+        min=0,
+        max=MAX_CAR_STAGE,
+    )
+    unlock_price: IntProperty(
+        name="Unlock Price",
+        description="XP needed to unlock this car; 0 owns it from the start",
+        default=0,
+        min=0,
+        max=MAX_UNLOCK_PRICE,
+    )
     vehicle_tag_tarmac: BoolProperty(
         name="Tarmac",
         description="Mark this vehicle as suitable for tarmac tracks",
@@ -4058,7 +4179,7 @@ class CarExporterSettings(PropertyGroup):
         max=2400,
     )
     body_colors: CollectionProperty(type=CarBodyColorSettings)
-    active_body_color_index: IntProperty(name="Active Body Color", default=0)
+    active_body_color_index: IntProperty(name="Active Body Color", default=0, update=update_active_body_color)
     colliders: CollectionProperty(type=CarColliderSettings)
     down_force_points: CollectionProperty(type=CarDownForcePointSettings)
     wheels: CollectionProperty(type=CarWheelSettings)
@@ -4712,6 +4833,9 @@ def clear_configuration_settings(settings):
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
     settings.merge_meshes = True
     settings.car_class = DEFAULT_VEHICLE_CLASS
+    settings.family = ""
+    settings.stage = 0
+    settings.unlock_price = 0
     settings.vehicle_tag_tarmac = False
     settings.vehicle_tag_offroad = False
     settings.abs_max_level = 5
@@ -4807,6 +4931,9 @@ def initialize_configuration_settings(settings):
     settings.jpeg_quality = DEFAULT_JPEG_QUALITY
     settings.merge_meshes = True
     settings.car_class = DEFAULT_VEHICLE_CLASS
+    settings.family = ""
+    settings.stage = 0
+    settings.unlock_price = 0
     settings.vehicle_tag_tarmac = True
     settings.vehicle_tag_offroad = True
     settings.abs_max_level = 5
@@ -5174,6 +5301,7 @@ def build_manifest(settings, lod_object_names=None):
             {
                 "name": body_color.display_name.strip(),
                 "material": body_color.material.name,
+                "swatch": body_color_swatch(body_color),
             }
             for body_color in settings.body_colors
         ]
@@ -5189,6 +5317,9 @@ def build_manifest(settings, lod_object_names=None):
         "ambientShadow": build_ambient_shadow_config(settings),
         "displayName": settings.display_name,
         "class": settings.car_class,
+        "family": car_family(settings),
+        "stage": settings.stage,
+        "unlockPrice": settings.unlock_price,
         "trackTypes": [
             tag
             for tag, enabled in (
@@ -5441,6 +5572,10 @@ def draw_export_progress():
     draw_export_text(hint, x + width / 2, y + 12 * scale, 11 * scale, dim, inner, "CENTER")
 
 
+def car_family(settings):
+    return settings.family.strip() or settings.car_id
+
+
 def iter_car_zip_export(context, settings, export_zip, apply_scales):
     """Export the car ZIP one step at a time, yielding (fraction, message) before each step."""
     export_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -5461,7 +5596,11 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
         carrier = None
         merge_result = None
         restored_nodes, temp_images = [], []
+        previewed_paint = []
         try:
+            # The car ships in its default body color, whichever color the panel shows.
+            if settings.body_colors and settings.body_colors[0].material:
+                previewed_paint = paint_body_color(settings, settings.body_colors[0].material)
             unlink_export_helpers(states)
             carrier = create_body_material_export_carrier(context)
             if settings.merge_meshes:
@@ -5502,6 +5641,7 @@ def iter_car_zip_export(context, settings, export_zip, apply_scales):
             restore_car_mesh_merge(merge_result)
             remove_body_material_export_carrier(carrier)
             relink_export_helpers(states)
+            restore_body_paint(previewed_paint)
 
         yield 0.85, "Writing manifest..."
         manifest = compact_manifest_floats(build_manifest(settings, lod_object_names))
@@ -6020,6 +6160,42 @@ class CAR_EXPORTER_OT_move_body_color(Operator):
             return {"CANCELLED"}
         settings.body_colors.move(index, target)
         settings.active_body_color_index = target
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_add_swatch_color(Operator):
+    bl_idname = "car_exporter.add_swatch_color"
+    bl_label = "Add Swatch Color"
+    bl_description = "Add a color to the active body color's swatch, up to three"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_body_color_index
+        if not 0 <= index < len(settings.body_colors):
+            return {"CANCELLED"}
+        body_color = settings.body_colors[index]
+        if body_color.swatch_color_count >= MAX_SWATCH_COLORS:
+            return {"CANCELLED"}
+        body_color.swatch_color_count += 1
+        return {"FINISHED"}
+
+
+class CAR_EXPORTER_OT_remove_swatch_color(Operator):
+    bl_idname = "car_exporter.remove_swatch_color"
+    bl_label = "Remove Swatch Color"
+    bl_description = "Remove the last color of the active body color's swatch"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = scene_settings(context)
+        index = settings.active_body_color_index
+        if not 0 <= index < len(settings.body_colors):
+            return {"CANCELLED"}
+        body_color = settings.body_colors[index]
+        if body_color.swatch_color_count <= 1:
+            return {"CANCELLED"}
+        body_color.swatch_color_count -= 1
         return {"FINISHED"}
 
 
@@ -6823,6 +6999,18 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             codes = ", ".join(code for code, _label, _description in VEHICLE_CLASS_ITEMS)
             self.report({"ERROR"}, f"Vehicle manifest class must be one of {codes}")
             return {"CANCELLED"}
+        family = data.get("family")
+        if not isinstance(family, str) or not CAR_FAMILY_PATTERN.fullmatch(family):
+            self.report({"ERROR"}, "Vehicle manifest family must be 1-64 letters, numbers, underscores, or dashes")
+            return {"CANCELLED"}
+        stage = data.get("stage")
+        if isinstance(stage, bool) or not isinstance(stage, int) or not 0 <= stage <= MAX_CAR_STAGE:
+            self.report({"ERROR"}, f"Vehicle manifest stage must be a whole number between 0 and {MAX_CAR_STAGE}")
+            return {"CANCELLED"}
+        unlock_price = data.get("unlockPrice")
+        if isinstance(unlock_price, bool) or not isinstance(unlock_price, int) or not 0 <= unlock_price <= MAX_UNLOCK_PRICE:
+            self.report({"ERROR"}, f"Vehicle manifest unlockPrice must be a whole number between 0 and {MAX_UNLOCK_PRICE}")
+            return {"CANCELLED"}
         engine = data.get("engine", {})
         if not isinstance(engine, dict) or "redlineRPM" not in engine:
             self.report({"ERROR"}, "Manifest engine.redlineRPM is required")
@@ -6958,6 +7146,11 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
                     self.report({"ERROR"}, f"Duplicate manifest body color material: {material_name}")
                     return {"CANCELLED"}
                 material_names.add(material_name)
+                swatch = body_color.get("swatch")
+                if (not isinstance(swatch, list) or not 1 <= len(swatch) <= MAX_SWATCH_COLORS
+                        or not all(isinstance(color, str) and SWATCH_COLOR_PATTERN.fullmatch(color) for color in swatch)):
+                    self.report({"ERROR"}, f"Manifest body.colors[{color_index}].swatch must be 1 to {MAX_SWATCH_COLORS} #rrggbb colors")
+                    return {"CANCELLED"}
         steering_wheel = data.get("steeringWheel")
         if not isinstance(steering_wheel, dict):
             self.report({"ERROR"}, "Manifest steeringWheel must be an object")
@@ -7151,6 +7344,9 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
         settings.package_version = str(data.get("packageVersion", settings.package_version))
         settings.display_name = data.get("displayName", data.get("name", settings.display_name))
         settings.car_class = data["class"]
+        settings.family = "" if data["family"] == settings.car_id else data["family"]
+        settings.stage = data["stage"]
+        settings.unlock_price = data["unlockPrice"]
         settings.sound_pitch_offset = round(sound_pitch_offset)
         settings.use_custom_sounds = any(slot in sounds for slot in SOUND_SLOTS)
         for slot, meta in SOUND_SLOTS.items():
@@ -7218,6 +7414,10 @@ class CAR_EXPORTER_OT_import_manifest(Operator):
             body_color = settings.body_colors.add()
             body_color.display_name = body_color_data["name"].strip()
             set_material_pointer(body_color, "material", body_color_data["material"])
+            swatch = body_color_data["swatch"]
+            body_color.swatch_color_count = len(swatch)
+            for prop, value in zip(SWATCH_COLOR_PROPS, swatch):
+                setattr(body_color, prop, hex_swatch(value))
         settings.active_body_color_index = 0
 
         colliders = body.get("colliders") or []
@@ -7386,6 +7586,19 @@ def draw_body_colors(layout, settings):
     body_color = settings.body_colors[index]
     draw_split_prop(layout, body_color, "display_name")
     draw_split_prop(layout, body_color, "material")
+    # One row: a square per swatch color, then add and remove buttons.
+    split = layout.split(factor=0.4, align=True)
+    split.label(text="Swatch")
+    row = split.row(align=True)
+    row.alignment = "LEFT"
+    for prop in SWATCH_COLOR_PROPS[:body_color.swatch_color_count]:
+        square = row.row(align=True)
+        square.ui_units_x = 1.5
+        square.prop(body_color, prop, text="")
+    if body_color.swatch_color_count < MAX_SWATCH_COLORS:
+        row.operator("car_exporter.add_swatch_color", text="", icon="ADD")
+    if body_color.swatch_color_count > 1:
+        row.operator("car_exporter.remove_swatch_color", text="", icon="REMOVE")
     if index == 0:
         layout.label(text="Index 0 is the default body color", icon="CHECKMARK")
 
@@ -7775,6 +7988,9 @@ class CAR_EXPORTER_PT_car_export(Panel):
         draw_split_prop(color_quality, settings, "jpeg_quality")
         draw_split_prop(box, settings, "merge_meshes")
         draw_split_prop(box, settings, "car_class")
+        draw_split_prop(box, settings, "family")
+        draw_split_prop(box, settings, "stage")
+        draw_split_prop(box, settings, "unlock_price")
         draw_vehicle_tags(box, settings)
 
         box = layout.box()
@@ -7940,6 +8156,8 @@ classes = (
     CAR_EXPORTER_OT_add_body_color,
     CAR_EXPORTER_OT_remove_body_color,
     CAR_EXPORTER_OT_move_body_color,
+    CAR_EXPORTER_OT_add_swatch_color,
+    CAR_EXPORTER_OT_remove_swatch_color,
     CAR_EXPORTER_OT_add_preset,
     CAR_EXPORTER_OT_remove_preset,
     CAR_EXPORTER_OT_move_preset,
